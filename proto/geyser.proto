@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package solana.geyser.v1;
+
+message SubscribeRequest {}
+
+message SubscribeUpdate {
+  uint64 slot = 1;
+}
