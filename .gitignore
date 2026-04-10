@@ -1,0 +1,6 @@
+/docs/
+target/
+.env
+.env.*
+.codex
+SOLANA_INFRA_PIPELINE_SPEC.md
