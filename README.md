@@ -1,6 +1,6 @@
-# solana-infra-pipeline
+# solana-realtime-indexer
 
-High-performance Solana data pipeline:
+High-performance Solana realtime indexer:
 
 `RPC pool + Geyser streaming -> TimescaleDB -> public query API -> live dashboard`
 

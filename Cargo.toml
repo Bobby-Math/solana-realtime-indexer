@@ -1,0 +1,11 @@
+[package]
+name = "solana-realtime-indexer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "solana_realtime_indexer"
+path = "src/lib.rs"
+
+[dependencies]
