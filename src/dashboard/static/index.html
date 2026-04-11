@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>solana-realtime-indexer</title>
+  <style>
+    :root {
+      --bg: #0c1117;
+      --panel: #121a23;
+      --text: #dce7f3;
+      --muted: #88a0b8;
+      --accent: #5dd4a2;
+      --border: #223243;
+    }
+    body {
+      margin: 0;
+      font-family: "Iosevka", "SFMono-Regular", monospace;
+      background: linear-gradient(180deg, #0a0f14 0%, #0f1720 100%);
+      color: var(--text);
+    }
+    main {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }
+    .panel {
+      background: rgba(18, 26, 35, 0.95);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 20px;
+      margin-bottom: 16px;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.25);
+    }
+    h1, h2, p {
+      margin-top: 0;
+    }
+    .live {
+      color: var(--accent);
+      font-weight: 700;
+    }
+    .muted {
+      color: var(--muted);
+    }
+    .grid {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="panel">
+      <h1>solana-realtime-indexer <span class="live">LIVE</span></h1>
+      <p class="muted">Scaffold dashboard placeholder. Wire this to REST metrics and slot streams during Module 4 and Module 5.</p>
+    </section>
+    <section class="grid">
+      <div class="panel">
+        <h2>Slot Lag</h2>
+        <p>Pending live data</p>
+      </div>
+      <div class="panel">
+        <h2>Events / Sec</h2>
+        <p>Pending live data</p>
+      </div>
+      <div class="panel">
+        <h2>Write Latency p99</h2>
+        <p>Pending live data</p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

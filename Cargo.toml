@@ -9,3 +9,5 @@ name = "solana_realtime_indexer"
 path = "src/lib.rs"
 
 [dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
