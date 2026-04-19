@@ -12,6 +12,8 @@ use crate::processor::store::StoreSnapshot;
 pub struct PipelineReport {
     pub received_events: u64,
     pub flush_count: u64,
+    pub last_processed_slot: Option<i64>,
+    pub last_observed_at_unix_ms: Option<i64>,
     pub account_rows_written: u64,
     pub transaction_rows_written: u64,
     pub slot_rows_written: u64,
@@ -101,6 +103,12 @@ impl ProcessorPipeline {
 
 fn apply_batch(report: &mut PipelineReport, batch: PersistedBatch, result: StorageWriteResult) {
     report.flush_count += 1;
+    report.last_processed_slot =
+        max_optional(report.last_processed_slot, latest_processed_slot(&batch));
+    report.last_observed_at_unix_ms = max_optional(
+        report.last_observed_at_unix_ms,
+        batch.latest_timestamp_unix_ms(),
+    );
     report.account_rows_written += batch.account_rows.len() as u64;
     report.transaction_rows_written += batch.transaction_rows.len() as u64;
     report.slot_rows_written += batch.slot_rows.len() as u64;
@@ -115,6 +123,25 @@ fn apply_batch(report: &mut PipelineReport, batch: PersistedBatch, result: Stora
     report.pruned_transaction_rows = snapshot.metrics.transaction_rows_pruned;
     report.pruned_slot_rows = snapshot.metrics.slot_rows_pruned;
     report.pruned_custom_rows = snapshot.metrics.custom_rows_pruned;
+}
+
+fn max_optional(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn latest_processed_slot(batch: &PersistedBatch) -> Option<i64> {
+    batch
+        .slot_rows
+        .iter()
+        .map(|row| row.slot)
+        .chain(batch.transaction_rows.iter().map(|row| row.slot))
+        .chain(batch.account_rows.iter().map(|row| row.slot))
+        .chain(batch.custom_rows.iter().map(|row| row.slot))
+        .max()
 }
 
 fn checkpoint_update_for_batch(batch: &PersistedBatch) -> Option<CheckpointUpdate> {
@@ -189,5 +216,7 @@ mod tests {
         assert_eq!(report.custom_rows_written, 1);
         assert_eq!(report.sql_statements_planned, 8);
         assert_eq!(report.retained_account_rows, 1);
+        assert_eq!(report.last_processed_slot, Some(10));
+        assert_eq!(report.last_observed_at_unix_ms, Some(1_710_000_000_001));
     }
 }
