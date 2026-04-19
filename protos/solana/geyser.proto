@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package solana.geyser;
+
+// Geyser service definition
+service Geyser {
+    // Subscribe to blockchain events
+    rpc Subscribe(stream SubscribeRequest) returns (stream SubscribeResponse);
+}
+
+// Subscription request messages
+message SubscribeRequest {
+    oneof request {
+        SubscribeRequestFilter subscribe_request = 1;
+        SubscribeRequestUnsubscribe unsubscribe_request = 2;
+    }
+}
+
+message SubscribeRequestFilter {
+    repeated SubscribeRequestFilterAccounts accounts = 1;
+    repeated SubscribeRequestFilterAccounts accounts_owner = 2;
+    repeated SubscribeRequestFilterBlocks blocks = 3;
+    repeated SubscribeRequestFilterBlocksMeta blocks_meta = 4;
+    repeated SubscribeRequestFilterEntry entry = 5;
+    repeated SubscribeRequestFilterSlots slots = 6;
+    repeated SubscribeRequestFilterTransactions transactions = 7;
+    repeated SubscribeRequestFilterTransactions transactions_status = 8;
+}
+
+message SubscribeRequestFilterAccounts {
+    string account = 1;
+}
+
+message SubscribeRequestFilterBlocks {
+    // Filter for specific blocks or all blocks
+}
+
+message SubscribeRequestFilterBlocksMeta {
+    // Filter for block metadata
+}
+
+message SubscribeRequestFilterEntry {
+    // Filter for entry notifications
+}
+
+message SubscribeRequestFilterSlots {
+    // Filter for slot updates
+}
+
+message SubscribeRequestFilterTransactions {
+    // Filter for transactions
+}
+
+message SubscribeRequestUnsubscribe {
+    int32 id = 1;
+}
+
+// Subscription response messages
+message SubscribeResponse {
+    oneof result {
+        int32 filter = 1;
+        SubscribeResponseAccount account = 2;
+        SubscribeResponseAccount account_write = 12;
+        SubscribeResponseTransaction transaction = 3;
+        SubscribeResponseTransaction transaction_status = 11;
+        SubscribeResponseSlot slot = 4;
+        SubscribeResponseBlock block = 5;
+        SubscribeResponseBlockMeta block_meta = 6;
+        SubscribeResponseEntry entry = 7;
+        SubscribeResponsePing pong = 10;
+    }
+}
+
+message SubscribeResponseAccount {
+    uint64 slot = 1;
+    bytes account = 2;
+    uint64 lamports = 3;
+    bytes owner = 4;
+    bytes data = 5;
+    bool executable = 6;
+    uint64 rent_epoch = 7;
+    uint64 write_version = 8;
+    uint64 txn_signature = 9;
+}
+
+message SubscribeResponseTransaction {
+    uint64 slot = 1;
+    bytes transaction = 2;
+    bytes meta = 3;
+    uint64 index = 4;
+    uint64 result = 5; // 0 = success, non-zero = error
+}
+
+message SubscribeResponseSlot {
+    uint64 slot = 1;
+    uint64 parent = 2;
+    SlotStatus status = 3;
+}
+
+enum SlotStatus {
+    PROCESING = 0; // Note: keeping typo for compatibility with some versions
+    PROCESSED = 1;
+    CONFIRMED = 2;
+    FINALIZED = 3;
+}
+
+message SubscribeResponseBlock {
+    // Block message (simplified)
+}
+
+message SubscribeResponseBlockMeta {
+    // Block metadata message (simplified)
+}
+
+message SubscribeResponseEntry {
+    // Entry message (simplified)
+}
+
+message SubscribeResponsePing {
+    // Ping/pong for keepalive
+}

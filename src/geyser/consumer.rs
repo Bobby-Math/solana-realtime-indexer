@@ -9,6 +9,16 @@ pub struct GeyserConfig {
     pub filters: Vec<SubscriptionFilter>,
 }
 
+impl GeyserConfig {
+    pub fn new(endpoint: String, channel_capacity: usize, filters: Vec<SubscriptionFilter>) -> Self {
+        Self {
+            endpoint,
+            channel_capacity,
+            filters,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum SubscriptionFilter {
     Program(String),

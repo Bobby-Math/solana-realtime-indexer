@@ -1,3 +1,8 @@
+[workspace]
+members = [
+    ".",
+]
+
 [package]
 name = "solana-realtime-indexer"
 version = "0.1.0"
@@ -9,5 +14,19 @@ name = "solana_realtime_indexer"
 path = "src/lib.rs"
 
 [dependencies]
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "full"] }
+reqwest = { version = "0.12", features = ["json"] }
+helius-laserstream = "0.1"
+futures = "0.3"
+chrono = "0.4"
+bs58 = "0.5"
+log = "0.4"
+env_logger = "0.11"
+dotenvy = "0.15"
+
+[build-dependencies]
+tonic-build = "0.12"
