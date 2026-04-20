@@ -1,10 +1,10 @@
 use crate::processor::decoder::PersistedBatch;
-use crate::processor::sql::{build_write_plan, CheckpointUpdate, SqlWritePlan};
+use crate::processor::sql::{execute_batch, CheckpointUpdate};
 use crate::processor::store::{StoreSnapshot, Type1Store};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 
 #[derive(Debug, Clone, Default)]
 pub struct StorageWriteResult {
@@ -37,7 +37,7 @@ impl Display for StorageError {
 
 impl Error for StorageError {}
 
-pub trait StorageSink {
+pub trait StorageSink: Send {
     fn write_batch(
         &mut self,
         batch: &PersistedBatch,
@@ -48,19 +48,19 @@ pub trait StorageSink {
 #[derive(Debug, Clone)]
 pub struct DryRunStorageSink {
     store: Type1Store,
-    last_plan: Option<SqlWritePlan>,
+    last_statement_count: u64,
 }
 
 impl DryRunStorageSink {
     pub fn new(store: Type1Store) -> Self {
         Self {
             store,
-            last_plan: None,
+            last_statement_count: 0,
         }
     }
 
-    pub fn last_plan(&self) -> Option<&SqlWritePlan> {
-        self.last_plan.as_ref()
+    pub fn last_statement_count(&self) -> u64 {
+        self.last_statement_count
     }
 }
 
@@ -70,48 +70,97 @@ impl StorageSink for DryRunStorageSink {
         batch: &PersistedBatch,
         checkpoint: Option<CheckpointUpdate>,
     ) -> Result<StorageWriteResult, StorageError> {
-        let plan = build_write_plan(batch, &self.store.retention_policy, checkpoint);
-        let sql_statements_planned = plan.statement_count() as u64;
-        self.last_plan = Some(plan);
+        // Estimate statement count (same logic as execute_batch)
+        let mut statement_count = 0u64;
+        if !batch.account_rows.is_empty() { statement_count += 1; }
+        if !batch.transaction_rows.is_empty() { statement_count += 1; }
+        if !batch.slot_rows.is_empty() { statement_count += 1; }
+        if !batch.custom_rows.is_empty() { statement_count += 1; }
+        if batch.latest_timestamp_unix_ms().is_some() { statement_count += 4; } // retention deletes for 4 tables
+        if checkpoint.is_some() { statement_count += 1; }
+
+        self.last_statement_count = statement_count;
 
         Ok(StorageWriteResult {
             snapshot: self.store.apply_batch(batch.clone()),
-            sql_statements_planned,
+            sql_statements_planned: statement_count,
         })
     }
+}
+
+struct PoolWithRuntime {
+    pool: PgPool,
+    runtime: Runtime,
 }
 
 pub struct TimescaleStorageSink {
     store: Type1Store,
-    runtime: Runtime,
-    pool: PgPool,
-    last_plan: Option<SqlWritePlan>,
+    pool: PoolWithRuntime,
+    last_statement_count: u64,
 }
 
 impl TimescaleStorageSink {
     pub fn connect(database_url: &str, store: Type1Store) -> Result<Self, StorageError> {
-        let runtime = Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| StorageError::RuntimeInit(error.to_string()))?;
-        let pool = runtime
-            .block_on(
+        Self::connect_with_pool_size(database_url, store, 20)
+    }
+
+    pub fn connect_with_pool_size(database_url: &str, store: Type1Store, max_connections: u32) -> Result<Self, StorageError> {
+        // Check if we're already in a runtime
+        let in_runtime = tokio::runtime::Handle::try_current().is_ok();
+
+        let (pool, runtime) = if in_runtime {
+            // We're in a runtime, create the pool using spawn_blocking
+            let database_url = database_url.to_string();
+            let (sender, receiver) = std::sync::mpsc::channel();
+
+            std::thread::spawn(move || {
+                let rt = Runtime::new().unwrap();
+                let pool = rt.block_on(
+                    PgPoolOptions::new()
+                        .max_connections(max_connections)
+                        .min_connections(2)
+                        .acquire_timeout(std::time::Duration::from_secs(60))
+                        .idle_timeout(std::time::Duration::from_secs(600))
+                        .max_lifetime(std::time::Duration::from_secs(1800))
+                        .test_before_acquire(true)
+                        .connect(&database_url),
+                );
+                sender.send((pool, rt)).unwrap();
+            });
+
+            let (pool, rt) = receiver.recv()
+                .map_err(|e| StorageError::Connect(format!("thread communication error: {}", e)))?;
+            let pool = pool.map_err(|e| StorageError::Connect(format!("connection error: {}", e)))?;
+            (pool, rt)
+        } else {
+            // Not in a runtime, create directly
+            let rt = Runtime::new()
+                .map_err(|error| StorageError::RuntimeInit(error.to_string()))?;
+
+            let pool = rt.block_on(
                 PgPoolOptions::new()
-                    .max_connections(5)
+                    .max_connections(max_connections)
+                    .min_connections(2)
+                    .acquire_timeout(std::time::Duration::from_secs(60))
+                    .idle_timeout(std::time::Duration::from_secs(600))
+                    .max_lifetime(std::time::Duration::from_secs(1800))
+                    .test_before_acquire(true)
                     .connect(database_url),
             )
-            .map_err(|error| StorageError::Connect(error.to_string()))?;
+                .map_err(|error| StorageError::Connect(error.to_string()))?;
+
+            (pool, rt)
+        };
 
         Ok(Self {
             store,
-            runtime,
-            pool,
-            last_plan: None,
+            pool: PoolWithRuntime { pool, runtime },
+            last_statement_count: 0,
         })
     }
 
-    pub fn last_plan(&self) -> Option<&SqlWritePlan> {
-        self.last_plan.as_ref()
+    pub fn last_statement_count(&self) -> u64 {
+        self.last_statement_count
     }
 }
 
@@ -121,30 +170,32 @@ impl StorageSink for TimescaleStorageSink {
         batch: &PersistedBatch,
         checkpoint: Option<CheckpointUpdate>,
     ) -> Result<StorageWriteResult, StorageError> {
-        let plan = build_write_plan(batch, &self.store.retention_policy, checkpoint);
-        let sql_statements_planned = plan.statement_count() as u64;
+        // Use our dedicated runtime for database operations
+        let statement_count = self.pool.runtime.block_on({
+            let pool = self.pool.pool.clone();
+            let batch = batch.clone();
+            let retention_policy = self.store.retention_policy.clone();
+            let checkpoint = checkpoint.clone();
 
-        self.runtime
-            .block_on(execute_plan(&self.pool, &plan))
+            async move {
+                let mut transaction = pool.begin().await?;
+                let count = execute_batch(&mut transaction, &batch, &retention_policy, checkpoint.as_ref()).await?;
+                transaction.commit().await?;
+                Ok::<u64, sqlx::Error>(count)
+            }
+        })
             .map_err(|error| StorageError::Execute(error.to_string()))?;
-        self.last_plan = Some(plan);
+
+        self.last_statement_count = statement_count;
+        let snapshot = self.store.apply_batch(batch.clone());
 
         Ok(StorageWriteResult {
-            snapshot: self.store.apply_batch(batch.clone()),
-            sql_statements_planned,
+            snapshot,
+            sql_statements_planned: statement_count,
         })
     }
 }
 
-async fn execute_plan(pool: &PgPool, plan: &SqlWritePlan) -> Result<(), sqlx::Error> {
-    let mut transaction = pool.begin().await?;
-
-    for statement in &plan.statements {
-        sqlx::query(statement).execute(&mut *transaction).await?;
-    }
-
-    transaction.commit().await
-}
 
 #[cfg(test)]
 mod tests {
@@ -157,7 +208,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn dry_run_sink_plans_sql_and_updates_store_snapshot() {
+    fn dry_run_sink_estimates_statement_count_and_updates_store_snapshot() {
         let mut sink = DryRunStorageSink::new(Type1Store::new(RetentionPolicy {
             max_age: Duration::from_secs(60),
         }));
@@ -190,13 +241,7 @@ mod tests {
             .expect("dry-run write");
 
         assert_eq!(result.snapshot.account_rows, 1);
-        assert_eq!(result.sql_statements_planned, 6);
-        assert!(sink
-            .last_plan()
-            .expect("last plan")
-            .statements
-            .last()
-            .expect("checkpoint statement")
-            .contains("INSERT INTO ingestion_checkpoints"));
+        assert_eq!(result.sql_statements_planned, 6); // 1 account + 1 checkpoint + 4 retention deletes
+        assert_eq!(sink.last_statement_count(), 6);
     }
 }
