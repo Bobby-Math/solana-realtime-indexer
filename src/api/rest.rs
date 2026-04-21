@@ -15,6 +15,7 @@ pub struct HealthResponse {
     pub last_processed_slot: Option<i64>,
     pub slot_to_indexed_lag_ms: Option<i64>,
     pub queue_depth: usize,
+    pub channel_capacity: usize,
     pub rpc_healthy_endpoints: usize,
 }
 
@@ -30,6 +31,12 @@ pub struct MetricsResponse {
     pub slot_rows_written: u64,
     pub custom_rows_written: u64,
     pub sql_statements_planned: u64,
+    pub queue_depth: usize,
+    pub channel_capacity: usize,
+    pub batch_size: usize,
+    pub batch_flush_ms: u64,
+    pub wal_unprocessed_count: u64,
+    pub channel_utilization: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -39,14 +46,20 @@ pub struct ApiSnapshot {
     pub bind_address: String,
     pub rpc_endpoint_count: usize,
     pub queue_depth: usize,
+    pub channel_capacity: usize,
+    pub batch_size: usize,
+    pub batch_flush_ms: u64,
     pub elapsed_secs: f64,
     pub last_processed_slot: Option<i64>,
     pub last_observed_at_unix_ms: Option<i64>,
     pub indexed_at_unix_ms: i64,
     pub report: PipelineReport,
+    pub wal_unprocessed_count: u64,
+    pub channel_utilization: f64,
 }
 
 impl ApiSnapshot {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_report(
         project: impl Into<String>,
         storage_mode: impl Into<String>,
@@ -63,12 +76,29 @@ impl ApiSnapshot {
             bind_address: bind_address.into(),
             rpc_endpoint_count,
             queue_depth,
+            channel_capacity: 0,
+            batch_size: 0,
+            batch_flush_ms: 0,
             elapsed_secs: elapsed.as_secs_f64(),
             last_processed_slot: report.last_processed_slot,
             last_observed_at_unix_ms: report.last_observed_at_unix_ms,
             indexed_at_unix_ms,
             report,
+            wal_unprocessed_count: 0,
+            channel_utilization: 0.0,
         }
+    }
+
+    pub fn with_runtime_config(
+        mut self,
+        channel_capacity: usize,
+        batch_size: usize,
+        batch_flush_ms: u64,
+    ) -> Self {
+        self.channel_capacity = channel_capacity;
+        self.batch_size = batch_size;
+        self.batch_flush_ms = batch_flush_ms;
+        self
     }
 
     pub fn health_response(&self) -> HealthResponse {
@@ -80,6 +110,7 @@ impl ApiSnapshot {
             last_processed_slot: self.last_processed_slot,
             slot_to_indexed_lag_ms: self.slot_to_indexed_lag_ms(),
             queue_depth: self.queue_depth,
+            channel_capacity: self.channel_capacity,
             rpc_healthy_endpoints: self.rpc_endpoint_count,
         }
     }
@@ -96,6 +127,12 @@ impl ApiSnapshot {
             slot_rows_written: self.report.slot_rows_written,
             custom_rows_written: self.report.custom_rows_written,
             sql_statements_planned: self.report.sql_statements_planned,
+            queue_depth: self.queue_depth,
+            channel_capacity: self.channel_capacity,
+            batch_size: self.batch_size,
+            batch_flush_ms: self.batch_flush_ms,
+            wal_unprocessed_count: self.wal_unprocessed_count,
+            channel_utilization: self.channel_utilization,
         }
     }
 
@@ -113,11 +150,13 @@ impl ApiSnapshot {
 }
 
 pub async fn health(State(state): State<SharedApiState>) -> Json<HealthResponse> {
-    Json(state.health_response())
+    let snapshot = state.lock().await;
+    Json(snapshot.health_response())
 }
 
 pub async fn metrics(State(state): State<SharedApiState>) -> Json<MetricsResponse> {
-    Json(state.metrics_response())
+    let snapshot = state.lock().await;
+    Json(snapshot.metrics_response())
 }
 
 fn per_second(count: u64, elapsed_secs: f64) -> f64 {
@@ -156,7 +195,8 @@ mod tests {
             Duration::from_secs(2),
             1_025,
             report,
-        );
+        )
+        .with_runtime_config(1000, 500, 100);
         let health = snapshot.health_response();
         let metrics = snapshot.metrics_response();
 

@@ -1,17 +1,19 @@
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
-use axum::{routing::get, Router};
+use axum::{routing::{get, post}, Router};
 
 pub mod middleware;
 pub mod rest;
 pub mod self_service;
 pub mod websocket;
 
-pub type SharedApiState = Arc<rest::ApiSnapshot>;
+pub type SharedApiState = Arc<Mutex<rest::ApiSnapshot>>;
 
-pub fn router(snapshot: rest::ApiSnapshot) -> Router {
+pub fn router_with_state(state: SharedApiState) -> Router {
     Router::new()
         .route("/health", get(rest::health))
         .route("/metrics", get(rest::metrics))
-        .with_state(Arc::new(snapshot))
+        .route("/api/protocol-monitor", post(self_service::handle_protocol_request))
+        .with_state(state)
 }

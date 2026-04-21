@@ -8,11 +8,15 @@ pub struct Config {
     pub rpc_endpoints: Vec<String>,
     pub geyser_endpoint: Option<String>,
     pub geyser_api_key: Option<String>,
+    pub geyser_channel_capacity: usize,
     pub geyser_program_filters: Vec<String>,
     pub geyser_account_filters: Vec<String>,
     pub geyser_include_slots: bool,
     pub geyser_run_duration_seconds: Option<u64>,
     pub database_url: Option<String>,
+    pub db_pool_max_connections: u32,
+    pub batch_size: usize,
+    pub batch_flush_ms: u64,
     pub log_level: String,
 }
 
@@ -23,13 +27,29 @@ impl Config {
             rpc_endpoints: read_csv_env("RPC_ENDPOINTS"),
             geyser_endpoint: env::var("GEYSER_ENDPOINT").ok(),
             geyser_api_key: env::var("GEYSER_API_KEY").ok(),
+            geyser_channel_capacity: env::var("GEYSER_CHANNEL_CAPACITY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000),
             geyser_program_filters: read_csv_env("GEYSER_PROGRAM_FILTERS"),
             geyser_account_filters: read_csv_env("GEYSER_ACCOUNT_FILTERS"),
             geyser_include_slots: read_bool_env("GEYSER_INCLUDE_SLOTS").unwrap_or(false),
             geyser_run_duration_seconds: env::var("GEYSER_RUN_DURATION_SECONDS")
                 .ok()
                 .and_then(|v| v.parse().ok()),
-            database_url: env::var("DATABASE_URL").ok(),
+            database_url: read_optional_env("DATABASE_URL"),
+            db_pool_max_connections: env::var("DB_POOL_MAX_CONNECTIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20),
+            batch_size: env::var("BATCH_SIZE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(500),
+            batch_flush_ms: env::var("BATCH_FLUSH_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100),
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string()),
         }
     }
@@ -70,6 +90,13 @@ fn read_csv_env(key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn read_optional_env(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn read_bool_env(key: &str) -> Option<bool> {

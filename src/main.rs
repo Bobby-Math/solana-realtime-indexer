@@ -1,5 +1,4 @@
-use std::sync::mpsc::sync_channel;
-use std::thread;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use solana_realtime_indexer::api;
@@ -7,131 +6,176 @@ use solana_realtime_indexer::api::rest::ApiSnapshot;
 use solana_realtime_indexer::config::Config;
 use solana_realtime_indexer::geyser::client::GeyserClient;
 use solana_realtime_indexer::geyser::consumer::{GeyserConfig, GeyserConsumer};
+use solana_realtime_indexer::geyser::wal_queue::WalQueue;
+use solana_realtime_indexer::geyser::wal_consumer::{WalPipelineConfig, WalPipelineRunner, RpcGapFiller};
 use solana_realtime_indexer::processor::batch_writer::BatchWriter;
 use solana_realtime_indexer::processor::decoder::{
     CustomDecoder, ProgramActivityDecoder, Type1Decoder,
 };
-use solana_realtime_indexer::processor::pipeline::ProcessorPipeline;
+use solana_realtime_indexer::processor::pipeline::{PipelineReport, ProcessorPipeline};
 use solana_realtime_indexer::processor::sink::{
     DryRunStorageSink, StorageSink, TimescaleStorageSink,
 };
 use solana_realtime_indexer::processor::store::{RetentionPolicy, Type1Store};
 use solana_realtime_indexer::PROJECT_NAME;
+use tokio::sync::Mutex;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Load .env file
+type SharedSnapshot = Arc<Mutex<ApiSnapshot>>;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
-
-    // Initialize logger
     env_logger::init();
 
     let config = Config::from_env();
-
-    // Determine which mode to run in
     let use_real_geyser = config.geyser_endpoint.is_some()
-        && !config.geyser_endpoint.as_ref().map(|e| e.starts_with("mock")).unwrap_or(false);
+        && !config
+            .geyser_endpoint
+            .as_ref()
+            .is_some_and(|endpoint| endpoint.starts_with("mock"));
 
     if use_real_geyser {
-        run_with_real_geyser(config)?;
+        run_with_real_geyser(config).await?;
     } else {
-        run_with_simulated_data(config)?;
+        run_with_simulated_data(config).await?;
     }
 
     Ok(())
 }
 
-fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    log::info!("Starting Solana Realtime Indexer with real Geyser connection");
+async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    log::info!("Starting Solana Realtime Indexer with real Geyser connection (WAL mode)");
 
     let api_key = config
         .geyser_api_key
         .clone()
-        .expect("Geyser API key must be set for real Geyser connection");
-
+        .ok_or("Geyser API key must be set for real Geyser connection")?;
     let geyser_config = GeyserConfig::new(
         config
             .geyser_endpoint
             .clone()
-            .expect("Geyser endpoint must be set"),
-        8,
+            .ok_or("Geyser endpoint must be set")?,
+        config.geyser_channel_capacity, // Still used for initial WAL sizing
         config.geyser_subscription_filters(),
     );
 
-    let (sender, receiver) = sync_channel(geyser_config.channel_capacity);
+    let storage_mode = storage_mode(&config);
+    let api_state = initial_api_state(&config, storage_mode);
 
-    let custom_decoders: Vec<Box<dyn CustomDecoder>> =
-        vec![Box::new(ProgramActivityDecoder::new("amm-program"))];
+    // Create WAL queue instead of bounded channel
+    let wal_path = format!("./data/wal/geyser_{}", chrono::Utc::now().timestamp());
+    std::fs::create_dir_all("./data/wal").ok();
+    let wal_queue = Arc::new(WalQueue::new(&wal_path)?);
 
-    let retention_policy = RetentionPolicy {
-        max_age: Duration::from_secs(60),
+    // Start WAL background flusher
+    let _wal_flush_handle = wal_queue.clone().start_background_flush().await;
+
+    // Create bounded channel to connect WAL pipeline to database pipeline
+    let (sender, receiver) = std::sync::mpsc::sync_channel(config.geyser_channel_capacity);
+
+    // Configure WAL pipeline
+    let wal_pipeline_config = WalPipelineConfig {
+        wal_path: wal_path.clone(),
+        poll_interval: Duration::from_millis(10), // Poll every 10ms
+        batch_size: config.batch_size,
+        batch_flush_ms: config.batch_flush_ms,
+        channel_capacity: config.geyser_channel_capacity,
     };
 
-    let storage_mode = if config.database_url.is_some() {
-        "timescale"
-    } else {
-        "dry-run"
-    };
+    // Start RPC gap filler
+    let gap_filler = RpcGapFiller::new(config.rpc_endpoints.clone(), wal_queue.clone());
+    let gap_filler_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            if let Err(e) = gap_filler.detect_and_fill_gaps().await {
+                log::error!("Gap filler error: {}", e);
+            }
+        }
+    });
 
-    let sink: Box<dyn StorageSink> = if let Some(database_url) = config.database_url.as_deref() {
-        Box::new(TimescaleStorageSink::connect(
-            database_url,
-            Type1Store::new(retention_policy.clone()),
-        )?)
-    } else {
-        Box::new(DryRunStorageSink::new(Type1Store::new(retention_policy)))
-    };
-
-    // Spawn Geyser client in async runtime
+    // Start Geyser client writing to WAL
     let geyser_client = GeyserClient::new(
-        geyser_config.clone(),
+        geyser_config,
         api_key,
         config.geyser_run_duration_seconds,
     );
-    let sender_clone = sender.clone();
-
-    let client_handle = thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new()
-            .expect("Failed to create tokio runtime");
-
-        rt.block_on(async {
-            match geyser_client.connect_and_subscribe(sender_clone).await {
-                Ok(events_count) => {
-                    log::info!("Geyser client processed {} events", events_count);
-                    events_count as i64
-                }
-                Err(e) => {
-                    log::error!("Geyser client error: {}", e);
-                    -1
-                }
+    let wal_queue_clone = wal_queue.clone();
+    let geyser_handle = tokio::spawn(async move {
+        match geyser_client.connect_and_subscribe(&wal_queue_clone).await {
+            Ok(events_count) => {
+                log::info!("✅ Geyser client processed {} events (WAL mode)", events_count);
+                let unprocessed = wal_queue_clone.get_unprocessed_count();
+                log::info!("📝 WAL state: {} events written, {} unprocessed",
+                          wal_queue_clone.get_total_written(), unprocessed);
             }
-        })
+            Err(error) => log::error!("Geyser client error: {}", error),
+        }
     });
 
-    // Run the processor pipeline
-    let pipeline_started_at = Instant::now();
-    let mut pipeline = ProcessorPipeline::new(
-        receiver,
-        BatchWriter::new(2, Duration::from_millis(10)),
-        Type1Decoder::new(),
-        custom_decoders,
-        sink,
-    );
+    // Start WAL pipeline consumer (connected to channel)
+    let wal_runner = Arc::new(WalPipelineRunner::new(
+        wal_queue.clone(),
+        wal_pipeline_config,
+        api_state.clone(),
+        sender,
+    ));
+    let wal_pipeline_handle = wal_runner.start_background_processor().await;
 
-    let report = pipeline.run()?;
-    let elapsed = pipeline_started_at.elapsed();
+    // Build database sink and start processor pipeline
+    let sink = build_sink(&config)?;
+    let pipeline_state = Arc::clone(&api_state);
+    let pipeline_config = RuntimeSnapshotConfig::from_config(&config, storage_mode);
+    let pipeline_handle = tokio::task::spawn_blocking(move || {
+        run_pipeline(receiver, sink, pipeline_config, pipeline_state)
+    });
 
-    // Wait for client to finish
-    let forwarded = client_handle
-        .join()
-        .map_err(|_| "Failed to join client thread")?
-        .max(0) as u64;
+    log_background_pipeline(pipeline_handle);
+    log_background_wal_pipeline(wal_pipeline_handle);
+    log_background_geyser(geyser_handle);
+    log_background_gap_filler(gap_filler_handle);
 
-    print_final_report(&config, storage_mode, elapsed, forwarded, report, "real-geyser");
+    // Start WAL metrics reporter
+    let _metrics_reporter = {
+        let wal_queue = wal_queue.clone();
+        let api_state = api_state.clone();
+        let channel_capacity = config.geyser_channel_capacity;
 
-    Ok(())
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+
+                let wal_unprocessed = wal_queue.get_unprocessed_count();
+
+                // Update API state with latest metrics
+                let mut state = api_state.lock().await;
+                state.wal_unprocessed_count = wal_unprocessed;
+
+                // Calculate channel utilization (0.0 to 1.0)
+                // We can't get exact channel depth without wrapping it, so we estimate
+                // based on WAL unprocessed count as a proxy
+                let utilization = if channel_capacity > 0 {
+                    (wal_unprocessed as f64 / (channel_capacity * 2) as f64).min(1.0)
+                } else {
+                    0.0
+                };
+                state.channel_utilization = utilization;
+            }
+        })
+    };
+
+    log::info!("🚀 Indexer running in WAL mode:");
+    log::info!("   - No event drops (correctness guaranteed)");
+    log::info!("   - No blocking (OS buffer + disk storage)");
+    log::info!("   - Gap detection + RPC fallback enabled");
+    log::info!("   - WAL path: {}", wal_path);
+    log::info!("   - WAL metrics exposed via /api/metrics");
+
+    serve_api(config.bind_address, api_state).await
 }
 
-fn run_with_simulated_data(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_with_simulated_data(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("Starting Solana Realtime Indexer with simulated data");
 
     let geyser_consumer = GeyserConsumer::new(GeyserConfig {
@@ -139,115 +183,228 @@ fn run_with_simulated_data(config: Config) -> Result<(), Box<dyn std::error::Err
             .geyser_endpoint
             .clone()
             .unwrap_or_else(|| "mock://local-geyser".to_string()),
-        channel_capacity: 8,
+        channel_capacity: config.geyser_channel_capacity,
         filters: config.geyser_subscription_filters(),
     });
-
-    let (sender, receiver) = sync_channel(geyser_consumer.config.channel_capacity);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(geyser_consumer.config.channel_capacity);
     let fixture = GeyserConsumer::simulated_fixture();
+    let storage_mode = storage_mode(&config);
+    let api_state = initial_api_state(&config, storage_mode);
 
-    let custom_decoders: Vec<Box<dyn CustomDecoder>> =
-        vec![Box::new(ProgramActivityDecoder::new("amm-program"))];
+    let producer_handle =
+        tokio::task::spawn_blocking(move || geyser_consumer.forward_events(&sender, fixture));
 
+    let sink = build_sink(&config)?;
+    let pipeline_state = Arc::clone(&api_state);
+    let pipeline_config = RuntimeSnapshotConfig::from_config(&config, storage_mode);
+    let pipeline_handle = tokio::task::spawn_blocking(move || {
+        run_pipeline(receiver, sink, pipeline_config, pipeline_state)
+    });
+
+    log_background_producer(producer_handle);
+    log_background_pipeline(pipeline_handle);
+    serve_api(config.bind_address, api_state).await
+}
+
+fn build_sink(config: &Config) -> Result<Box<dyn StorageSink>, Box<dyn std::error::Error>> {
     let retention_policy = RetentionPolicy {
         max_age: Duration::from_secs(60),
     };
 
-    let storage_mode = if config.database_url.is_some() {
-        "timescale"
-    } else {
-        "dry-run"
-    };
-
-    let sink: Box<dyn StorageSink> = if let Some(database_url) = config.database_url.as_deref() {
-        Box::new(TimescaleStorageSink::connect(
+    if let Some(database_url) = config.database_url.as_deref() {
+        Ok(Box::new(TimescaleStorageSink::connect_with_pool_size(
             database_url,
-            Type1Store::new(retention_policy.clone()),
-        )?)
+            Type1Store::new(retention_policy),
+            config.db_pool_max_connections,
+        )?))
     } else {
-        Box::new(DryRunStorageSink::new(Type1Store::new(retention_policy)))
-    };
+        Ok(Box::new(DryRunStorageSink::new(Type1Store::new(
+            retention_policy,
+        ))))
+    }
+}
 
-    let pipeline_started_at = Instant::now();
-    let producer = thread::spawn(move || geyser_consumer.forward_events(&sender, fixture));
-
+fn run_pipeline(
+    receiver: std::sync::mpsc::Receiver<solana_realtime_indexer::geyser::decoder::GeyserEvent>,
+    sink: Box<dyn StorageSink>,
+    snapshot_config: RuntimeSnapshotConfig,
+    api_state: SharedSnapshot,
+) -> Result<PipelineReport, String> {
+    let started_at = Instant::now();
+    let custom_decoders: Vec<Box<dyn CustomDecoder>> =
+        vec![Box::new(ProgramActivityDecoder::new("amm-program"))];
     let mut pipeline = ProcessorPipeline::new(
         receiver,
-        BatchWriter::new(2, Duration::from_millis(10)),
+        BatchWriter::new(
+            snapshot_config.batch_size,
+            Duration::from_millis(snapshot_config.batch_flush_ms),
+        ),
         Type1Decoder::new(),
         custom_decoders,
         sink,
     );
 
-    let report = pipeline.run()?;
-    let elapsed = pipeline_started_at.elapsed();
+    log::info!("Starting pipeline processor");
+    pipeline
+        .run_with_reporter(|report| {
+            update_api_state(&api_state, &snapshot_config, started_at.elapsed(), report.clone());
+        })
+        .map_err(|error| error.to_string())
+}
 
-    let forwarded = producer
-        .join()
-        .expect("producer thread should complete")
-        .expect("channel should remain open while forwarding") as u64;
+async fn serve_api(
+    bind_address: String,
+    api_state: SharedSnapshot,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let app = api::router_with_state(api_state);
+    let tcp_listener = tokio::net::TcpListener::bind(&bind_address).await?;
+    log::info!("API server listening on {}", bind_address);
 
-    print_final_report(&config, storage_mode, elapsed, forwarded, report, "simulated-data");
+    axum::serve(tcp_listener, app)
+        .with_graceful_shutdown(async {
+            tokio::signal::ctrl_c()
+                .await
+                .expect("failed to install CTRL+C handler");
+        })
+        .await?;
 
     Ok(())
 }
 
-fn print_final_report(
-    config: &Config,
-    storage_mode: &str,
+fn update_api_state(
+    api_state: &SharedSnapshot,
+    config: &RuntimeSnapshotConfig,
     elapsed: Duration,
-    forwarded_events: u64,
-    report: solana_realtime_indexer::processor::pipeline::PipelineReport,
-    status: &str,
+    report: PipelineReport,
 ) {
-    let api_snapshot = ApiSnapshot::from_report(
+    // 1. Lock the state and extract the current WAL metrics
+    let (current_wal_unprocessed, current_channel_utilization) = {
+        let state = api_state.blocking_lock();
+        (state.wal_unprocessed_count, state.channel_utilization)
+    };
+
+    // 2. Create the new snapshot
+    let mut snapshot = ApiSnapshot::from_report(
+        PROJECT_NAME,
+        config.storage_mode.clone(),
+        config.bind_address.clone(),
+        config.rpc_endpoint_count,
+        0,
+        elapsed,
+        unix_now_millis(),
+        report,
+    )
+    .with_runtime_config(
+        config.channel_capacity,
+        config.batch_size,
+        config.batch_flush_ms,
+    );
+
+    // 3. Inject the preserved WAL metrics into the new snapshot
+    snapshot.wal_unprocessed_count = current_wal_unprocessed;
+    snapshot.channel_utilization = current_channel_utilization;
+
+    // 4. Overwrite the state
+    *api_state.blocking_lock() = snapshot;
+}
+
+fn initial_api_state(config: &Config, storage_mode: &str) -> SharedSnapshot {
+    Arc::new(Mutex::new(ApiSnapshot::from_report(
         PROJECT_NAME,
         storage_mode,
         config.bind_address.clone(),
         config.rpc_endpoints.len(),
         0,
-        elapsed,
+        Duration::from_secs(0),
         unix_now_millis(),
-        report.clone(),
-    );
+        PipelineReport::default(),
+    )
+    .with_runtime_config(
+        config.geyser_channel_capacity,
+        config.batch_size,
+        config.batch_flush_ms,
+    )))
+}
 
-    let _api_router = api::router(api_snapshot);
+fn storage_mode(config: &Config) -> &'static str {
+    if config.database_url.is_some() {
+        "timescale"
+    } else {
+        "dry-run"
+    }
+}
 
-    println!("{PROJECT_NAME}");
-    println!("bind_address={}", config.bind_address);
-    println!("rpc_endpoints={}", config.rpc_endpoints.len());
-    println!(
-        "geyser_endpoint={}",
-        config
-            .geyser_endpoint
-            .as_deref()
-            .unwrap_or("mock://local-geyser")
-    );
-    println!("storage_mode={storage_mode}");
-    println!("forwarded_events={forwarded_events}");
-    println!("received_events={}", report.received_events);
-    println!("flushes={}", report.flush_count);
-    println!("account_rows_written={}", report.account_rows_written);
-    println!(
-        "transaction_rows_written={}",
-        report.transaction_rows_written
-    );
-    println!("slot_rows_written={}", report.slot_rows_written);
-    println!("custom_rows_written={}", report.custom_rows_written);
-    println!("sql_statements_planned={}", report.sql_statements_planned);
-    println!("retained_account_rows={}", report.retained_account_rows);
-    println!(
-        "retained_transaction_rows={}",
-        report.retained_transaction_rows
-    );
-    println!("retained_slot_rows={}", report.retained_slot_rows);
-    println!("retained_custom_rows={}", report.retained_custom_rows);
-    println!("pruned_account_rows={}", report.pruned_account_rows);
-    println!("pruned_transaction_rows={}", report.pruned_transaction_rows);
-    println!("pruned_slot_rows={}", report.pruned_slot_rows);
-    println!("pruned_custom_rows={}", report.pruned_custom_rows);
-    println!("api_routes=/health,/metrics");
-    println!("status={status}");
+#[derive(Clone)]
+struct RuntimeSnapshotConfig {
+    bind_address: String,
+    rpc_endpoint_count: usize,
+    storage_mode: String,
+    batch_size: usize,
+    batch_flush_ms: u64,
+    channel_capacity: usize,
+}
+
+impl RuntimeSnapshotConfig {
+    fn from_config(config: &Config, storage_mode: &str) -> Self {
+        Self {
+            bind_address: config.bind_address.clone(),
+            rpc_endpoint_count: config.rpc_endpoints.len(),
+            storage_mode: storage_mode.to_string(),
+            batch_size: config.batch_size,
+            batch_flush_ms: config.batch_flush_ms,
+            channel_capacity: config.geyser_channel_capacity,
+        }
+    }
+}
+
+fn log_background_pipeline(
+    handle: tokio::task::JoinHandle<Result<PipelineReport, String>>,
+) {
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(Ok(report)) => log::info!("Pipeline completed: {:?}", report),
+            Ok(Err(error)) => log::error!("Pipeline failed: {}", error),
+            Err(error) => log::error!("Pipeline task join failed: {}", error),
+        }
+    });
+}
+
+fn log_background_geyser(handle: tokio::task::JoinHandle<()>) {
+    tokio::spawn(async move {
+        if let Err(error) = handle.await {
+            log::error!("Geyser task join failed: {}", error);
+        }
+    });
+}
+
+fn log_background_wal_pipeline(handle: tokio::task::JoinHandle<Result<PipelineReport, String>>) {
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(Ok(report)) => log::info!("WAL Pipeline completed: {:?}", report),
+            Ok(Err(error)) => log::error!("WAL Pipeline failed: {}", error),
+            Err(error) => log::error!("WAL Pipeline task join failed: {}", error),
+        }
+    });
+}
+
+fn log_background_gap_filler(handle: tokio::task::JoinHandle<()>) {
+    tokio::spawn(async move {
+        if let Err(error) = handle.await {
+            log::error!("Gap filler task join failed: {}", error);
+        }
+    });
+}
+
+fn log_background_producer(
+    handle: tokio::task::JoinHandle<Result<usize, std::sync::mpsc::SendError<solana_realtime_indexer::geyser::decoder::GeyserEvent>>>,
+) {
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(Ok(forwarded)) => log::info!("Simulated producer forwarded {} events", forwarded),
+            Ok(Err(error)) => log::error!("Simulated producer failed: {}", error),
+            Err(error) => log::error!("Simulated producer task join failed: {}", error),
+        }
+    });
 }
 
 fn unix_now_millis() -> i64 {

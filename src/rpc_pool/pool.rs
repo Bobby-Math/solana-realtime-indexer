@@ -250,7 +250,7 @@ fn select_endpoint_index(
         }
 
         let key = endpoint.routing_key(assessment.as_ref(), now);
-        if selected_key.map_or(true, |current_key| key < current_key) {
+        if selected_key.is_none_or(|current_key| key < current_key) {
             selected_index = Some(index);
             selected_key = Some(key);
         }
@@ -283,10 +283,12 @@ mod tests {
 
     #[test]
     fn skips_unhealthy_endpoint_and_uses_alternative() {
-        let mut config = PoolConfig::default();
-        config.health_policy = HealthPolicy {
-            max_slot_lag: 2,
-            ..HealthPolicy::default()
+        let config = PoolConfig {
+            health_policy: HealthPolicy {
+                max_slot_lag: 2,
+                ..HealthPolicy::default()
+            },
+            ..PoolConfig::default()
         };
 
         let pool = RpcPool::new(
@@ -305,8 +307,10 @@ mod tests {
 
     #[test]
     fn failure_opens_circuit_and_updates_metrics() {
-        let mut config = PoolConfig::default();
-        config.circuit_open_threshold = 1;
+        let config = PoolConfig {
+            circuit_open_threshold: 1,
+            ..PoolConfig::default()
+        };
 
         let pool = RpcPool::new(vec!["rpc-a".to_string(), "rpc-b".to_string()], config);
         let now = Instant::now();
@@ -337,11 +341,13 @@ mod tests {
 
     #[test]
     fn degraded_endpoint_is_still_used_when_it_is_only_option() {
-        let mut config = PoolConfig::default();
-        config.health_policy = HealthPolicy {
-            max_latency_ms: 10,
-            stale_after: Duration::from_secs(60),
-            ..HealthPolicy::default()
+        let config = PoolConfig {
+            health_policy: HealthPolicy {
+                max_latency_ms: 10,
+                stale_after: Duration::from_secs(60),
+                ..HealthPolicy::default()
+            },
+            ..PoolConfig::default()
         };
 
         let pool = RpcPool::new(vec!["rpc-a".to_string()], config);
