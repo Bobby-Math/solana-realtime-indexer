@@ -1,6 +1,13 @@
-/docs/
+docs/
 target/
 .env
 .env.*
 .codex
-SOLANA_INFRA_PIPELINE_SPEC.md
+
+# Runtime artifacts
+data/
+logs/
+*.log
+
+# Generated/demo files
+web-interface.html

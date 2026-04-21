@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: solana_timescaledb
+    environment:
+      POSTGRES_USER: solana
+      POSTGRES_PASSWORD: solana
+      POSTGRES_DB: solana_pipeline
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb_data:/home/postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U solana"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    command: ["postgres", "-csynchronous_commit=off"]
+
+volumes:
+  timescaledb_data:
