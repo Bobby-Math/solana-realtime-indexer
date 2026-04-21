@@ -75,8 +75,8 @@ impl GeyserConsumer {
             GeyserEvent::AccountUpdate(AccountUpdate {
                 timestamp_unix_ms: 1_710_000_000_000,
                 slot: 9_001,
-                pubkey: "tracked-account".to_string(),
-                owner: "amm-program".to_string(),
+                pubkey: "tracked-account".as_bytes().to_vec(),
+                owner: "amm-program".as_bytes().to_vec(),
                 lamports: 42,
                 write_version: 7,
                 data: vec![1, 2, 3, 4],
@@ -84,10 +84,10 @@ impl GeyserConsumer {
             GeyserEvent::Transaction(TransactionUpdate {
                 timestamp_unix_ms: 1_710_000_000_001,
                 slot: 9_001,
-                signature: "tracked-signature".to_string(),
+                signature: "tracked-signature".as_bytes().to_vec(),
                 fee: 5_000,
                 success: true,
-                program_ids: vec!["amm-program".to_string(), "token-program".to_string()],
+                program_ids: vec![b"amm-program".to_vec(), b"token-program".to_vec()],
                 log_messages: vec!["swap".to_string(), "settled".to_string()],
             }),
             GeyserEvent::SlotUpdate(SlotUpdate {
@@ -99,8 +99,8 @@ impl GeyserConsumer {
             GeyserEvent::AccountUpdate(AccountUpdate {
                 timestamp_unix_ms: 1_710_000_000_003,
                 slot: 9_001,
-                pubkey: "ignored-account".to_string(),
-                owner: "noise-program".to_string(),
+                pubkey: "ignored-account".as_bytes().to_vec(),
+                owner: "noise-program".as_bytes().to_vec(),
                 lamports: 1,
                 write_version: 1,
                 data: vec![9, 9, 9],
@@ -113,20 +113,31 @@ impl SubscriptionFilter {
     fn matches(&self, event: &GeyserEvent) -> bool {
         match (self, event) {
             (SubscriptionFilter::Program(program), GeyserEvent::AccountUpdate(update)) => {
-                update.owner == *program
+                let program_bytes = program_filter_bytes(program);
+                update.owner == program_bytes
             }
-            (SubscriptionFilter::Program(program), GeyserEvent::Transaction(update)) => update
-                .program_ids
-                .iter()
-                .any(|program_id| program_id == program),
+            (SubscriptionFilter::Program(program), GeyserEvent::Transaction(update)) => {
+                let program_bytes = program_filter_bytes(program);
+                update
+                    .program_ids
+                    .iter()
+                    .any(|program_id_bytes| program_id_bytes == &program_bytes)
+            }
             (SubscriptionFilter::Account(account), GeyserEvent::AccountUpdate(update)) => {
-                update.pubkey == *account
+                let account_bytes = program_filter_bytes(account);
+                update.pubkey == account_bytes
             }
             (SubscriptionFilter::Slots, GeyserEvent::SlotUpdate(_)) => true,
             (SubscriptionFilter::Blocks, GeyserEvent::SlotUpdate(_)) => false,
             _ => false,
         }
     }
+}
+
+fn program_filter_bytes(program: &str) -> Vec<u8> {
+    bs58::decode(program)
+        .into_vec()
+        .unwrap_or_else(|_| program.as_bytes().to_vec())
 }
 
 #[cfg(test)]

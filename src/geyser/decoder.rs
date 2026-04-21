@@ -9,8 +9,8 @@ pub enum GeyserEvent {
 pub struct AccountUpdate {
     pub timestamp_unix_ms: i64,
     pub slot: u64,
-    pub pubkey: String,
-    pub owner: String,
+    pub pubkey: Vec<u8>,
+    pub owner: Vec<u8>,
     pub lamports: u64,
     pub write_version: u64,
     pub data: Vec<u8>,
@@ -20,10 +20,10 @@ pub struct AccountUpdate {
 pub struct TransactionUpdate {
     pub timestamp_unix_ms: i64,
     pub slot: u64,
-    pub signature: String,
+    pub signature: Vec<u8>,
     pub fee: u64,
     pub success: bool,
-    pub program_ids: Vec<String>,
+    pub program_ids: Vec<Vec<u8>>,
     pub log_messages: Vec<String>,
 }
 

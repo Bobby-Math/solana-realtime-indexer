@@ -1,14 +1,12 @@
 use futures::StreamExt;
-use std::sync::mpsc::SyncSender;
 use helius_laserstream::{subscribe, LaserstreamConfig, ChannelOptions};
 use helius_laserstream::grpc::{SubscribeRequest, SubscribeUpdate};
+use helius_laserstream::grpc::subscribe_update::UpdateOneof;
 use futures::pin_mut;
 
 use crate::geyser::consumer::GeyserConfig;
-use crate::geyser::decoder::{GeyserEvent, TransactionUpdate};
-
-// Import tokio::time if we need timeout functionality
-use tokio::time as tokio_time;
+use crate::geyser::decoder::{GeyserEvent, TransactionUpdate, AccountUpdate, SlotUpdate};
+use crate::geyser::wal_queue::WalQueue;
 
 #[derive(Debug)]
 pub enum GeyserClientError {
@@ -44,12 +42,14 @@ impl GeyserClient {
 
     pub async fn connect_and_subscribe(
         &self,
-        sender: SyncSender<GeyserEvent>,
+        wal_queue: &WalQueue,
     ) -> Result<u64, GeyserClientError> {
         let endpoint = self.config.endpoint.clone();
 
-        // Set timeout if configured
-        let timeout_duration = self.run_duration_seconds.map(std::time::Duration::from_secs);
+        // Set timeout if configured (0 means run indefinitely)
+        let timeout_duration = self.run_duration_seconds
+            .filter(|&secs| secs > 0)  // 0 means run indefinitely
+            .map(std::time::Duration::from_secs);
         let start_time = std::time::Instant::now();
 
         // Build Helius Laserstream configuration
@@ -101,10 +101,18 @@ impl GeyserClient {
 
                 match maybe_data {
                     Ok(Some(Ok(data))) => {
-                        // Convert Helius data to GeyserEvent
-                        if let Some(event) = self.handle_helius_data(data) {
-                            if sender.send(event).is_err() {
-                                log::error!("Channel closed, stopping Geyser client");
+                        // Extract slot for WAL ordering and convert to GeyserEvent for filtering
+                        let slot = self.extract_slot(&data);
+                        if let Some(event) = self.handle_helius_data(data.clone()) {
+                            // Apply client-side filtering to ensure event matches configured filters
+                            if !self.event_matches_filters(&event) {
+                                log::trace!("Event filtered out by client-side filters: {:?}", event);
+                                continue;
+                            }
+
+                            // Write raw protobuf bytes to WAL - non-blocking, no drops
+                            if let Err(e) = wal_queue.push_update(slot, &data) {
+                                log::error!("WAL write error: {}, stopping Geyser client", e);
                                 break;
                             }
                             events_processed += 1;
@@ -140,10 +148,18 @@ impl GeyserClient {
                 // No timeout - run forever
                 match stream.next().await {
                     Some(Ok(data)) => {
-                        // Convert Helius data to GeyserEvent
-                        if let Some(event) = self.handle_helius_data(data) {
-                            if sender.send(event).is_err() {
-                                log::error!("Channel closed, stopping Geyser client");
+                        // Extract slot for WAL ordering and convert to GeyserEvent for filtering
+                        let slot = self.extract_slot(&data);
+                        if let Some(event) = self.handle_helius_data(data.clone()) {
+                            // Apply client-side filtering to ensure event matches configured filters
+                            if !self.event_matches_filters(&event) {
+                                log::trace!("Event filtered out by client-side filters: {:?}", event);
+                                continue;
+                            }
+
+                            // Write raw protobuf bytes to WAL - non-blocking, no drops
+                            if let Err(e) = wal_queue.push_update(slot, &data) {
+                                log::error!("WAL write error: {}, stopping Geyser client", e);
                                 break;
                             }
                             events_processed += 1;
@@ -188,36 +204,263 @@ impl GeyserClient {
     }
 
     fn build_subscription_request(&self) -> Result<SubscribeRequest, GeyserClientError> {
-        let request = SubscribeRequest {
+        use crate::geyser::consumer::SubscriptionFilter;
+        use helius_laserstream::grpc::{SubscribeRequestFilterAccounts, SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions};
+        use std::collections::HashMap;
+
+        let mut request = SubscribeRequest {
             commitment: Some(2), // 2 = Confirmed commitment level
             ..Default::default()
         };
 
-        // For now, use a simple subscription request
-        // TODO: Add transaction and account filters when Helius SDK documentation is clear
-        if !self.config.filters.is_empty() {
-            log::info!("Applying {} filters (basic subscription for now)", self.config.filters.len());
+        // Collect configured filters
+        let mut account_pubkeys: Vec<String> = Vec::new();
+        let mut program_ids: Vec<String> = Vec::new();
+        let mut has_slot_filters = false;
+
+        for filter in &self.config.filters {
+            match filter {
+                SubscriptionFilter::Account(pubkey) => {
+                    account_pubkeys.push(pubkey.clone());
+                }
+                SubscriptionFilter::Program(program_id) => {
+                    program_ids.push(program_id.clone());
+                }
+                SubscriptionFilter::Slots => {
+                    has_slot_filters = true;
+                }
+                SubscriptionFilter::Blocks => {
+                    // Blocks metadata - not directly supported in basic Laserstream filters
+                    log::warn!("Blocks filter not directly supported, will be handled via client-side filtering");
+                }
+            }
         }
 
+        // Build accounts subscription with server-side filtering
+        let has_account_filters = !account_pubkeys.is_empty() || !program_ids.is_empty();
+
+        if has_account_filters {
+            let mut accounts_map = HashMap::new();
+            accounts_map.insert("filtered_accounts".to_string(), SubscribeRequestFilterAccounts {
+                account: account_pubkeys.clone(),
+                owner: program_ids.clone(),
+                filters: vec![],
+                nonempty_txn_signature: Some(false),
+            });
+            request.accounts = accounts_map;
+            log::info!("Subscribed to filtered account updates: {} specific accounts, {} program owners",
+                      request.accounts.get("filtered_accounts").map(|f| f.account.len()).unwrap_or(0),
+                      request.accounts.get("filtered_accounts").map(|f| f.owner.len()).unwrap_or(0));
+        } else {
+            // No account filters configured - subscribe to all accounts (expensive!)
+            let mut accounts_map = HashMap::new();
+            accounts_map.insert("all_accounts".to_string(), SubscribeRequestFilterAccounts {
+                account: vec![],
+                owner: vec![],
+                filters: vec![],
+                nonempty_txn_signature: Some(false),
+            });
+            request.accounts = accounts_map;
+            log::warn!("No account filters configured - subscribing to ALL account updates (expensive!)");
+        }
+
+        // Build transactions subscription with server-side filtering
+        // Note: Helius transaction filtering is more limited, so we may need client-side filtering too
+        let mut transactions_map = HashMap::new();
+        transactions_map.insert("filtered_transactions".to_string(), SubscribeRequestFilterTransactions {
+            vote: Some(false),
+            failed: Some(false),
+            signature: None,
+            account_include: account_pubkeys.clone(), // Include transactions mentioning filtered accounts
+            account_exclude: vec![],
+            account_required: vec![],
+        });
+        request.transactions = transactions_map;
+        log::info!("Subscribed to transaction updates with {} account filters",
+                  request.transactions.get("filtered_transactions").map(|f| f.account_include.len()).unwrap_or(0));
+
+        // Subscribe to slots if slot filters are configured
+        if has_slot_filters {
+            let mut slots_map = HashMap::new();
+            slots_map.insert("all_slots".to_string(), SubscribeRequestFilterSlots {
+                filter_by_commitment: Some(true),
+                interslot_updates: Some(false),
+            });
+            request.slots = slots_map;
+            log::info!("Subscribed to slot updates");
+        }
+
+        log::info!("Built SubscribeRequest with {} account subscriptions, {} transaction subscriptions, {} slot subscriptions",
+                  request.accounts.len(), request.transactions.len(), request.slots.len());
+
         Ok(request)
+    }
+
+    fn event_matches_filters(&self, event: &GeyserEvent) -> bool {
+        use crate::geyser::consumer::SubscriptionFilter;
+
+        // If no filters configured, accept all events
+        if self.config.filters.is_empty() {
+            return true;
+        }
+
+        // Check if any filter matches this event
+        self.config.filters.iter().any(|filter| match (filter, event) {
+            (SubscriptionFilter::Program(program_id), GeyserEvent::AccountUpdate(update)) => {
+                let program_id_bytes = program_filter_bytes(program_id);
+                update.owner == program_id_bytes
+            }
+            (SubscriptionFilter::Program(program_id), GeyserEvent::Transaction(update)) => {
+                let program_id_bytes = program_filter_bytes(program_id);
+                update
+                    .program_ids
+                    .iter()
+                    .any(|id_bytes| id_bytes == &program_id_bytes)
+            }
+            (SubscriptionFilter::Account(pubkey), GeyserEvent::AccountUpdate(update)) => {
+                let pubkey_bytes = program_filter_bytes(pubkey);
+                update.pubkey == pubkey_bytes
+            }
+            (SubscriptionFilter::Account(_pubkey), GeyserEvent::Transaction(_update)) => {
+                // For transactions, we'd need to check account keys - this is a simplified check
+                // In production, you'd parse the transaction's account list
+                false // Placeholder - requires full transaction parsing
+            }
+            (SubscriptionFilter::Slots, GeyserEvent::SlotUpdate(_)) => true,
+            (SubscriptionFilter::Blocks, GeyserEvent::SlotUpdate(_)) => false,
+            _ => false,
+        })
+    }
+
+    fn extract_slot(&self, data: &SubscribeUpdate) -> u64 {
+        match &data.update_oneof {
+            Some(UpdateOneof::Account(acc)) => acc.slot,
+            Some(UpdateOneof::Transaction(tx)) => tx.slot,
+            Some(UpdateOneof::Slot(slot)) => slot.slot,
+            Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => 0,
+            Some(UpdateOneof::Block(_)) | Some(UpdateOneof::BlockMeta(_)) | Some(UpdateOneof::TransactionStatus(_)) | Some(UpdateOneof::Entry(_)) => 0,
+            None => 0,
+        }
     }
 
     fn handle_helius_data(&self, data: SubscribeUpdate) -> Option<GeyserEvent> {
         let timestamp_unix_ms = chrono::Utc::now().timestamp_millis();
 
-        // For now, just log that we received data and create a placeholder event
-        // TODO: Implement proper conversion once we understand the Helius SDK types
-        log::info!("Received Helius data: {:?}", data);
+        // Parse the update based on its type
+        match data.update_oneof? {
+            UpdateOneof::Account(account_update) => {
+                log::debug!("Received account update for slot {}", account_update.slot);
 
-        // Create a placeholder transaction event for now
-        Some(GeyserEvent::Transaction(TransactionUpdate {
-            timestamp_unix_ms,
-            slot: 0,
-            signature: format!("{:?}", data),
-            fee: 5000,
-            success: true,
-            program_ids: vec![],
-            log_messages: vec![],
-        }))
+                // Extract account info if available
+                if let Some(account_info) = account_update.account {
+                    log::trace!("Account update: pubkey (bytes), owner (bytes), lamports={}, slot={}",
+                              account_info.lamports, account_update.slot);
+
+                    Some(GeyserEvent::AccountUpdate(AccountUpdate {
+                        timestamp_unix_ms,
+                        slot: account_update.slot,
+                        pubkey: account_info.pubkey.clone(),
+                        owner: account_info.owner.clone(),
+                        lamports: account_info.lamports,
+                        write_version: account_info.write_version,
+                        data: account_info.data,
+                    }))
+                } else {
+                    log::warn!("Account update missing account info for slot {}", account_update.slot);
+                    None
+                }
+            }
+            UpdateOneof::Transaction(tx_update) => {
+                log::debug!("Received transaction update for slot {}", tx_update.slot);
+
+                // Extract transaction info if available
+                if let Some(tx_info) = tx_update.transaction {
+                    // Determine success (err is None means success)
+                    let success = tx_info.meta.as_ref()
+                        .map(|meta| meta.err.is_none())
+                        .unwrap_or(false);  // If no meta, assume failed
+
+                    // Extract fee
+                    let fee = tx_info.meta.as_ref()
+                        .map(|meta| meta.fee)
+                        .unwrap_or(0);
+
+                    // Extract log messages
+                    let log_messages = tx_info.meta.as_ref()
+                        .map(|meta| meta.log_messages.clone())
+                        .unwrap_or_default();
+
+                    // Extract program_ids from transaction data
+                    // In Solana transactions, each instruction has a program_id_index that points
+                    // to the account key that is the program being invoked
+                    let program_ids = if let Some(tx) = &tx_info.transaction {
+                        // Access the message field which contains account_keys and instructions
+                        if let Some(message) = &tx.message {
+                            // Extract program IDs from instructions (keep as raw bytes, not base58 strings)
+                            let mut invoked_programs = std::collections::HashSet::new();
+                            for instruction in &message.instructions {
+                                let program_idx = instruction.program_id_index as usize;
+                                if program_idx < message.account_keys.len() {
+                                    // Store as raw bytes directly for database compatibility
+                                    invoked_programs.insert(message.account_keys[program_idx].clone());
+                                }
+                            }
+                            invoked_programs.into_iter().collect()
+                        } else {
+                            log::debug!("No message field in transaction, program_ids will be empty");
+                            Vec::new()
+                        }
+                    } else {
+                        // Fallback: try to extract from transaction meta if available
+                        // This is less reliable but better than nothing
+                        log::debug!("No transaction field available, program_ids will be empty");
+                        Vec::new()
+                    };
+
+                    log::trace!("Transaction update: signature (bytes), success={}, fee={}, slot={}",
+                              success, fee, tx_update.slot);
+
+                    Some(GeyserEvent::Transaction(TransactionUpdate {
+                        timestamp_unix_ms,
+                        slot: tx_update.slot,
+                        signature: tx_info.signature.clone(),
+                        fee,
+                        success,
+                        program_ids,
+                        log_messages,
+                    }))
+                } else {
+                    log::warn!("Transaction update missing transaction info for slot {}", tx_update.slot);
+                    None
+                }
+            }
+            UpdateOneof::Slot(slot_update) => {
+                log::debug!("Received slot update: {}", slot_update.slot);
+                Some(GeyserEvent::SlotUpdate(SlotUpdate {
+                    timestamp_unix_ms,
+                    slot: slot_update.slot,
+                    parent_slot: slot_update.parent,
+                    status: format!("{:?}", slot_update.status),
+                }))
+            }
+            UpdateOneof::Ping(_) => {
+                log::trace!("Received ping - ignoring");
+                None
+            }
+            UpdateOneof::Pong(_) => {
+                log::trace!("Received pong - ignoring");
+                None
+            }
+            other => {
+                log::warn!("Received unhandled update type: {:?}", std::mem::discriminant(&other));
+                None
+            }
+        }
     }
+}
+
+fn program_filter_bytes(program_id: &str) -> Vec<u8> {
+    bs58::decode(program_id)
+        .into_vec()
+        .unwrap_or_else(|_| program_id.as_bytes().to_vec())
 }
