@@ -139,9 +139,8 @@ async fn execute_slots_upsert(
     sqlx::query(
         "INSERT INTO slots (slot, parent_slot, timestamp, status)
          SELECT * FROM UNNEST($1::bigint[], $2::bigint[], $3::timestamptz[], $4::text[])
-         ON CONFLICT (slot) DO UPDATE SET
+         ON CONFLICT (timestamp, slot) DO UPDATE SET
            parent_slot = EXCLUDED.parent_slot,
-           timestamp = EXCLUDED.timestamp,
            status = EXCLUDED.status"
     )
     .bind(&slots)
@@ -165,17 +164,19 @@ async fn execute_custom_decoded_insert(
     let slots: Vec<i64> = rows.iter().map(|row| row.slot).collect();
     let decoder_names: Vec<String> = rows.iter().map(|row| row.decoder_name.clone()).collect();
     let record_keys: Vec<String> = rows.iter().map(|row| row.record_key.clone()).collect();
+    let event_indexes: Vec<i16> = rows.iter().map(|row| row.event_index).collect();
     let payloads: Vec<String> = rows.iter().map(|row| row.payload.clone()).collect();
 
     sqlx::query(
-        "INSERT INTO custom_decoded_events (timestamp, slot, decoder_name, record_key, payload)
-         SELECT * FROM UNNEST($1::timestamptz[], $2::bigint[], $3::text[], $4::text[], $5::text[])
-         ON CONFLICT (timestamp, decoder_name, record_key, slot) DO NOTHING"
+        "INSERT INTO custom_decoded_events (timestamp, slot, decoder_name, record_key, event_index, payload)
+         SELECT * FROM UNNEST($1::timestamptz[], $2::bigint[], $3::text[], $4::text[], $5::smallint[], $6::text[])
+         ON CONFLICT (timestamp, decoder_name, record_key, slot, event_index) DO NOTHING"
     )
     .bind(&timestamps)
     .bind(&slots)
     .bind(&decoder_names)
     .bind(&record_keys)
+    .bind(&event_indexes)
     .bind(&payloads)
     .execute(&mut **transaction)
     .await?;

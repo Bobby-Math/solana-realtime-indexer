@@ -65,25 +65,23 @@ impl Type1Decoder {
                     persisted.account_rows.push(AccountUpdateRow {
                         slot: update.slot as i64,
                         timestamp_unix_ms: update.timestamp_unix_ms,
-                        pubkey: update.pubkey.into_bytes(),
-                        owner: update.owner.into_bytes(),
+                        pubkey: update.pubkey.clone(),
+                        owner: update.owner.clone(),
                         lamports: update.lamports as i64,
                         data: update.data,
                         write_version: update.write_version as i64,
                     });
                 }
                 GeyserEvent::Transaction(update) => {
+                    log::debug!("Processing transaction: signature={:?}, program_ids count={}",
+                              update.signature, update.program_ids.len());
                     persisted.transaction_rows.push(TransactionRow {
                         slot: update.slot as i64,
                         timestamp_unix_ms: update.timestamp_unix_ms,
-                        signature: update.signature.into_bytes(),
+                        signature: update.signature.clone(),
                         fee: update.fee as i64,
                         success: update.success,
-                        program_ids: update
-                            .program_ids
-                            .into_iter()
-                            .map(String::into_bytes)
-                            .collect(),
+                        program_ids: update.program_ids,
                         log_messages: update.log_messages,
                     });
                 }
@@ -102,15 +100,25 @@ impl Type1Decoder {
     }
 }
 
+impl Default for Type1Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProgramActivityDecoder {
-    program_id: String,
+    program_id: Vec<u8>,
 }
 
 impl ProgramActivityDecoder {
-    pub fn new(program_id: impl Into<String>) -> Self {
+    pub fn new(program_id: impl AsRef<str>) -> Self {
+        // Decode the program_id once during construction
+        let program_id_bytes = bs58::decode(program_id.as_ref())
+            .into_vec()
+            .unwrap_or_else(|_| program_id.as_ref().as_bytes().to_vec());
         Self {
-            program_id: program_id.into(),
+            program_id: program_id_bytes,
         }
     }
 }
@@ -123,22 +131,28 @@ impl CustomDecoder for ProgramActivityDecoder {
     fn decode(&mut self, event: &GeyserEvent) -> Option<CustomDecodedRow> {
         match event {
             GeyserEvent::AccountUpdate(update) if update.owner == self.program_id => {
+                // Encode pubkey back to base58 for the record_key (CustomDecodedRow uses String)
+                let record_key = bs58::encode(&update.pubkey).into_string();
                 Some(CustomDecodedRow {
                     decoder_name: self.name().to_string(),
-                    record_key: update.pubkey.clone(),
+                    record_key,
                     slot: update.slot as i64,
                     timestamp_unix_ms: update.timestamp_unix_ms,
+                    event_index: 0,
                     payload: "account_update".to_string(),
                 })
             }
             GeyserEvent::Transaction(update)
                 if transaction_mentions_program(update, &self.program_id) =>
             {
+                // Encode signature back to base58 for the record_key (CustomDecodedRow uses String)
+                let record_key = bs58::encode(&update.signature).into_string();
                 Some(CustomDecodedRow {
                     decoder_name: self.name().to_string(),
-                    record_key: update.signature.clone(),
+                    record_key,
                     slot: update.slot as i64,
                     timestamp_unix_ms: update.timestamp_unix_ms,
+                    event_index: 0,
                     payload: "transaction".to_string(),
                 })
             }
@@ -147,11 +161,11 @@ impl CustomDecoder for ProgramActivityDecoder {
     }
 }
 
-fn transaction_mentions_program(update: &TransactionUpdate, program_id: &str) -> bool {
+fn transaction_mentions_program(update: &TransactionUpdate, program_id: &[u8]) -> bool {
     update
         .program_ids
         .iter()
-        .any(|candidate| candidate == program_id)
+        .any(|candidate_bytes| candidate_bytes == program_id)
 }
 
 #[cfg(test)]
@@ -171,8 +185,8 @@ mod tests {
                 GeyserEvent::AccountUpdate(AccountUpdate {
                     timestamp_unix_ms: 1_710_000_000_000,
                     slot: 50,
-                    pubkey: "tracked-account".to_string(),
-                    owner: "amm-program".to_string(),
+                    pubkey: "tracked-account".as_bytes().to_vec(),
+                    owner: "amm-program".as_bytes().to_vec(),
                     lamports: 9,
                     write_version: 1,
                     data: vec![1, 2, 3],
@@ -180,10 +194,10 @@ mod tests {
                 GeyserEvent::Transaction(TransactionUpdate {
                     timestamp_unix_ms: 1_710_000_000_001,
                     slot: 50,
-                    signature: "tracked-signature".to_string(),
+                    signature: "tracked-signature".as_bytes().to_vec(),
                     fee: 5_000,
                     success: true,
-                    program_ids: vec!["amm-program".to_string()],
+                    program_ids: vec!["amm-program".as_bytes().to_vec()],
                     log_messages: vec!["swap".to_string()],
                 }),
             ],

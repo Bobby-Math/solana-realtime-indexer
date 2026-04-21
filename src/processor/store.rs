@@ -185,6 +185,7 @@ mod tests {
                 record_key: "tracked".to_string(),
                 slot: 2,
                 timestamp_unix_ms: 125,
+                event_index: 0,
                 payload: "transaction".to_string(),
             }],
         };

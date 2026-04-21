@@ -34,5 +34,6 @@ pub struct CustomDecodedRow {
     pub record_key: String,
     pub slot: i64,
     pub timestamp_unix_ms: i64,
+    pub event_index: i16,
     pub payload: String,
 }

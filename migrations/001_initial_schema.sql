@@ -23,10 +23,11 @@ CREATE TABLE IF NOT EXISTS transactions (
 );
 
 CREATE TABLE IF NOT EXISTS slots (
-    slot BIGINT PRIMARY KEY,
-    parent_slot BIGINT,
     timestamp TIMESTAMPTZ NOT NULL,
-    status TEXT NOT NULL
+    slot BIGINT NOT NULL,
+    parent_slot BIGINT,
+    status TEXT NOT NULL,
+    PRIMARY KEY (timestamp, slot)
 );
 
 CREATE TABLE IF NOT EXISTS custom_decoded_events (
@@ -34,8 +35,9 @@ CREATE TABLE IF NOT EXISTS custom_decoded_events (
     slot BIGINT NOT NULL,
     decoder_name TEXT NOT NULL,
     record_key TEXT NOT NULL,
+    event_index SMALLINT NOT NULL DEFAULT 0,
     payload TEXT NOT NULL,
-    PRIMARY KEY (timestamp, decoder_name, record_key, slot)
+    PRIMARY KEY (timestamp, decoder_name, record_key, slot, event_index)
 );
 
 CREATE TABLE IF NOT EXISTS pipeline_metrics (
@@ -55,7 +57,8 @@ CREATE TABLE IF NOT EXISTS ingestion_checkpoints (
     notes TEXT
 );
 
-SELECT create_hypertable('account_updates', 'timestamp', if_not_exists => TRUE);
-SELECT create_hypertable('transactions', 'timestamp', if_not_exists => TRUE);
-SELECT create_hypertable('custom_decoded_events', 'timestamp', if_not_exists => TRUE);
-SELECT create_hypertable('pipeline_metrics', 'timestamp', if_not_exists => TRUE);
+SELECT create_hypertable('account_updates', 'timestamp', chunk_time_interval => INTERVAL '2 hours', if_not_exists => TRUE);
+SELECT create_hypertable('transactions', 'timestamp', chunk_time_interval => INTERVAL '2 hours', if_not_exists => TRUE);
+SELECT create_hypertable('custom_decoded_events', 'timestamp', chunk_time_interval => INTERVAL '2 hours', if_not_exists => TRUE);
+SELECT create_hypertable('pipeline_metrics', 'timestamp', chunk_time_interval => INTERVAL '1 hour', if_not_exists => TRUE);
+SELECT create_hypertable('slots', 'timestamp', chunk_time_interval => INTERVAL '1 day', if_not_exists => TRUE);

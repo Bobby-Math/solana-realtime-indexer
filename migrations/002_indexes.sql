@@ -16,9 +16,6 @@ CREATE INDEX IF NOT EXISTS idx_transactions_slot_timestamp
 CREATE INDEX IF NOT EXISTS idx_transactions_program_ids
     ON transactions USING GIN (program_ids);
 
-CREATE INDEX IF NOT EXISTS idx_slots_timestamp
-    ON slots (timestamp DESC);
-
 CREATE INDEX IF NOT EXISTS idx_slots_parent_slot
     ON slots (parent_slot);
 
