@@ -1,4 +1,3 @@
-use std::mem;
 use std::time::{Duration, Instant};
 
 use crate::geyser::decoder::GeyserEvent;
@@ -72,7 +71,7 @@ impl BatchWriter {
             return None;
         }
 
-        let events = mem::take(&mut self.buffer);
+        let events = std::mem::replace(&mut self.buffer, Vec::with_capacity(self.flush_size));
         let batch = BufferedBatch { reason, events };
 
         self.metrics.flush_count += 1;
@@ -97,8 +96,8 @@ mod tests {
         writer.push(GeyserEvent::AccountUpdate(AccountUpdate {
             timestamp_unix_ms: 1_710_000_000_000,
             slot: 100,
-            pubkey: "account-a".to_string(),
-            owner: "program-a".to_string(),
+            pubkey: "account-a".as_bytes().to_vec(),
+            owner: "program-a".as_bytes().to_vec(),
             lamports: 10,
             write_version: 1,
             data: vec![1, 2],
@@ -106,10 +105,10 @@ mod tests {
         writer.push(GeyserEvent::Transaction(TransactionUpdate {
             timestamp_unix_ms: 1_710_000_000_001,
             slot: 100,
-            signature: "sig-a".to_string(),
+            signature: "sig-a".as_bytes().to_vec(),
             fee: 5_000,
             success: true,
-            program_ids: vec!["program-a".to_string()],
+            program_ids: vec![b"program-a".to_vec()],
             log_messages: vec!["ok".to_string()],
         }));
 

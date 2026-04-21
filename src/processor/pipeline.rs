@@ -55,6 +55,13 @@ impl ProcessorPipeline {
     }
 
     pub fn run(&mut self) -> Result<PipelineReport, StorageError> {
+        self.run_with_reporter(|_| {})
+    }
+
+    pub fn run_with_reporter<F>(&mut self, mut report_progress: F) -> Result<PipelineReport, StorageError>
+    where
+        F: FnMut(&PipelineReport),
+    {
         let mut report = PipelineReport::default();
 
         loop {
@@ -65,11 +72,13 @@ impl ProcessorPipeline {
 
                     if let Some(batch) = self.writer.flush_if_needed(Instant::now()) {
                         self.process_batch(batch, &mut report)?;
+                        report_progress(&report);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if let Some(batch) = self.writer.flush(FlushReason::Interval, Instant::now()) {
                         self.process_batch(batch, &mut report)?;
+                        report_progress(&report);
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
@@ -78,6 +87,7 @@ impl ProcessorPipeline {
                         .flush(FlushReason::ChannelClosed, Instant::now())
                     {
                         self.process_batch(batch, &mut report)?;
+                        report_progress(&report);
                     }
                     break;
                 }
@@ -181,8 +191,8 @@ mod tests {
             .send(GeyserEvent::AccountUpdate(AccountUpdate {
                 timestamp_unix_ms: 1_710_000_000_000,
                 slot: 10,
-                pubkey: "tracked-account".to_string(),
-                owner: "tracked-program".to_string(),
+                pubkey: "tracked-account".as_bytes().to_vec(),
+                owner: "tracked-program".as_bytes().to_vec(),
                 lamports: 5,
                 write_version: 1,
                 data: vec![1, 2, 3],

@@ -1,9 +1,9 @@
 // Protocol Pulse - Immediate Value Demo
 // This creates an impressive live dashboard for prospects
+#![allow(dead_code)]
 
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
-use solana_realtime_indexer::geyser::decoder::{GeyserEvent, TransactionUpdate};
+use solana_realtime_indexer::geyser::decoder::GeyserEvent;
 
 #[derive(Debug, Clone)]
 struct ProtocolMetrics {
@@ -61,10 +61,12 @@ impl ProtocolPulse {
             GeyserEvent::Transaction(tx) => {
                 // Track large transactions
                 if tx.fee > 10000 {
+                    let signature_str = bs58::encode(&tx.signature).into_string();
+
                     self.large_transactions.push(LargeTransaction {
                         timestamp: tx.timestamp_unix_ms,
                         amount: tx.fee as f64 / 1_000_000.0, // Convert to lamports to SOL
-                        wallet: tx.signature.clone(),
+                        wallet: signature_str.clone(),
                         description: format!("Large transaction: {} SOL", tx.fee as f64 / 1_000_000_000.0),
                     });
 
@@ -72,7 +74,7 @@ impl ProtocolPulse {
                     self.metrics.alerts.push(format!(
                         "🚨 Large transaction detected: {} SOL - {}",
                         tx.fee as f64 / 1_000_000_000.0,
-                        tx.signature
+                        signature_str
                     ));
                 }
 
@@ -164,10 +166,10 @@ fn create_demo_event(num: i32) -> GeyserEvent {
     GeyserEvent::Transaction(solana_realtime_indexer::geyser::decoder::TransactionUpdate {
         timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
         slot: 123456 + num as u64,
-        signature: format!("demo_signature_{}", num),
+        signature: format!("demo_signature_{}", num).as_bytes().to_vec(),
         fee: 50000 * num as u64, // Increasing fees
         success: true,
-        program_ids: vec!["token-program".to_string()],
+        program_ids: vec![b"token-program".to_vec()],
         log_messages: vec![],
     })
 }

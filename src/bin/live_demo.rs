@@ -1,8 +1,8 @@
 // "Wow Factor" Live Demo - Immediate Client Impressions
 // Run this to show prospects what's possible with their data
+#![allow(dead_code)]
 
-use std::time::{Duration, Instant};
-use std::collections::HashMap;
+use std::time::Instant;
 
 struct LiveDemo {
     metrics: DemoMetrics,
@@ -120,7 +120,7 @@ impl LiveDemo {
         println!("👥 Active Users: {} ({} events/sec)", self.metrics.active_users,
                  self.metrics.transactions_per_second as i64);
         println!("🏥 Health Score: {:.0}/100 ({})", self.metrics.health_score,
-                 if self.metrics.health_score > 80 { "✅ EXCELLENT" } else { "⚠️ ATTENTION" });
+                 if self.metrics.health_score > 80.0 { "✅ EXCELLENT" } else { "⚠️ ATTENTION" });
         println!("💵 Revenue (24h): ${:.2}", self.metrics.revenue_24h);
         println!();
     }
