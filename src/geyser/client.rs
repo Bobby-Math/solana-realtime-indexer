@@ -343,6 +343,34 @@ impl GeyserClient {
         }
     }
 
+    fn map_slot_status(status: i32) -> String {
+        // Map prost protobuf enum values to strings
+        // SlotStatus enum values from geyser.proto:
+        // SLOT_PROCESSED = 0
+        // SLOT_CONFIRMED = 1
+        // SLOT_FINALIZED = 2
+        // SLOT_FIRST_SHRED_RECEIVED = 3
+        // SLOT_COMPLETED = 4
+        // SLOT_CREATED_BANK = 5
+        // SLOT_DEAD = 6
+        let status_str = match status {
+            0 => "processed",
+            1 => "confirmed",
+            2 => "finalized",
+            3 => "first_shred_received",
+            4 => "completed",
+            5 => "created_bank",
+            6 => "dead",
+            _ => {
+                log::warn!("Unknown slot status value: {}, using 'unknown'", status);
+                "unknown"
+            }
+        };
+
+        log::debug!("Mapping slot status {} -> '{}'", status, status_str);
+        status_str.to_string()
+    }
+
     fn handle_helius_data(&self, data: SubscribeUpdate) -> Option<GeyserEvent> {
         let timestamp_unix_ms = chrono::Utc::now().timestamp_millis();
 
@@ -435,12 +463,12 @@ impl GeyserClient {
                 }
             }
             UpdateOneof::Slot(slot_update) => {
-                log::debug!("Received slot update: {}", slot_update.slot);
+                log::debug!("Received slot update: {} with status value: {:?}", slot_update.slot, slot_update.status);
                 Some(GeyserEvent::SlotUpdate(SlotUpdate {
                     timestamp_unix_ms,
                     slot: slot_update.slot,
                     parent_slot: slot_update.parent,
-                    status: format!("{:?}", slot_update.status),
+                    status: Self::map_slot_status(slot_update.status),
                 }))
             }
             UpdateOneof::Ping(_) => {

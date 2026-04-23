@@ -71,9 +71,12 @@ impl GeyserConsumer {
     }
 
     pub fn simulated_fixture() -> Vec<GeyserEvent> {
+        // Use current timestamp so the materialized view time filter includes it
+        let now_ms = chrono::Utc::now().timestamp_millis();
+
         vec![
             GeyserEvent::AccountUpdate(AccountUpdate {
-                timestamp_unix_ms: 1_710_000_000_000,
+                timestamp_unix_ms: now_ms,
                 slot: 9_001,
                 pubkey: "tracked-account".as_bytes().to_vec(),
                 owner: "amm-program".as_bytes().to_vec(),
@@ -82,7 +85,7 @@ impl GeyserConsumer {
                 data: vec![1, 2, 3, 4],
             }),
             GeyserEvent::Transaction(TransactionUpdate {
-                timestamp_unix_ms: 1_710_000_000_001,
+                timestamp_unix_ms: now_ms + 1,
                 slot: 9_001,
                 signature: "tracked-signature".as_bytes().to_vec(),
                 fee: 5_000,
@@ -91,13 +94,20 @@ impl GeyserConsumer {
                 log_messages: vec!["swap".to_string(), "settled".to_string()],
             }),
             GeyserEvent::SlotUpdate(SlotUpdate {
-                timestamp_unix_ms: 1_710_000_000_002,
+                timestamp_unix_ms: now_ms + 2,
                 slot: 9_001,
                 parent_slot: Some(9_000),
                 status: "processed".to_string(),
             }),
+            // Add confirmed status for the same slot (500ms later) to test latency calculation
+            GeyserEvent::SlotUpdate(SlotUpdate {
+                timestamp_unix_ms: now_ms + 502, // 500ms after processed
+                slot: 9_001,
+                parent_slot: Some(9_000),
+                status: "confirmed".to_string(),
+            }),
             GeyserEvent::AccountUpdate(AccountUpdate {
-                timestamp_unix_ms: 1_710_000_000_003,
+                timestamp_unix_ms: now_ms + 3,
                 slot: 9_001,
                 pubkey: "ignored-account".as_bytes().to_vec(),
                 owner: "noise-program".as_bytes().to_vec(),

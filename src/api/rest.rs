@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use axum::{extract::State, Json};
 use serde::Serialize;
+use sqlx::postgres::PgPool;
 
 use crate::api::SharedApiState;
 use crate::processor::pipeline::PipelineReport;
@@ -56,6 +57,7 @@ pub struct ApiSnapshot {
     pub report: PipelineReport,
     pub wal_unprocessed_count: u64,
     pub channel_utilization: f64,
+    pub pool: Option<PgPool>,
 }
 
 impl ApiSnapshot {
@@ -86,6 +88,7 @@ impl ApiSnapshot {
             report,
             wal_unprocessed_count: 0,
             channel_utilization: 0.0,
+            pool: None,
         }
     }
 
@@ -98,6 +101,11 @@ impl ApiSnapshot {
         self.channel_capacity = channel_capacity;
         self.batch_size = batch_size;
         self.batch_flush_ms = batch_flush_ms;
+        self
+    }
+
+    pub fn with_pool(mut self, pool: PgPool) -> Self {
+        self.pool = Some(pool);
         self
     }
 
