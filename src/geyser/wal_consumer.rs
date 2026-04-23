@@ -1,8 +1,12 @@
 use crate::geyser::wal_queue::{WalQueue, WalEntry};
 use crate::geyser::decoder::GeyserEvent;
 use crate::processor::pipeline::PipelineReport;
+use crate::processor::batch_writer::{BatchWriter, BufferedBatch};
+use crate::processor::decoder::{CustomDecoder, Type1Decoder, PersistedBatch};
+use crate::processor::sink::{StorageSink, StorageWriteResult};
+use crate::processor::sql::CheckpointUpdate;
+use crate::processor::store::StoreSnapshot;
 use std::sync::Arc;
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use helius_laserstream::grpc::SubscribeUpdate;
@@ -13,34 +17,43 @@ pub struct WalPipelineConfig {
     pub poll_interval: Duration,
     pub batch_size: usize,
     pub batch_flush_ms: u64,
-    pub channel_capacity: usize,
 }
 
 pub struct WalPipelineRunner {
     wal_queue: Arc<WalQueue>,
     config: WalPipelineConfig,
-    _api_state: Arc<Mutex<crate::api::rest::ApiSnapshot>>,
-    sender: mpsc::SyncSender<GeyserEvent>,
+    #[allow(dead_code)]
+    api_state: Arc<Mutex<crate::api::rest::ApiSnapshot>>,
+    writer: BatchWriter,
+    decoder: Type1Decoder,
+    custom_decoders: Vec<Box<dyn CustomDecoder>>,
+    sink: Box<dyn StorageSink>,
 }
 
 impl WalPipelineRunner {
     pub fn new(
         wal_queue: Arc<WalQueue>,
         config: WalPipelineConfig,
-        _api_state: Arc<Mutex<crate::api::rest::ApiSnapshot>>,
-        sender: mpsc::SyncSender<GeyserEvent>,
+        api_state: Arc<Mutex<crate::api::rest::ApiSnapshot>>,
+        writer: BatchWriter,
+        decoder: Type1Decoder,
+        custom_decoders: Vec<Box<dyn CustomDecoder>>,
+        sink: Box<dyn StorageSink>,
     ) -> Self {
         Self {
             wal_queue,
             config,
-            _api_state,
-            sender,
+            api_state,
+            writer,
+            decoder,
+            custom_decoders,
+            sink,
         }
     }
 
-    pub async fn run(&self) -> Result<PipelineReport, String> {
+    pub fn run(&mut self) -> Result<PipelineReport, String> {
         let started_at = Instant::now();
-        let mut events_processed = 0u64;
+        let mut report = PipelineReport::default();
         let mut last_log_time = started_at;
         let log_interval = Duration::from_secs(5);
 
@@ -48,59 +61,73 @@ impl WalPipelineRunner {
 
         // Main polling loop
         loop {
+            let now = Instant::now();
+
+            // Check if we should flush due to interval
+            if let Some(batch) = self.writer.flush_if_needed(now) {
+                self.process_batch(batch, &mut report)?;
+            }
+
             // Check for new entries in WAL
             match self.wal_queue.read_next() {
                 Ok(Some(entry)) => {
                     // Process the event
-                    if let Err(e) = self.process_entry(&entry).await {
-                        log::error!("Error processing entry slot {} seq {}: {}", entry.slot, entry.seq, e);
-                        // Continue processing other entries even if one fails
-                    } else {
-                        events_processed += 1;
+                    match self.process_entry(&entry, &mut report) {
+                        Ok(()) => {
+                            // Mark as processed in WAL
+                            if let Err(e) = self.wal_queue.mark_processed(entry.slot, entry.seq) {
+                                log::error!("Failed to mark entry slot {} seq {} as processed: {}", entry.slot, entry.seq, e);
+                            }
 
-                        // Mark as processed in WAL
-                        if let Err(e) = self.wal_queue.mark_processed(entry.slot, entry.seq) {
-                            log::error!("Failed to mark entry slot {} seq {} as processed: {}", entry.slot, entry.seq, e);
+                            // Log progress every 5 seconds
+                            if now.duration_since(last_log_time) >= log_interval {
+                                let elapsed = now.duration_since(started_at);
+                                let events_per_sec = report.received_events as f64 / elapsed.as_secs_f64();
+                                let unprocessed_count = self.wal_queue.get_unprocessed_count();
+                                log::info!("📊 WAL Pipeline Progress: {:.1}s elapsed, {} events processed ({:.1} events/sec), {} unprocessed in WAL",
+                                          elapsed.as_secs_f64(), report.received_events, events_per_sec, unprocessed_count);
+                                last_log_time = now;
+                            }
                         }
-
-                        // Log progress every 5 seconds
-                        let now = Instant::now();
-                        if now.duration_since(last_log_time) >= log_interval {
-                            let elapsed = now.duration_since(started_at);
-                            let events_per_sec = events_processed as f64 / elapsed.as_secs_f64();
-                            let unprocessed_count = self.wal_queue.get_unprocessed_count();
-                            log::info!("📊 WAL Pipeline Progress: {:.1}s elapsed, {} events processed ({:.1} events/sec), {} unprocessed in WAL",
-                                      elapsed.as_secs_f64(), events_processed, events_per_sec, unprocessed_count);
-                            last_log_time = now;
+                        Err(e) => {
+                            log::error!("Error processing entry slot {} seq {}: {}", entry.slot, entry.seq, e);
                         }
                     }
                 }
                 Ok(None) => {
                     // No new entries, sleep for poll interval
-                    tokio::time::sleep(self.config.poll_interval).await;
+                    std::thread::sleep(self.config.poll_interval);
                 }
                 Err(e) => {
-                    {
-                        let error_msg = format!("Error reading from WAL: {}", e);
-                        log::error!("{}", error_msg);
-                    }
-                    tokio::time::sleep(self.config.poll_interval).await;
+                    log::error!("Error reading from WAL: {}", e);
+                    std::thread::sleep(self.config.poll_interval);
                 }
             }
         }
     }
 
-    async fn process_entry(&self, entry: &WalEntry) -> Result<(), String> {
+    fn process_entry(&mut self, entry: &WalEntry, report: &mut PipelineReport) -> Result<(), String> {
         // Decode the protobuf bytes back to SubscribeUpdate
         let update = entry.decode_update()
             .map_err(|e| format!("Failed to decode protobuf: {}", e))?;
 
-        // Convert SubscribeUpdate to GeyserEvent for the pipeline
+        // Convert SubscribeUpdate to GeyserEvent
         let geyser_event = self.convert_update_to_event(&update, entry)?;
 
-        // Send to the pipeline channel
-        self.sender.send(geyser_event).map_err(|e| format!("Failed to send event to pipeline: {}", e))?;
+        // Add to batch
+        report.received_events += 1;
+        self.writer.push(geyser_event);
 
+        Ok(())
+    }
+
+    fn process_batch(&mut self, batch: BufferedBatch, report: &mut PipelineReport) -> Result<(), String> {
+        let persisted = self.decoder.decode(batch, &mut self.custom_decoders);
+        let checkpoint = checkpoint_update_for_batch(&persisted);
+        let result = self.sink.write_batch(&persisted, checkpoint)
+            .map_err(|e| format!("Storage error: {}", e))?;
+
+        apply_batch_report(report, persisted, result);
         Ok(())
     }
 
@@ -206,11 +233,75 @@ impl WalPipelineRunner {
         status_str.to_string()
     }
 
-    pub async fn start_background_processor(self: Arc<Self>) -> tokio::task::JoinHandle<Result<PipelineReport, String>> {
-        tokio::spawn(async move {
-            self.run().await
+    pub fn start_background_processor(mut self) -> tokio::task::JoinHandle<Result<PipelineReport, String>>
+    where
+        Self: Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            self.run()
         })
     }
+}
+
+fn apply_batch_report(report: &mut PipelineReport, batch: PersistedBatch, result: StorageWriteResult) {
+    report.flush_count += 1;
+    report.last_processed_slot = max_optional(report.last_processed_slot, latest_processed_slot(&batch));
+    report.last_observed_at_unix_ms = max_optional(
+        report.last_observed_at_unix_ms,
+        batch.latest_timestamp_unix_ms(),
+    );
+    report.account_rows_written += batch.account_rows.len() as u64;
+    report.transaction_rows_written += batch.transaction_rows.len() as u64;
+    report.slot_rows_written += batch.slot_rows.len() as u64;
+    report.custom_rows_written += batch.custom_rows.len() as u64;
+    report.sql_statements_planned += result.sql_statements_planned;
+    let snapshot: StoreSnapshot = result.snapshot;
+    report.retained_account_rows = snapshot.account_rows;
+    report.retained_transaction_rows = snapshot.transaction_rows;
+    report.retained_slot_rows = snapshot.slot_rows;
+    report.retained_custom_rows = snapshot.custom_rows;
+    report.pruned_account_rows = snapshot.metrics.account_rows_pruned;
+    report.pruned_transaction_rows = snapshot.metrics.transaction_rows_pruned;
+    report.pruned_slot_rows = snapshot.metrics.slot_rows_pruned;
+    report.pruned_custom_rows = snapshot.metrics.custom_rows_pruned;
+}
+
+fn max_optional(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn latest_processed_slot(batch: &PersistedBatch) -> Option<i64> {
+    batch
+        .slot_rows
+        .iter()
+        .map(|row| row.slot)
+        .chain(batch.transaction_rows.iter().map(|row| row.slot))
+        .chain(batch.account_rows.iter().map(|row| row.slot))
+        .chain(batch.custom_rows.iter().map(|row| row.slot))
+        .max()
+}
+
+fn checkpoint_update_for_batch(batch: &PersistedBatch) -> Option<CheckpointUpdate> {
+    let last_processed_slot = batch
+        .slot_rows
+        .iter()
+        .map(|row| row.slot)
+        .chain(batch.transaction_rows.iter().map(|row| row.slot))
+        .chain(batch.account_rows.iter().map(|row| row.slot))
+        .chain(batch.custom_rows.iter().map(|row| row.slot))
+        .max();
+    let last_observed_at_unix_ms = batch.latest_timestamp_unix_ms()?;
+
+    Some(CheckpointUpdate {
+        stream_name: "geyser-main".to_string(),
+        last_processed_slot,
+        last_observed_at_unix_ms,
+        notes: Some(format!("flush_reason={:?}", batch.reason)),
+    })
 }
 
 // RPC Fallback for gap detection and filling

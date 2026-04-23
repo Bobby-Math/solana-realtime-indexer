@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use solana_realtime_indexer::api;
 use solana_realtime_indexer::api::rest::ApiSnapshot;
@@ -13,7 +13,7 @@ use solana_realtime_indexer::processor::cpi_decoder::CpiLogDecoder;
 use solana_realtime_indexer::processor::decoder::{
     CustomDecoder, ProgramActivityDecoder, Type1Decoder,
 };
-use solana_realtime_indexer::processor::pipeline::{PipelineReport, ProcessorPipeline};
+use solana_realtime_indexer::processor::pipeline::PipelineReport;
 use solana_realtime_indexer::processor::sink::{
     DryRunStorageSink, StorageSink, TimescaleStorageSink,
 };
@@ -82,16 +82,12 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     // Start WAL background flusher
     let _wal_flush_handle = wal_queue.clone().start_background_flush().await;
 
-    // Create bounded channel to connect WAL pipeline to database pipeline
-    let (sender, receiver) = std::sync::mpsc::sync_channel(config.geyser_channel_capacity);
-
     // Configure WAL pipeline
     let wal_pipeline_config = WalPipelineConfig {
         wal_path: wal_path.clone(),
         poll_interval: Duration::from_millis(10), // Poll every 10ms
         batch_size: config.batch_size,
         batch_flush_ms: config.batch_flush_ms,
-        channel_capacity: config.geyser_channel_capacity,
     };
 
     // Start RPC gap filler
@@ -125,24 +121,32 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
         }
     });
 
-    // Start WAL pipeline consumer (connected to channel)
-    let wal_runner = Arc::new(WalPipelineRunner::new(
+    // Build database sink and batch writer
+    let sink = build_sink(&config)?;
+    let writer = BatchWriter::new(
+        config.batch_size,
+        Duration::from_millis(config.batch_flush_ms),
+    );
+
+    // Create custom decoders
+    let custom_decoders: Vec<Box<dyn CustomDecoder>> = vec![
+        Box::new(ProgramActivityDecoder::new("amm-program")),
+        Box::new(CpiLogDecoder::new()),
+    ];
+    let decoder = Type1Decoder::new();
+
+    // Start WAL pipeline consumer (now handles batching and DB writes directly)
+    let wal_runner = WalPipelineRunner::new(
         wal_queue.clone(),
         wal_pipeline_config,
         api_state.clone(),
-        sender,
-    ));
-    let wal_pipeline_handle = wal_runner.start_background_processor().await;
+        writer,
+        decoder,
+        custom_decoders,
+        sink,
+    );
+    let wal_pipeline_handle = wal_runner.start_background_processor();
 
-    // Build database sink and start processor pipeline
-    let sink = build_sink(&config)?;
-    let pipeline_state = Arc::clone(&api_state);
-    let pipeline_config = RuntimeSnapshotConfig::from_config(&config, storage_mode);
-    let pipeline_handle = tokio::task::spawn_blocking(move || {
-        run_pipeline(receiver, sink, pipeline_config, pipeline_state)
-    });
-
-    log_background_pipeline(pipeline_handle);
     log_background_wal_pipeline(wal_pipeline_handle);
     log_background_geyser(geyser_handle);
     log_background_gap_filler(gap_filler_handle);
@@ -151,7 +155,6 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     let _metrics_reporter = {
         let wal_queue = wal_queue.clone();
         let api_state = api_state.clone();
-        let channel_capacity = config.geyser_channel_capacity;
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
@@ -164,15 +167,8 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
                 let mut state = api_state.lock().await;
                 state.wal_unprocessed_count = wal_unprocessed;
 
-                // Calculate channel utilization (0.0 to 1.0)
-                // We can't get exact channel depth without wrapping it, so we estimate
-                // based on WAL unprocessed count as a proxy
-                let utilization = if channel_capacity > 0 {
-                    (wal_unprocessed as f64 / (channel_capacity * 2) as f64).min(1.0)
-                } else {
-                    0.0
-                };
-                state.channel_utilization = utilization;
+                // Channel utilization is no longer relevant - WAL is the only buffer
+                state.channel_utilization = 0.0;
             }
         })
     };
@@ -238,55 +234,6 @@ fn build_sink(config: &Config) -> Result<Box<dyn StorageSink>, Box<dyn std::erro
     }
 }
 
-fn run_pipeline(
-    receiver: std::sync::mpsc::Receiver<solana_realtime_indexer::geyser::decoder::GeyserEvent>,
-    sink: Box<dyn StorageSink>,
-    snapshot_config: RuntimeSnapshotConfig,
-    api_state: SharedSnapshot,
-) -> Result<PipelineReport, String> {
-    let started_at = Instant::now();
-    let custom_decoders: Vec<Box<dyn CustomDecoder>> = vec![
-        Box::new(ProgramActivityDecoder::new("amm-program")),
-        Box::new(CpiLogDecoder::new()),
-    ];
-    let mut pipeline = ProcessorPipeline::new(
-        receiver,
-        BatchWriter::new(
-            snapshot_config.batch_size,
-            Duration::from_millis(snapshot_config.batch_flush_ms),
-        ),
-        Type1Decoder::new(),
-        custom_decoders,
-        sink,
-    );
-
-    log::info!("Starting pipeline processor");
-    let result = pipeline.run_with_reporter(|report| {
-        update_api_state(&api_state, &snapshot_config, started_at.elapsed(), report.clone());
-    });
-
-    match &result {
-        Ok(report) => {
-            log::info!("Pipeline completed successfully: {:?}", report);
-        }
-        Err(error) => {
-            // Log the FULL StorageError details - this is the key to debugging
-            log::error!("==========================================");
-            log::error!("PIPELINE StorageError (will close channel):");
-            log::error!("Error debug: {:?}", error);
-            log::error!("Error display: {}", error);
-            log::error!("==========================================");
-            log::error!("The channel is now CLOSED. WAL consumer will fail with 'sending on closed channel'");
-            log::error!("This error MUST be fixed to prevent pipeline crashes.");
-        }
-    }
-
-    result.map_err(|error| {
-        log::error!("Pipeline failed with StorageError, converted to String");
-        error.to_string()
-    })
-}
-
 async fn serve_api(
     bind_address: String,
     api_state: SharedSnapshot,
@@ -304,48 +251,6 @@ async fn serve_api(
         .await?;
 
     Ok(())
-}
-
-fn update_api_state(
-    api_state: &SharedSnapshot,
-    config: &RuntimeSnapshotConfig,
-    elapsed: Duration,
-    report: PipelineReport,
-) {
-    // 1. Lock the state and extract the current WAL metrics and pool
-    let (current_wal_unprocessed, current_channel_utilization, current_pool) = {
-        let state = api_state.blocking_lock();
-        (
-            state.wal_unprocessed_count,
-            state.channel_utilization,
-            state.pool.clone(),
-        )
-    };
-
-    // 2. Create the new snapshot
-    let mut snapshot = ApiSnapshot::from_report(
-        PROJECT_NAME,
-        config.storage_mode.clone(),
-        config.bind_address.clone(),
-        config.rpc_endpoint_count,
-        0,
-        elapsed,
-        unix_now_millis(),
-        report,
-    )
-    .with_runtime_config(
-        config.channel_capacity,
-        config.batch_size,
-        config.batch_flush_ms,
-    );
-
-    // 3. Inject the preserved WAL metrics and pool into the new snapshot
-    snapshot.wal_unprocessed_count = current_wal_unprocessed;
-    snapshot.channel_utilization = current_channel_utilization;
-    snapshot.pool = current_pool;
-
-    // 4. Overwrite the state
-    *api_state.blocking_lock() = snapshot;
 }
 
 async fn initial_api_state(config: &Config, storage_mode: &str) -> SharedSnapshot {
@@ -372,54 +277,6 @@ fn storage_mode(config: &Config) -> &'static str {
     } else {
         "dry-run"
     }
-}
-
-#[derive(Clone)]
-struct RuntimeSnapshotConfig {
-    bind_address: String,
-    rpc_endpoint_count: usize,
-    storage_mode: String,
-    batch_size: usize,
-    batch_flush_ms: u64,
-    channel_capacity: usize,
-}
-
-impl RuntimeSnapshotConfig {
-    fn from_config(config: &Config, storage_mode: &str) -> Self {
-        Self {
-            bind_address: config.bind_address.clone(),
-            rpc_endpoint_count: config.rpc_endpoints.len(),
-            storage_mode: storage_mode.to_string(),
-            batch_size: config.batch_size,
-            batch_flush_ms: config.batch_flush_ms,
-            channel_capacity: config.geyser_channel_capacity,
-        }
-    }
-}
-
-fn log_background_pipeline(
-    handle: tokio::task::JoinHandle<Result<PipelineReport, String>>,
-) {
-    tokio::spawn(async move {
-        match handle.await {
-            Ok(Ok(report)) => {
-                log::info!("✅ Pipeline completed successfully");
-                log::info!("   Report: {:?}", report);
-            }
-            Ok(Err(error)) => {
-                log::error!("❌ Pipeline FAILED with error");
-                log::error!("   Error message: {}", error);
-                log::error!("   This indicates a StorageError occurred during pipeline execution");
-                log::error!("   The channel has been closed and WAL consumer will fail");
-                log::error!("   Fix the underlying storage issue and restart the indexer");
-            }
-            Err(error) => {
-                log::error!("❌ Pipeline task panicked or was cancelled");
-                log::error!("   Join error: {:?}", error);
-                log::error!("   This is a serious error - check for panics in pipeline code");
-            }
-        }
-    });
 }
 
 fn log_background_geyser(handle: tokio::task::JoinHandle<()>) {
