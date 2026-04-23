@@ -5,7 +5,7 @@ use solana_realtime_indexer::api;
 use solana_realtime_indexer::api::rest::ApiSnapshot;
 use solana_realtime_indexer::config::Config;
 use solana_realtime_indexer::geyser::client::GeyserClient;
-use solana_realtime_indexer::geyser::consumer::{GeyserConfig, GeyserConsumer};
+use solana_realtime_indexer::geyser::consumer::GeyserConfig;
 use solana_realtime_indexer::geyser::wal_queue::WalQueue;
 use solana_realtime_indexer::geyser::wal_consumer::{WalPipelineConfig, WalPipelineRunner, RpcGapFiller};
 use solana_realtime_indexer::processor::batch_writer::BatchWriter;
@@ -19,6 +19,7 @@ use solana_realtime_indexer::processor::sink::{
 };
 use solana_realtime_indexer::processor::store::{RetentionPolicy, Type1Store};
 use solana_realtime_indexer::PROJECT_NAME;
+use sqlx::postgres::PgPoolOptions;
 use tokio::sync::Mutex;
 
 type SharedSnapshot = Arc<Mutex<ApiSnapshot>>;
@@ -29,17 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     let config = Config::from_env();
-    let use_real_geyser = config.geyser_endpoint.is_some()
-        && !config
-            .geyser_endpoint
-            .as_ref()
-            .is_some_and(|endpoint| endpoint.starts_with("mock"));
 
-    if use_real_geyser {
-        run_with_real_geyser(config).await?;
-    } else {
-        run_with_simulated_data(config).await?;
-    }
+    run_with_real_geyser(config).await?;
 
     Ok(())
 }
@@ -61,7 +53,26 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     );
 
     let storage_mode = storage_mode(&config);
-    let api_state = initial_api_state(&config, storage_mode);
+    let api_state = initial_api_state(&config, storage_mode).await;
+
+    // Create API connection pool if database URL is available
+    if let Some(database_url) = config.database_url.as_deref() {
+        match PgPoolOptions::new()
+            .max_connections(5)
+            .connect(database_url)
+            .await
+        {
+            Ok(pool) => {
+                log::info!("API database pool connected successfully");
+                // Attach pool to API state
+                let mut state = api_state.lock().await;
+                *state = state.clone().with_pool(pool);
+            }
+            Err(e) => {
+                log::warn!("Failed to create API database pool: {}. Network stress endpoint will be unavailable.", e);
+            }
+        }
+    }
 
     // Create WAL queue instead of bounded channel
     let wal_path = format!("./data/wal/geyser_{}", chrono::Utc::now().timestamp());
@@ -166,6 +177,39 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
         })
     };
 
+    // Start slot latency materialized view refresh task
+    let _latency_refresh_handle = if let Some(database_url) = config.database_url.as_deref() {
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(database_url)
+            .await;
+
+        match pool {
+            Ok(pool) => {
+                log::info!("Starting slot latency materialized view refresh task (every 30s)");
+                Some(tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(30));
+                    loop {
+                        interval.tick().await;
+
+                        if let Err(e) = sqlx::query("SELECT refresh_slot_health_1m()")
+                            .execute(&pool)
+                            .await
+                        {
+                            log::warn!("Failed to refresh slot_health_1m: {}", e);
+                        }
+                    }
+                }))
+            }
+            Err(e) => {
+                log::warn!("Failed to create pool for latency refresh: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     log::info!("🚀 Indexer running in WAL mode:");
     log::info!("   - No event drops (correctness guaranteed)");
     log::info!("   - No blocking (OS buffer + disk storage)");
@@ -173,37 +217,6 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     log::info!("   - WAL path: {}", wal_path);
     log::info!("   - WAL metrics exposed via /api/metrics");
 
-    serve_api(config.bind_address, api_state).await
-}
-
-async fn run_with_simulated_data(config: Config) -> Result<(), Box<dyn std::error::Error>> {
-    log::info!("Starting Solana Realtime Indexer with simulated data");
-
-    let geyser_consumer = GeyserConsumer::new(GeyserConfig {
-        endpoint: config
-            .geyser_endpoint
-            .clone()
-            .unwrap_or_else(|| "mock://local-geyser".to_string()),
-        channel_capacity: config.geyser_channel_capacity,
-        filters: config.geyser_subscription_filters(),
-    });
-    let (sender, receiver) = std::sync::mpsc::sync_channel(geyser_consumer.config.channel_capacity);
-    let fixture = GeyserConsumer::simulated_fixture();
-    let storage_mode = storage_mode(&config);
-    let api_state = initial_api_state(&config, storage_mode);
-
-    let producer_handle =
-        tokio::task::spawn_blocking(move || geyser_consumer.forward_events(&sender, fixture));
-
-    let sink = build_sink(&config)?;
-    let pipeline_state = Arc::clone(&api_state);
-    let pipeline_config = RuntimeSnapshotConfig::from_config(&config, storage_mode);
-    let pipeline_handle = tokio::task::spawn_blocking(move || {
-        run_pipeline(receiver, sink, pipeline_config, pipeline_state)
-    });
-
-    log_background_producer(producer_handle);
-    log_background_pipeline(pipeline_handle);
     serve_api(config.bind_address, api_state).await
 }
 
@@ -299,10 +312,14 @@ fn update_api_state(
     elapsed: Duration,
     report: PipelineReport,
 ) {
-    // 1. Lock the state and extract the current WAL metrics
-    let (current_wal_unprocessed, current_channel_utilization) = {
+    // 1. Lock the state and extract the current WAL metrics and pool
+    let (current_wal_unprocessed, current_channel_utilization, current_pool) = {
         let state = api_state.blocking_lock();
-        (state.wal_unprocessed_count, state.channel_utilization)
+        (
+            state.wal_unprocessed_count,
+            state.channel_utilization,
+            state.pool.clone(),
+        )
     };
 
     // 2. Create the new snapshot
@@ -322,15 +339,16 @@ fn update_api_state(
         config.batch_flush_ms,
     );
 
-    // 3. Inject the preserved WAL metrics into the new snapshot
+    // 3. Inject the preserved WAL metrics and pool into the new snapshot
     snapshot.wal_unprocessed_count = current_wal_unprocessed;
     snapshot.channel_utilization = current_channel_utilization;
+    snapshot.pool = current_pool;
 
     // 4. Overwrite the state
     *api_state.blocking_lock() = snapshot;
 }
 
-fn initial_api_state(config: &Config, storage_mode: &str) -> SharedSnapshot {
+async fn initial_api_state(config: &Config, storage_mode: &str) -> SharedSnapshot {
     Arc::new(Mutex::new(ApiSnapshot::from_report(
         PROJECT_NAME,
         storage_mode,
@@ -426,18 +444,6 @@ fn log_background_gap_filler(handle: tokio::task::JoinHandle<()>) {
     tokio::spawn(async move {
         if let Err(error) = handle.await {
             log::error!("Gap filler task join failed: {}", error);
-        }
-    });
-}
-
-fn log_background_producer(
-    handle: tokio::task::JoinHandle<Result<usize, std::sync::mpsc::SendError<solana_realtime_indexer::geyser::decoder::GeyserEvent>>>,
-) {
-    tokio::spawn(async move {
-        match handle.await {
-            Ok(Ok(forwarded)) => log::info!("Simulated producer forwarded {} events", forwarded),
-            Ok(Err(error)) => log::error!("Simulated producer failed: {}", error),
-            Err(error) => log::error!("Simulated producer task join failed: {}", error),
         }
     });
 }

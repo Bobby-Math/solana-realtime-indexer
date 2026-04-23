@@ -172,7 +172,7 @@ impl WalPipelineRunner {
                     timestamp_unix_ms,
                     slot: slot_update.slot,
                     parent_slot: slot_update.parent,
-                    status: format!("{:?}", slot_update.status),
+                    status: Self::map_slot_status(slot_update.status),
                 }))
             }
             Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => {
@@ -185,6 +185,25 @@ impl WalPipelineRunner {
                 Err("SubscribeUpdate has no variant".to_string())
             }
         }
+    }
+
+    fn map_slot_status(status: i32) -> String {
+        let status_str = match status {
+            0 => "processed",
+            1 => "confirmed",
+            2 => "finalized",
+            3 => "first_shred_received",
+            4 => "completed",
+            5 => "created_bank",
+            6 => "dead",
+            _ => {
+                log::warn!("Unknown slot status value: {}, using 'unknown'", status);
+                "unknown"
+            }
+        };
+
+        log::debug!("Mapping slot status {} -> '{}'", status, status_str);
+        status_str.to_string()
     }
 
     pub async fn start_background_processor(self: Arc<Self>) -> tokio::task::JoinHandle<Result<PipelineReport, String>> {
