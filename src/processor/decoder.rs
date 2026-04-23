@@ -5,6 +5,10 @@ use crate::processor::schema::{AccountUpdateRow, CustomDecodedRow, SlotRow, Tran
 pub trait CustomDecoder: Send {
     fn name(&self) -> &str;
     fn decode(&mut self, event: &GeyserEvent) -> Option<CustomDecodedRow>;
+    fn decode_multi(&mut self, event: &GeyserEvent) -> Vec<CustomDecodedRow> {
+        // Default implementation for backwards compatibility
+        self.decode(event).into_iter().collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -55,9 +59,11 @@ impl Type1Decoder {
 
         for event in batch.events {
             for decoder in custom_decoders.iter_mut() {
-                if let Some(row) = decoder.decode(&event) {
-                    persisted.custom_rows.push(row);
+                let rows = decoder.decode_multi(&event);
+                if !rows.is_empty() {
+                    log::debug!("Decoder {} produced {} rows for event", decoder.name(), rows.len());
                 }
+                persisted.custom_rows.extend(rows);
             }
 
             match event {

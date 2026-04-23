@@ -169,7 +169,7 @@ async fn execute_custom_decoded_insert(
 
     sqlx::query(
         "INSERT INTO custom_decoded_events (timestamp, slot, decoder_name, record_key, event_index, payload)
-         SELECT * FROM UNNEST($1::timestamptz[], $2::bigint[], $3::text[], $4::text[], $5::smallint[], $6::text[])
+         SELECT * FROM UNNEST($1::timestamptz[], $2::bigint[], $3::text[], $4::text[], $5::smallint[], $6::jsonb[])
          ON CONFLICT (timestamp, decoder_name, record_key, slot, event_index) DO NOTHING"
     )
     .bind(&timestamps)

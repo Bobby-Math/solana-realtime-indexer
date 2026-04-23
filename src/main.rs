@@ -9,6 +9,7 @@ use solana_realtime_indexer::geyser::consumer::{GeyserConfig, GeyserConsumer};
 use solana_realtime_indexer::geyser::wal_queue::WalQueue;
 use solana_realtime_indexer::geyser::wal_consumer::{WalPipelineConfig, WalPipelineRunner, RpcGapFiller};
 use solana_realtime_indexer::processor::batch_writer::BatchWriter;
+use solana_realtime_indexer::processor::cpi_decoder::CpiLogDecoder;
 use solana_realtime_indexer::processor::decoder::{
     CustomDecoder, ProgramActivityDecoder, Type1Decoder,
 };
@@ -231,8 +232,10 @@ fn run_pipeline(
     api_state: SharedSnapshot,
 ) -> Result<PipelineReport, String> {
     let started_at = Instant::now();
-    let custom_decoders: Vec<Box<dyn CustomDecoder>> =
-        vec![Box::new(ProgramActivityDecoder::new("amm-program"))];
+    let custom_decoders: Vec<Box<dyn CustomDecoder>> = vec![
+        Box::new(ProgramActivityDecoder::new("amm-program")),
+        Box::new(CpiLogDecoder::new()),
+    ];
     let mut pipeline = ProcessorPipeline::new(
         receiver,
         BatchWriter::new(
@@ -245,11 +248,30 @@ fn run_pipeline(
     );
 
     log::info!("Starting pipeline processor");
-    pipeline
-        .run_with_reporter(|report| {
-            update_api_state(&api_state, &snapshot_config, started_at.elapsed(), report.clone());
-        })
-        .map_err(|error| error.to_string())
+    let result = pipeline.run_with_reporter(|report| {
+        update_api_state(&api_state, &snapshot_config, started_at.elapsed(), report.clone());
+    });
+
+    match &result {
+        Ok(report) => {
+            log::info!("Pipeline completed successfully: {:?}", report);
+        }
+        Err(error) => {
+            // Log the FULL StorageError details - this is the key to debugging
+            log::error!("==========================================");
+            log::error!("PIPELINE StorageError (will close channel):");
+            log::error!("Error debug: {:?}", error);
+            log::error!("Error display: {}", error);
+            log::error!("==========================================");
+            log::error!("The channel is now CLOSED. WAL consumer will fail with 'sending on closed channel'");
+            log::error!("This error MUST be fixed to prevent pipeline crashes.");
+        }
+    }
+
+    result.map_err(|error| {
+        log::error!("Pipeline failed with StorageError, converted to String");
+        error.to_string()
+    })
 }
 
 async fn serve_api(
@@ -362,9 +384,22 @@ fn log_background_pipeline(
 ) {
     tokio::spawn(async move {
         match handle.await {
-            Ok(Ok(report)) => log::info!("Pipeline completed: {:?}", report),
-            Ok(Err(error)) => log::error!("Pipeline failed: {}", error),
-            Err(error) => log::error!("Pipeline task join failed: {}", error),
+            Ok(Ok(report)) => {
+                log::info!("✅ Pipeline completed successfully");
+                log::info!("   Report: {:?}", report);
+            }
+            Ok(Err(error)) => {
+                log::error!("❌ Pipeline FAILED with error");
+                log::error!("   Error message: {}", error);
+                log::error!("   This indicates a StorageError occurred during pipeline execution");
+                log::error!("   The channel has been closed and WAL consumer will fail");
+                log::error!("   Fix the underlying storage issue and restart the indexer");
+            }
+            Err(error) => {
+                log::error!("❌ Pipeline task panicked or was cancelled");
+                log::error!("   Join error: {:?}", error);
+                log::error!("   This is a serious error - check for panics in pipeline code");
+            }
         }
     });
 }
