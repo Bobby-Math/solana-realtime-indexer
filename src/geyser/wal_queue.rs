@@ -130,18 +130,20 @@ impl WalQueue {
         let metadata = db.keyspace("metadata", fjall::KeyspaceCreateOptions::default)
             .map_err(|e| format!("Failed to open metadata keyspace: {}", e))?;
 
-        // CRITICAL: Scan events keyspace to find the maximum existing sequence number.
+        // CRITICAL: Single scan to determine both WAL emptiness and max existing sequence number.
         // This prevents the producer from overwriting unprocessed events on restart.
         // last_flushed_seq is the consumer checkpoint, NOT the producer cursor.
-        let max_existing_seq = {
+        // The reverse scan result already encodes emptiness (None = empty, Some = non-empty).
+        let (is_empty, max_existing_seq) = {
             let mut rev = events.range::<Vec<u8>, _>(..).rev();
-            rev.next()
-                .and_then(|guard| guard.into_inner().ok())
-                .map(|(k, _)| {
+            match rev.next().and_then(|g| g.into_inner().ok()) {
+                None => (true, 0),
+                Some((k, _)) => {
                     let key_bytes = k.to_vec();
-                    u64::from_be_bytes(key_bytes.try_into().unwrap())
-                })
-                .unwrap_or(0)
+                    let seq = u64::from_be_bytes(key_bytes.try_into().unwrap());
+                    (false, seq)
+                }
+            }
         };
 
         // Recover consumer checkpoint from metadata (for resuming consumption)
@@ -158,8 +160,7 @@ impl WalQueue {
 
         // CRITICAL FIX: Distinguish empty WAL from WAL with one entry at seq=0
         // max_existing_seq == 0 is ambiguous - could be empty OR could have entry at seq=0
-        // Use range().next().is_none() to check if WAL is truly empty
-        let is_empty = events.range::<Vec<u8>, _>(..).next().is_none();
+        // is_empty from the single scan resolves this ambiguity
         let initial_seq = if is_empty {
             0  // Empty WAL starts at sequence 0
         } else {
