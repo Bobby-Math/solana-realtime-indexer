@@ -78,24 +78,33 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     let storage_mode = storage_mode(&config);
     let api_state = initial_api_state(&config, storage_mode).await;
 
-    // Create API connection pool if database URL is available
-    if let Some(database_url) = config.database_url.as_deref() {
+    // Create single shared database pool for all consumers
+    let shared_pool: Option<Arc<sqlx::PgPool>> = if let Some(database_url) = config.database_url.as_deref() {
         match PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(config.db_pool_max_connections)
+            .min_connections(2)
+            .acquire_timeout(Duration::from_secs(60))
+            .idle_timeout(Duration::from_secs(600))
+            .max_lifetime(Duration::from_secs(1800))
+            .test_before_acquire(true)
             .connect(database_url)
             .await
         {
             Ok(pool) => {
-                log::info!("API database pool connected successfully");
+                log::info!("✅ Shared database pool connected (max {} connections)", config.db_pool_max_connections);
                 // Attach pool to API state
                 let mut state = api_state.lock().await;
-                *state = state.clone().with_pool(pool);
+                *state = state.clone().with_pool(pool.clone());
+                Some(Arc::new(pool))
             }
             Err(e) => {
-                log::warn!("Failed to create API database pool: {}. Network stress endpoint will be unavailable.", e);
+                log::warn!("Failed to create shared database pool: {}. Storage and API endpoints will be unavailable.", e);
+                None
             }
         }
-    }
+    } else {
+        None
+    };
 
     // Create WAL queue instead of bounded channel
     if config.clear_wal_on_startup {
@@ -141,7 +150,7 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     });
 
     // Build database sink and batch writer
-    let sink = build_sink(&config).await?;
+    let sink = build_sink(&config, shared_pool.clone()).await?;
     let writer = BatchWriter::new(
         config.batch_size,
         Duration::from_millis(config.batch_flush_ms),
@@ -192,35 +201,23 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     };
 
     // Start slot latency materialized view refresh task
-    let _latency_refresh_handle = if let Some(database_url) = config.database_url.as_deref() {
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect(database_url)
-            .await;
+    let _latency_refresh_handle = if let Some(pool) = shared_pool.clone() {
+        log::info!("Starting slot latency materialized view refresh task (every 30s)");
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
 
-        match pool {
-            Ok(pool) => {
-                log::info!("Starting slot latency materialized view refresh task (every 30s)");
-                Some(tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(Duration::from_secs(30));
-                    loop {
-                        interval.tick().await;
-
-                        if let Err(e) = sqlx::query("SELECT refresh_slot_health_1m()")
-                            .execute(&pool)
-                            .await
-                        {
-                            log::warn!("Failed to refresh slot_health_1m: {}", e);
-                        }
-                    }
-                }))
+                if let Err(e) = sqlx::query("SELECT refresh_slot_health_1m()")
+                    .execute(&*pool)
+                    .await
+                {
+                    log::warn!("Failed to refresh slot_health_1m: {}", e);
+                }
             }
-            Err(e) => {
-                log::warn!("Failed to create pool for latency refresh: {}", e);
-                None
-            }
-        }
+        }))
     } else {
+        log::warn!("No database pool available - skipping materialized view refresh task");
         None
     };
 
@@ -234,17 +231,29 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     serve_api(config.bind_address, api_state).await
 }
 
-async fn build_sink(config: &Config) -> Result<Box<dyn StorageSink>, Box<dyn std::error::Error>> {
+async fn build_sink(config: &Config, pool: Option<Arc<sqlx::PgPool>>) -> Result<Box<dyn StorageSink>, Box<dyn std::error::Error>> {
     let retention_policy = RetentionPolicy {
         max_age: Duration::from_secs(60),
     };
 
     if let Some(database_url) = config.database_url.as_deref() {
-        Ok(Box::new(TimescaleStorageSink::connect_with_pool_size(
-            database_url,
-            Type1Store::new(retention_policy),
-            config.db_pool_max_connections,
-        ).await?))
+        match pool {
+            Some(p) => {
+                // Use shared pool
+                Ok(Box::new(TimescaleStorageSink::with_pool(
+                    (*p).clone(),
+                    Type1Store::new(retention_policy),
+                )))
+            }
+            None => {
+                // Fallback: create new pool (shouldn't happen in normal flow)
+                Ok(Box::new(TimescaleStorageSink::connect_with_pool_size(
+                    database_url,
+                    Type1Store::new(retention_policy),
+                    config.db_pool_max_connections,
+                ).await?))
+            }
+        }
     } else {
         Ok(Box::new(DryRunStorageSink::new(Type1Store::new(
             retention_policy,

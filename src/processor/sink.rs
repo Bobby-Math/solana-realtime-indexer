@@ -116,6 +116,14 @@ impl TimescaleStorageSink {
         })
     }
 
+    pub fn with_pool(pool: PgPool, store: Type1Store) -> Self {
+        Self {
+            store,
+            pool,
+            last_statement_count: 0,
+        }
+    }
+
     pub fn last_statement_count(&self) -> u64 {
         self.last_statement_count
     }
