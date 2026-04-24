@@ -173,10 +173,9 @@ impl WalPipelineRunner {
             self.block_time_cache.insert(bm.slot, bm.block_time_ms);
             log::debug!("Cached block_time {}ms for slot {}", bm.block_time_ms, bm.slot);
 
-            // Mark BlockMeta as processed immediately - no DB write needed
-            if let Err(e) = self.wal_queue.mark_processed(entry.slot, entry.seq) {
-                log::error!("Failed to mark BlockMeta seq {} as processed: {}", entry.seq, e);
-            }
+            // CRITICAL FIX: Add BlockMeta to pending_checkpoint_seqs instead of marking processed immediately
+            // This prevents checkpoint from advancing before DB commit, avoiding data loss on crash
+            self.pending_checkpoint_seqs.push(entry.seq);
             return Ok(());
         }
 
