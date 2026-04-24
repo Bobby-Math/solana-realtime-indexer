@@ -189,7 +189,7 @@ impl WalQueue {
     }
 
     pub fn push_update(&self, slot: u64, update: &SubscribeUpdate) -> Result<u64, String> {
-        let seq = self.slot_sequence.fetch_add(1, Ordering::SeqCst);
+        let seq = self.slot_sequence.fetch_add(1, Ordering::Release);
 
         // Create WAL entry with raw protobuf bytes
         let entry = WalEntry::from_update(slot, seq, update);
@@ -237,7 +237,7 @@ impl WalQueue {
 
         // For now, we'll store a placeholder - this method should be removed
         log::warn!("Using legacy push() method - this should be replaced with push_update()");
-        let seq = self.slot_sequence.fetch_add(1, Ordering::SeqCst);
+        let seq = self.slot_sequence.fetch_add(1, Ordering::Release);
         Ok(seq)
     }
 
@@ -327,13 +327,13 @@ impl WalQueue {
     }
 
     pub fn get_unprocessed_count(&self) -> u64 {
-        let total = self.slot_sequence.load(Ordering::SeqCst);
+        let total = self.slot_sequence.load(Ordering::Relaxed);
         let processed = self.get_last_processed_seq();
         total.saturating_sub(processed)
     }
 
     pub fn get_total_written(&self) -> u64 {
-        self.slot_sequence.load(Ordering::SeqCst)
+        self.slot_sequence.load(Ordering::Relaxed)
     }
 
     pub fn get_last_processed_slot(&self) -> u64 {
@@ -702,9 +702,9 @@ mod tests {
         // Phase 2: Simulate crash at seq 6 (allocate but don't write)
         println!("\n=== Phase 2: Simulating crash at seq 6 ===");
         // Manually increment the counter (simulating fetch_add)
-        wal_queue.slot_sequence.fetch_add(1, Ordering::SeqCst);
+        wal_queue.slot_sequence.fetch_add(1, Ordering::Release);
         println!("Allocated seq 6 but crashed before write");
-        println!("seq_counter = {}", wal_queue.slot_sequence.load(Ordering::SeqCst));
+        println!("seq_counter = {}", wal_queue.slot_sequence.load(Ordering::Relaxed));
 
         // Phase 3: Write events 7-8 (these will get seq 7 and 8)
         println!("\n=== Phase 3: Writing events 7-8 after crash ===");
@@ -859,7 +859,7 @@ mod tests {
         }
 
         // Simulate crash at seq 6 by manually incrementing counter
-        wal_queue.slot_sequence.fetch_add(1, Ordering::SeqCst);
+        wal_queue.slot_sequence.fetch_add(1, Ordering::Release);
         println!("Simulated crash at seq 6 (allocated but not written)");
 
         // Now write next event - this should allocate seq 7
