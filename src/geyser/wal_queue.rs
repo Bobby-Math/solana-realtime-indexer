@@ -4,6 +4,38 @@ use std::path::Path;
 use helius_laserstream::grpc::SubscribeUpdate;
 use prost::Message;
 
+/// Typed error for WAL read operations
+/// This replaces string-based error handling to prevent fragile parsing
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalReadError {
+    /// A gap was detected in the WAL (crash between allocation and write)
+    Gap { seq: u64 },
+    /// Key mismatch during read (corruption or race condition)
+    KeyMismatch { requested: u64, found: u64 },
+    /// Generic IO error from underlying storage
+    Io(String),
+}
+
+impl std::fmt::Display for WalReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WalReadError::Gap { seq } => write!(
+                f,
+                "WAL gap detected at seq {} (next seq {} exists). \
+                 This sequence was lost due to a crash between allocation and write. \
+                 Try fetching from RPC to repair.",
+                seq, seq + 1
+            ),
+            WalReadError::KeyMismatch { requested, found } => {
+                write!(f, "Key mismatch: requested seq {}, found entry seq {}", requested, found)
+            }
+            WalReadError::Io(msg) => write!(f, "Failed to read from WAL: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for WalReadError {}
+
 const WAL_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const WAL_GC_INTERVAL: Duration = Duration::from_secs(10);
 const WAL_GC_SAFETY_MARGIN_DEFAULT: u64 = 1000; // Keep 1000 entries as safety buffer
@@ -251,16 +283,16 @@ impl WalQueue {
         Ok(seq)
     }
 
-    pub fn read_next(&self) -> Result<Option<WalEntry>, String> {
+    pub fn read_next(&self) -> Result<Option<WalEntry>, WalReadError> {
         let last_flushed_seq = self.get_last_processed_seq();
         self.read_from_seq(last_flushed_seq)
     }
 
-    pub fn read_from(&self, _slot: u64, seq: u64) -> Result<Option<WalEntry>, String> {
+    pub fn read_from(&self, _slot: u64, seq: u64) -> Result<Option<WalEntry>, WalReadError> {
         self.read_from_seq(seq)
     }
 
-    fn read_from_seq(&self, seq: u64) -> Result<Option<WalEntry>, String> {
+    fn read_from_seq(&self, seq: u64) -> Result<Option<WalEntry>, WalReadError> {
         // Direct lookup for exact seq (no more silent skipping!)
         let key = seq.to_be_bytes();
 
@@ -276,7 +308,7 @@ impl WalQueue {
 
                 // Verify the key matches (sanity check)
                 if entry_seq != seq {
-                    return Err(format!("Key mismatch: requested seq {}, found entry seq {}", seq, entry_seq));
+                    return Err(WalReadError::KeyMismatch { requested: seq, found: entry_seq });
                 }
 
                 Ok(Some(WalEntry {
@@ -296,18 +328,13 @@ impl WalQueue {
                 let next_key = (seq + 1).to_be_bytes();
                 if let Ok(Some(_)) = self.events.get(&next_key) {
                     // Next seq exists, so this seq is a hole/gap!
-                    return Err(format!(
-                        "WAL gap detected at seq {} (next seq {} exists). \
-                        This sequence was lost due to a crash between allocation and write. \
-                        Try fetching from RPC to repair.",
-                        seq, seq + 1
-                    ));
+                    return Err(WalReadError::Gap { seq });
                 }
 
                 // No next seq either - likely EOF
                 Ok(None)
             }
-            Err(e) => Err(format!("Failed to read from WAL: {}", e))
+            Err(e) => Err(WalReadError::Io(format!("{}", e)))
         }
     }
 
@@ -754,11 +781,11 @@ mod tests {
         match result {
             Ok(Some(entry)) => panic!("Expected gap error, but got seq {}", entry.seq),
             Ok(None) => panic!("Expected gap error, but got None (EOF)"),
-            Err(e) => {
-                println!("✓ Gap detected correctly: {}", e);
-                assert!(e.contains("gap") || e.contains("WAL"),
-                       "Error message should mention gap or WAL");
+            Err(WalReadError::Gap { seq }) => {
+                println!("✓ Gap detected correctly at seq {}", seq);
+                assert_eq!(seq, 6, "Gap should be at seq 6");
             }
+            Err(other) => panic!("Expected Gap error, got: {}", other),
         }
 
         // Verify we can still read seq 5 and 7
@@ -896,10 +923,11 @@ mod tests {
         match result_6_gap {
             Ok(Some(_)) => panic!("Expected gap error, but got a result"),
             Ok(None) => panic!("Expected gap error, but got None"),
-            Err(e) => {
-                println!("✓ Seq 6 is now detected as gap: {}", e);
-                assert!(e.contains("gap"), "Error should mention gap");
+            Err(WalReadError::Gap { seq }) => {
+                println!("✓ Seq {} is now detected as gap", seq);
+                assert_eq!(seq, 6, "Gap should be at seq 6");
             }
+            Err(other) => panic!("Expected Gap error, got: {}", other),
         }
     }
 

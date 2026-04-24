@@ -142,60 +142,59 @@ impl WalPipelineRunner {
                 }
                 Err(e) => {
                     // Check if this is a gap error
-                    if e.contains("gap detected") {
+                    if matches!(e, crate::geyser::wal_queue::WalReadError::Gap { .. }) {
                         log::warn!("⚠️ Gap detected in WAL: {}", e);
 
-                        // Extract the sequence number from the error message
-                        if let Some(seq_str) = e.split(" seq ").nth(1) {
-                            if let Some(seq_end) = seq_str.find(' ') {
-                                if let Ok(seq) = seq_str[..seq_end].parse::<u64>() {
-                                    // Trigger immediate repair if gap filler is available
-                                    if let Some(gap_filler) = &self.gap_filler {
-                                        log::info!("🔧 Triggering immediate RPC repair for seq {}", seq);
-                                        match gap_filler.repair_gap(seq).await {
-                                            Ok(true) => {
-                                                log::info!("✅ Gap repaired successfully, will retry read");
-                                                // Retry immediately after repair
-                                                continue;
-                                            }
-                                            Ok(false) => {
-                                                log::error!("❌ Gap repair failed for seq {}, skipping", seq);
-                                                // Mark as processed to skip this gap - use actual slot not 0
-                                                let last_flushed = self.wal_queue.get_last_processed_seq();
-                                                let next_seq = last_flushed + 1;
-                                                if let Some(slot) = self.wal_queue.get_slot_for_seq(next_seq) {
-                                                    let _ = self.wal_queue.mark_processed(slot, next_seq);
-                                                } else {
-                                                    log::warn!("No slot mapping for seq {}, using fallback", next_seq);
-                                                    let _ = self.wal_queue.mark_processed(0, next_seq);
-                                                }
-                                            }
-                                            Err(repair_err) => {
-                                                log::error!("❌ Gap repair error for seq {}: {}, skipping", seq, repair_err);
-                                                // Mark as processed to skip this gap - use actual slot not 0
-                                                let last_flushed = self.wal_queue.get_last_processed_seq();
-                                                let next_seq = last_flushed + 1;
-                                                if let Some(slot) = self.wal_queue.get_slot_for_seq(next_seq) {
-                                                    let _ = self.wal_queue.mark_processed(slot, next_seq);
-                                                } else {
-                                                    log::warn!("No slot mapping for seq {}, using fallback", next_seq);
-                                                    let _ = self.wal_queue.mark_processed(0, next_seq);
-                                                }
-                                            }
-                                        }
+                        // Extract sequence number from typed error (no fragile string parsing)
+                        let seq = match e {
+                            crate::geyser::wal_queue::WalReadError::Gap { seq } => seq,
+                            _ => unreachable!(),
+                        };
+
+                        // Trigger immediate repair if gap filler is available
+                        if let Some(gap_filler) = &self.gap_filler {
+                            log::info!("🔧 Triggering immediate RPC repair for seq {}", seq);
+                            match gap_filler.repair_gap(seq).await {
+                                Ok(true) => {
+                                    log::info!("✅ Gap repaired successfully, will retry read");
+                                    // Retry immediately after repair
+                                    continue;
+                                }
+                                Ok(false) => {
+                                    log::error!("❌ Gap repair failed for seq {}, skipping", seq);
+                                    // Mark as processed to skip this gap - use actual slot not 0
+                                    let last_flushed = self.wal_queue.get_last_processed_seq();
+                                    let next_seq = last_flushed + 1;
+                                    if let Some(slot) = self.wal_queue.get_slot_for_seq(next_seq) {
+                                        let _ = self.wal_queue.mark_processed(slot, next_seq);
                                     } else {
-                                        log::warn!("No gap filler available, skipping gap");
-                                        // Mark as processed to skip this gap - use actual slot not 0
-                                        let last_flushed = self.wal_queue.get_last_processed_seq();
-                                        let next_seq = last_flushed + 1;
-                                        if let Some(slot) = self.wal_queue.get_slot_for_seq(next_seq) {
-                                            let _ = self.wal_queue.mark_processed(slot, next_seq);
-                                        } else {
-                                            log::warn!("No slot mapping for seq {}, using fallback", next_seq);
-                                            let _ = self.wal_queue.mark_processed(0, next_seq);
-                                        }
+                                        log::warn!("No slot mapping for seq {}, using fallback", next_seq);
+                                        let _ = self.wal_queue.mark_processed(0, next_seq);
                                     }
                                 }
+                                Err(repair_err) => {
+                                    log::error!("❌ Gap repair error for seq {}: {}, skipping", seq, repair_err);
+                                    // Mark as processed to skip this gap - use actual slot not 0
+                                    let last_flushed = self.wal_queue.get_last_processed_seq();
+                                    let next_seq = last_flushed + 1;
+                                    if let Some(slot) = self.wal_queue.get_slot_for_seq(next_seq) {
+                                        let _ = self.wal_queue.mark_processed(slot, next_seq);
+                                    } else {
+                                        log::warn!("No slot mapping for seq {}, using fallback", next_seq);
+                                        let _ = self.wal_queue.mark_processed(0, next_seq);
+                                    }
+                                }
+                            }
+                        } else {
+                            log::warn!("No gap filler available, skipping gap");
+                            // Mark as processed to skip this gap - use actual slot not 0
+                            let last_flushed = self.wal_queue.get_last_processed_seq();
+                            let next_seq = last_flushed + 1;
+                            if let Some(slot) = self.wal_queue.get_slot_for_seq(next_seq) {
+                                let _ = self.wal_queue.mark_processed(slot, next_seq);
+                            } else {
+                                log::warn!("No slot mapping for seq {}, using fallback", next_seq);
+                                let _ = self.wal_queue.mark_processed(0, next_seq);
                             }
                         }
                     } else {
