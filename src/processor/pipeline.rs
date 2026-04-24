@@ -1,7 +1,9 @@
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Instant;
+use std::sync::Arc;
 
 use crate::geyser::decoder::GeyserEvent;
+use crate::geyser::BlockTimeCache;
 use crate::processor::batch_writer::{BatchWriter, FlushReason};
 use crate::processor::decoder::{CustomDecoder, PersistedBatch, Type1Decoder};
 use crate::processor::sink::{StorageError, StorageSink, StorageWriteResult};
@@ -35,6 +37,7 @@ pub struct ProcessorPipeline {
     decoder: Type1Decoder,
     custom_decoders: Vec<Box<dyn CustomDecoder>>,
     sink: Box<dyn StorageSink>,
+    block_time_cache: Arc<BlockTimeCache>,
 }
 
 impl ProcessorPipeline {
@@ -44,6 +47,7 @@ impl ProcessorPipeline {
         decoder: Type1Decoder,
         custom_decoders: Vec<Box<dyn CustomDecoder>>,
         sink: Box<dyn StorageSink>,
+        block_time_cache: Arc<BlockTimeCache>,
     ) -> Self {
         Self {
             receiver,
@@ -51,6 +55,7 @@ impl ProcessorPipeline {
             decoder,
             custom_decoders,
             sink,
+            block_time_cache,
         }
     }
 
@@ -102,7 +107,7 @@ impl ProcessorPipeline {
         batch: crate::processor::batch_writer::BufferedBatch,
         report: &mut PipelineReport,
     ) -> Result<(), StorageError> {
-        let persisted = self.decoder.decode(batch, &mut self.custom_decoders);
+        let persisted = self.decoder.decode(batch, &mut self.custom_decoders, &self.block_time_cache);
         let result = self
             .sink
             .write_batch(&persisted, checkpoint_update_for_batch(&persisted)).await?;
@@ -177,6 +182,7 @@ fn checkpoint_update_for_batch(batch: &PersistedBatch) -> Option<CheckpointUpdat
 mod tests {
     use super::{PipelineReport, ProcessorPipeline};
     use crate::geyser::decoder::{AccountUpdate, GeyserEvent, SlotUpdate};
+    use crate::geyser::BlockTimeCache;
     use crate::processor::batch_writer::BatchWriter;
     use crate::processor::decoder::{CustomDecoder, ProgramActivityDecoder, Type1Decoder};
     use crate::processor::sink::DryRunStorageSink;
@@ -216,6 +222,7 @@ mod tests {
             Box::new(DryRunStorageSink::new(Type1Store::new(RetentionPolicy {
                 max_age: Duration::from_secs(60),
             }))),
+            BlockTimeCache::new(1000),
         );
         let report: PipelineReport = pipeline.run().await.expect("pipeline should drain");
 

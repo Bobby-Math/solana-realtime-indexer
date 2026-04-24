@@ -6,6 +6,7 @@ pub enum GeyserEvent {
     AccountUpdate(AccountUpdate),
     Transaction(TransactionUpdate),
     SlotUpdate(SlotUpdate),
+    BlockMeta(BlockMetaUpdate),
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +37,13 @@ pub struct SlotUpdate {
     pub slot: u64,
     pub parent_slot: Option<u64>,
     pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockMetaUpdate {
+    pub slot: u64,
+    pub block_time_ms: i64,
+    pub block_height: Option<u64>,
 }
 
 /// Decodes a SubscribeUpdate protobuf into a GeyserEvent.
@@ -113,6 +121,17 @@ pub fn decode_subscribe_update(update: &SubscribeUpdate, timestamp_unix_ms: i64)
                 slot: slot_update.slot,
                 parent_slot: slot_update.parent,
                 status: map_slot_status(slot_update.status),
+            }))
+        }
+        Some(UpdateOneof::BlockMeta(block_meta)) => {
+            let block_time_ms = block_meta.block_time
+                .map(|unix_ts| unix_ts.timestamp * 1000)
+                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+            Some(GeyserEvent::BlockMeta(BlockMetaUpdate {
+                slot: block_meta.slot,
+                block_time_ms,
+                block_height: block_meta.block_height.map(|bh| bh.block_height),
             }))
         }
         Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => {

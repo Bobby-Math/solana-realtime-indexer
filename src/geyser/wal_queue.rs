@@ -233,6 +233,7 @@ impl WalQueue {
             crate::geyser::decoder::GeyserEvent::AccountUpdate(acc) => acc.slot,
             crate::geyser::decoder::GeyserEvent::Transaction(tx) => tx.slot,
             crate::geyser::decoder::GeyserEvent::SlotUpdate(slot) => slot.slot,
+            crate::geyser::decoder::GeyserEvent::BlockMeta(bm) => bm.slot,
         };
 
         // For now, we'll store a placeholder - this method should be removed

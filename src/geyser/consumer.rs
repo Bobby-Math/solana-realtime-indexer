@@ -146,6 +146,7 @@ impl SubscriptionFilter {
                 update.pubkey == account_bytes
             }
             (SubscriptionFilter::Slots, GeyserEvent::SlotUpdate(_)) => true,
+            (SubscriptionFilter::Blocks, GeyserEvent::BlockMeta(_)) => true,
             (SubscriptionFilter::Blocks, GeyserEvent::SlotUpdate(_)) => false,
             _ => false,
         }

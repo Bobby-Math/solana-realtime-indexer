@@ -1,4 +1,5 @@
 use crate::geyser::decoder::{GeyserEvent, TransactionUpdate};
+use crate::geyser::BlockTimeCache;
 use crate::processor::batch_writer::BufferedBatch;
 use crate::processor::schema::{AccountUpdateRow, CustomDecodedRow, SlotRow, TransactionRow};
 
@@ -48,6 +49,7 @@ impl Type1Decoder {
         &self,
         batch: BufferedBatch,
         custom_decoders: &mut [Box<dyn CustomDecoder>],
+        block_time_cache: &BlockTimeCache,
     ) -> PersistedBatch {
         let mut persisted = PersistedBatch {
             reason: batch.reason,
@@ -68,9 +70,14 @@ impl Type1Decoder {
 
             match event {
                 GeyserEvent::AccountUpdate(update) => {
+                    // Use block_time if available, fall back to wall-clock timestamp
+                    let timestamp_ms = block_time_cache
+                        .get(update.slot)
+                        .unwrap_or(update.timestamp_unix_ms);
+
                     persisted.account_rows.push(AccountUpdateRow {
                         slot: update.slot as i64,
-                        timestamp_unix_ms: update.timestamp_unix_ms,
+                        timestamp_unix_ms: timestamp_ms,
                         pubkey: update.pubkey.clone(),
                         owner: update.owner.clone(),
                         lamports: update.lamports as i64,
@@ -79,11 +86,16 @@ impl Type1Decoder {
                     });
                 }
                 GeyserEvent::Transaction(update) => {
+                    // Use block_time if available, fall back to wall-clock timestamp
+                    let timestamp_ms = block_time_cache
+                        .get(update.slot)
+                        .unwrap_or(update.timestamp_unix_ms);
+
                     log::debug!("Processing transaction: signature={:?}, program_ids count={}",
                               update.signature, update.program_ids.len());
                     persisted.transaction_rows.push(TransactionRow {
                         slot: update.slot as i64,
-                        timestamp_unix_ms: update.timestamp_unix_ms,
+                        timestamp_unix_ms: timestamp_ms,
                         signature: update.signature.clone(),
                         fee: update.fee as i64,
                         success: update.success,
@@ -98,6 +110,10 @@ impl Type1Decoder {
                         parent_slot: update.parent_slot.map(|slot| slot as i64),
                         status: update.status,
                     });
+                }
+                GeyserEvent::BlockMeta(_) => {
+                    // BlockMeta events are handled separately to populate the block_time cache
+                    // They don't produce rows directly
                 }
             }
         }
@@ -177,6 +193,7 @@ fn transaction_mentions_program(update: &TransactionUpdate, program_id: &[u8]) -
 #[cfg(test)]
 mod tests {
     use super::{CustomDecoder, ProgramActivityDecoder, Type1Decoder};
+    use crate::geyser::BlockTimeCache;
     use crate::geyser::decoder::{AccountUpdate, GeyserEvent, TransactionUpdate};
     use crate::processor::batch_writer::{BufferedBatch, FlushReason};
 
@@ -209,7 +226,8 @@ mod tests {
             ],
         };
 
-        let persisted = decoder.decode(batch, &mut custom_decoders);
+        let block_time_cache = BlockTimeCache::new(1000);
+        let persisted = decoder.decode(batch, &mut custom_decoders, &block_time_cache);
 
         assert_eq!(persisted.account_rows.len(), 1);
         assert_eq!(persisted.transaction_rows.len(), 1);

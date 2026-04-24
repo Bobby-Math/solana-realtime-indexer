@@ -274,6 +274,7 @@ impl GeyserClient {
         let mut account_pubkeys: Vec<String> = Vec::new();
         let mut program_ids: Vec<String> = Vec::new();
         let mut has_slot_filters = false;
+        let mut has_blocks_meta_filters = false;
 
         for filter in &self.config.filters {
             match filter {
@@ -287,8 +288,8 @@ impl GeyserClient {
                     has_slot_filters = true;
                 }
                 SubscriptionFilter::Blocks => {
-                    // Blocks metadata - not directly supported in basic Laserstream filters
-                    log::warn!("Blocks filter not directly supported, will be handled via client-side filtering");
+                    // Subscribe to blocks_meta to get block_time
+                    has_blocks_meta_filters = true;
                 }
             }
         }
@@ -347,8 +348,18 @@ impl GeyserClient {
             log::info!("Subscribed to slot updates");
         }
 
-        log::info!("Built SubscribeRequest with {} account subscriptions, {} transaction subscriptions, {} slot subscriptions",
-                  request.accounts.len(), request.transactions.len(), request.slots.len());
+        // Subscribe to blocks_meta to get block_time for accurate latency measurements
+        if has_blocks_meta_filters {
+            let mut blocks_meta_map = HashMap::new();
+            blocks_meta_map.insert("all_blocks_meta".to_string(), helius_laserstream::grpc::SubscribeRequestFilterBlocksMeta {
+                ..Default::default()
+            });
+            request.blocks_meta = blocks_meta_map;
+            log::info!("Subscribed to blocks_meta updates for block_time extraction");
+        }
+
+        log::info!("Built SubscribeRequest with {} account subscriptions, {} transaction subscriptions, {} slot subscriptions, {} blocks_meta subscriptions",
+                  request.accounts.len(), request.transactions.len(), request.slots.len(), request.blocks_meta.len());
 
         Ok(request)
     }
@@ -394,8 +405,9 @@ impl GeyserClient {
             Some(UpdateOneof::Account(acc)) => acc.slot,
             Some(UpdateOneof::Transaction(tx)) => tx.slot,
             Some(UpdateOneof::Slot(slot)) => slot.slot,
+            Some(UpdateOneof::BlockMeta(bm)) => bm.slot,
             Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => 0,
-            Some(UpdateOneof::Block(_)) | Some(UpdateOneof::BlockMeta(_)) | Some(UpdateOneof::TransactionStatus(_)) | Some(UpdateOneof::Entry(_)) => 0,
+            Some(UpdateOneof::Block(_)) | Some(UpdateOneof::TransactionStatus(_)) | Some(UpdateOneof::Entry(_)) => 0,
             None => 0,
         }
     }

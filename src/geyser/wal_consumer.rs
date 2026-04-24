@@ -1,5 +1,6 @@
 use crate::geyser::wal_queue::{WalQueue, WalEntry};
 use crate::geyser::decoder::decode_subscribe_update;
+use crate::geyser::BlockTimeCache;
 use crate::processor::pipeline::PipelineReport;
 use crate::processor::batch_writer::{BatchWriter, BufferedBatch};
 use crate::processor::decoder::{CustomDecoder, Type1Decoder, PersistedBatch};
@@ -28,6 +29,7 @@ pub struct WalPipelineRunner {
     sink: Box<dyn StorageSink>,
     pending_checkpoint_seqs: Vec<u64>, // Track seqs to checkpoint after DB commit
     gap_filler: Option<RpcGapFiller>, // Event-driven gap repair
+    block_time_cache: Arc<BlockTimeCache>, // Cache slot → block_time mapping
 }
 
 impl WalPipelineRunner {
@@ -40,6 +42,9 @@ impl WalPipelineRunner {
         custom_decoders: Vec<Box<dyn CustomDecoder>>,
         sink: Box<dyn StorageSink>,
     ) -> Self {
+        // Cache last 1000 slots (~8KB of memory) - Solana produces ~216k slots/day
+        let block_time_cache = BlockTimeCache::new(1000);
+
         Self {
             wal_queue,
             config,
@@ -50,11 +55,17 @@ impl WalPipelineRunner {
             sink,
             pending_checkpoint_seqs: Vec::new(),
             gap_filler: None,
+            block_time_cache,
         }
     }
 
     pub fn with_gap_filler(mut self, gap_filler: RpcGapFiller) -> Self {
         self.gap_filler = Some(gap_filler);
+        self
+    }
+
+    pub fn with_block_time_cache(mut self, cache: Arc<BlockTimeCache>) -> Self {
+        self.block_time_cache = cache;
         self
     }
 
@@ -157,6 +168,18 @@ impl WalPipelineRunner {
         let geyser_event = decode_subscribe_update(&update, entry.timestamp_unix_ms)
             .ok_or_else(|| "Failed to decode SubscribeUpdate to GeyserEvent".to_string())?;
 
+        // BlockMeta events populate the cache, not the batch
+        if let crate::geyser::decoder::GeyserEvent::BlockMeta(bm) = &geyser_event {
+            self.block_time_cache.insert(bm.slot, bm.block_time_ms);
+            log::debug!("Cached block_time {}ms for slot {}", bm.block_time_ms, bm.slot);
+
+            // Mark BlockMeta as processed immediately - no DB write needed
+            if let Err(e) = self.wal_queue.mark_processed(entry.slot, entry.seq) {
+                log::error!("Failed to mark BlockMeta seq {} as processed: {}", entry.seq, e);
+            }
+            return Ok(());
+        }
+
         // Add to batch
         report.received_events += 1;
         self.writer.push(geyser_event);
@@ -168,7 +191,7 @@ impl WalPipelineRunner {
     }
 
     async fn process_batch(&mut self, batch: BufferedBatch, report: &mut PipelineReport) -> Result<(), String> {
-        let persisted = self.decoder.decode(batch, &mut self.custom_decoders);
+        let persisted = self.decoder.decode(batch, &mut self.custom_decoders, &self.block_time_cache);
         let checkpoint = checkpoint_update_for_batch(&persisted);
         let result = self.sink.write_batch(&persisted, checkpoint).await
             .map_err(|e| format!("Storage error: {}", e))?;
