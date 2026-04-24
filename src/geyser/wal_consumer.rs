@@ -200,18 +200,30 @@ impl WalPipelineRunner {
         // CRITICAL FIX: Mark sequences as processed ONLY AFTER DB commit succeeds
         // This prevents data loss if crash occurs between buffering and DB flush
         let checkpointed_seqs: Vec<_> = self.pending_checkpoint_seqs.drain(..).collect();
-        for &seq in &checkpointed_seqs {
-            if let Err(e) = self.wal_queue.mark_processed(0, seq) {
-                log::error!("Failed to mark seq {} as processed after DB commit: {}", seq, e);
+
+        if !checkpointed_seqs.is_empty() {
+            // Find the maximum seq in this batch
+            let max_seq = *checkpointed_seqs.iter().max().unwrap_or(&0);
+
+            // Look up which slot corresponds to this seq
+            let slot = match self.wal_queue.get_slot_for_seq(max_seq) {
+                Some(s) => s,
+                None => {
+                    log::error!("Failed to get slot for seq {} - skipping checkpoint", max_seq);
+                    return Ok(());
+                }
+            };
+
+            // CRITICAL: Mark processed ONCE with the correct slot and max seq
+            // This prevents corrupting last_flushed_slot and avoids N batch commits
+            if let Err(e) = self.wal_queue.mark_processed(slot, max_seq) {
+                log::error!("Failed to mark seq {} as processed after DB commit: {}", max_seq, e);
                 // Note: We don't return error here because the DB commit succeeded,
                 // and the seq will be retried on next startup
             }
-        }
 
-        if !checkpointed_seqs.is_empty() {
-            log::debug!("Checkpointed {} sequences after DB commit (last: {})",
-                       checkpointed_seqs.len(),
-                       checkpointed_seqs.last().unwrap_or(&0));
+            log::debug!("Checkpointed {} sequences after DB commit (slot: {}, seq: {})",
+                       checkpointed_seqs.len(), slot, max_seq);
         }
 
         Ok(())
