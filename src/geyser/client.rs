@@ -71,6 +71,10 @@ impl GeyserClient {
                         return Ok(total_events_processed);
                     }
 
+                    // CRITICAL FIX: Reset reconnect_count after successful session
+                    // This prevents backoff from ratcheting up permanently across sessions
+                    reconnect_count = 0;
+
                     // Stream ended normally - this is unexpected, try to reconnect
                     log::warn!("Geyser stream ended unexpectedly, attempting to reconnect...");
                 }
