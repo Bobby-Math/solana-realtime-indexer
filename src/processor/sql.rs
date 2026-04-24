@@ -102,32 +102,83 @@ async fn execute_transactions_insert(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     rows: &[TransactionRow],
 ) -> Result<(), sqlx::Error> {
-    for row in rows {
-        let timestamp = to_utc_timestamp(row.timestamp_unix_ms)?;
+    // Collect scalar columns into parallel arrays for UNNEST bulk insert
+    let timestamps: Vec<chrono::DateTime<Utc>> = rows
+        .iter()
+        .map(|row| to_utc_timestamp(row.timestamp_unix_ms))
+        .collect::<Result<Vec<_>, _>>()?;
+    let slots: Vec<i64> = rows.iter().map(|row| row.slot).collect();
+    let signatures: Vec<Vec<u8>> = rows.iter().map(|row| row.signature.clone()).collect();
+    let fees: Vec<i64> = rows.iter().map(|row| row.fee).collect();
+    let success: Vec<bool> = rows.iter().map(|row| row.success).collect();
 
-        // Decode program_ids from base58 to bytes client-side (PostgreSQL doesn't support base58 decode)
-        // Row already has Vec<Vec<u8>>, so we can bind directly as bytea[]
-        let program_ids_bytes: Vec<Vec<u8>> = row.program_ids
-            .iter()
-            .map(|bytes| bytes.clone())
-            .collect();
+    // Encode array columns as JSON arrays for bulk insert (SQLX limitation: can't bind Vec<Vec<Vec<u8>>> or Vec<Vec<String>>)
+    // Vec<Vec<u8>> (program_ids) encoded as JSON array of hex-encoded bytea strings
+    // Vec<String> (log_messages) encoded as JSON array of escaped strings
+    let program_ids_json: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            if row.program_ids.is_empty() {
+                return "[]".to_string();
+            }
+            let encoded: Vec<String> = row.program_ids.iter()
+                .map(|bytes| {
+                    let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                    format!("\"\\\\x{}\"", hex)
+                })
+                .collect();
+            format!("[{}]", encoded.join(","))
+        })
+        .collect();
+    let log_messages_json: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            if row.log_messages.is_empty() {
+                return "[]".to_string();
+            }
+            let encoded: Vec<String> = row.log_messages.iter()
+                .map(|msg| {
+                    // Escape backslashes and double quotes for JSON
+                    let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!("\"{}\"", escaped)
+                })
+                .collect();
+            format!("[{}]", encoded.join(","))
+        })
+        .collect();
 
-        // Bind log_messages directly as text[] - SQLX handles string arrays natively
-        sqlx::query(
-            "INSERT INTO transactions (timestamp, slot, signature, fee, success, program_ids, log_messages)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (timestamp, signature) DO NOTHING"
-        )
-        .bind(timestamp)
-        .bind(row.slot)
-        .bind(&row.signature)
-        .bind(row.fee)
-        .bind(row.success)
-        .bind(&program_ids_bytes)
-        .bind(&row.log_messages)
-        .execute(&mut **transaction)
-        .await?;
-    }
+    // Use UNNEST for bulk insert with JSON-to-array conversion in SELECT clause
+    // This reduces N round-trips to 1 round-trip for all rows
+    sqlx::query(
+        "INSERT INTO transactions (timestamp, slot, signature, fee, success, program_ids, log_messages)
+         SELECT
+            unnested.timestamp,
+            unnested.slot,
+            unnested.signature,
+            unnested.fee,
+            unnested.success,
+            unnested.program_ids::bytea[],
+            unnested.log_messages::text[]
+         FROM UNNEST(
+            $1::timestamptz[],
+            $2::bigint[],
+            $3::bytea[],
+            $4::bigint[],
+            $5::boolean[],
+            $6::jsonb[],
+            $7::jsonb[]
+         ) AS unnested(timestamp, slot, signature, fee, success, program_ids, log_messages)
+         ON CONFLICT (timestamp, signature) DO NOTHING"
+    )
+    .bind(&timestamps)
+    .bind(&slots)
+    .bind(&signatures)
+    .bind(&fees)
+    .bind(&success)
+    .bind(&program_ids_json)
+    .bind(&log_messages_json)
+    .execute(&mut **transaction)
+    .await?;
 
     Ok(())
 }
