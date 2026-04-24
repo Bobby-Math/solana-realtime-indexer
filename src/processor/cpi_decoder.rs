@@ -13,7 +13,7 @@ impl CpiLogDecoder {
 
     fn parse_cpi_edges(&self, update: &TransactionUpdate) -> Vec<CustomDecodedRow> {
         let mut edges = Vec::new();
-        let mut stack: Vec<String> = Vec::new();
+        let mut stack: Vec<Option<String>> = Vec::new();
         let mut program_outcomes: HashMap<String, bool> = HashMap::new();
 
         // First pass: collect program outcomes
@@ -24,33 +24,35 @@ impl CpiLogDecoder {
         }
 
         // Second pass: build call stack and emit edges
+        // Solana logs use 1-based depth, where depth=1 is the root invocation (no caller)
         for log in &update.log_messages {
             if let Some((program, depth)) = parse_program_invoke(log) {
-                // Ensure stack is large enough
+                // Ensure stack is large enough (depth is 1-based)
                 while stack.len() <= depth {
-                    stack.push(String::new());
+                    stack.push(None);
                 }
-                stack[depth] = program.clone();
+                stack[depth] = Some(program.clone());
 
-                // Emit edge if we have a parent (depth > 0 and parent exists)
-                if depth > 0 && depth > 0 && !stack[depth - 1].is_empty() {
-                    let caller = stack[depth - 1].clone();
-                    let callee = program.clone();
-                    let success = program_outcomes.get(&callee).copied().unwrap_or(update.success);
+                // Emit edge if we have a caller (depth > 1 means we have a parent)
+                if depth > 1 {
+                    if let Some(Some(caller)) = stack.get(depth - 1) {
+                        let callee = program.clone();
+                        let success = program_outcomes.get(&callee).copied().unwrap_or(update.success);
 
-                    edges.push(CustomDecodedRow {
-                        decoder_name: "cpi-edge".to_string(),
-                        record_key: bs58::encode(&update.signature).into_string(),
-                        slot: update.slot as i64,
-                        timestamp_unix_ms: update.timestamp_unix_ms,
-                        event_index: depth as i16,
-                        payload: serde_json::json!({
-                            "caller": caller,
-                            "callee": callee,
-                            "depth": depth,
-                            "success": success
-                        }).to_string(),
-                    });
+                        edges.push(CustomDecodedRow {
+                            decoder_name: "cpi-edge".to_string(),
+                            record_key: bs58::encode(&update.signature).into_string(),
+                            slot: update.slot as i64,
+                            timestamp_unix_ms: update.timestamp_unix_ms,
+                            event_index: depth as i16,
+                            payload: serde_json::json!({
+                                "caller": caller,
+                                "callee": callee,
+                                "depth": depth,
+                                "success": success
+                            }).to_string(),
+                        });
+                    }
                 }
             }
         }
