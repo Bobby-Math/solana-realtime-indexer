@@ -30,6 +30,7 @@ pub struct WalPipelineRunner {
     pending_checkpoint_seqs: Vec<u64>, // Track seqs to checkpoint after DB commit
     gap_filler: Option<RpcGapFiller>, // Event-driven gap repair
     block_time_cache: Arc<BlockTimeCache>, // Cache slot → block_time mapping
+    next_read_seq: u64, // In-memory read cursor, advances after each process_entry
 }
 
 impl WalPipelineRunner {
@@ -45,6 +46,9 @@ impl WalPipelineRunner {
         // Cache last 1000 slots (~8KB of memory) - Solana produces ~216k slots/day
         let block_time_cache = BlockTimeCache::new(1000);
 
+        // Initialize in-memory read cursor from persisted checkpoint
+        let next_read_seq = wal_queue.get_last_processed_seq();
+
         Self {
             wal_queue,
             config,
@@ -56,6 +60,7 @@ impl WalPipelineRunner {
             pending_checkpoint_seqs: Vec::new(),
             gap_filler: None,
             block_time_cache,
+            next_read_seq,
         }
     }
 
@@ -86,12 +91,15 @@ impl WalPipelineRunner {
                 self.process_batch(batch, &mut report).await?;
             }
 
-            // Check for new entries in WAL
-            match self.wal_queue.read_next() {
+            // Check for new entries in WAL using in-memory read cursor
+            match self.wal_queue.read_from(0, self.next_read_seq) {
                 Ok(Some(entry)) => {
                     // Process the event (just add to buffer, DON'T mark yet)
                     if let Err(e) = self.process_entry(&entry, &mut report).await {
                         log::error!("Error processing entry slot {} seq {}: {}", entry.slot, entry.seq, e);
+                    } else {
+                        // Only advance read cursor after successful processing
+                        self.next_read_seq = entry.seq + 1;
                     }
 
                     // Log progress every 5 seconds
@@ -469,5 +477,45 @@ mod tests {
         assert_eq!(wal_queue.get_total_written(), 1);
         assert_eq!(wal_queue.get_unprocessed_count(), 1);
         assert_eq!(wal_queue.get_last_processed_seq(), 0);
+    }
+
+    #[test]
+    fn test_in_memory_read_cursor_prevents_infinite_reread() {
+        let temp_dir = tempdir().unwrap();
+        let wal_queue = Arc::new(WalQueue::new(temp_dir.path()).unwrap());
+
+        // Write 3 distinct entries to WAL
+        for i in 0..3 {
+            let update = SubscribeUpdate {
+                ..Default::default()
+            };
+            wal_queue.push_update(100 + i, &update).unwrap();
+        }
+
+        // Simulate the consumer loop using in-memory cursor
+        let mut next_read_seq = wal_queue.get_last_processed_seq(); // Starts at 0
+
+        // First iteration: should read seq=0
+        let entry1 = wal_queue.read_from(0, next_read_seq).unwrap().unwrap();
+        assert_eq!(entry1.seq, 0, "First read should return seq=0");
+        next_read_seq = entry1.seq + 1; // Advance cursor to 1
+
+        // Second iteration: should read seq=1, NOT seq=0 again
+        let entry2 = wal_queue.read_from(0, next_read_seq).unwrap().unwrap();
+        assert_eq!(entry2.seq, 1, "Second read should return seq=1, not seq=0");
+        next_read_seq = entry2.seq + 1; // Advance cursor to 2
+
+        // Third iteration: should read seq=2, NOT seq=0 or seq=1 again
+        let entry3 = wal_queue.read_from(0, next_read_seq).unwrap().unwrap();
+        assert_eq!(entry3.seq, 2, "Third read should return seq=2, not seq=0 or seq=1");
+        next_read_seq = entry3.seq + 1; // Advance cursor to 3
+
+        // Fourth iteration: should return None (no more entries)
+        let entry4 = wal_queue.read_from(0, next_read_seq).unwrap();
+        assert!(entry4.is_none(), "Fourth read should return None");
+
+        // Verify persisted checkpoint hasn't advanced (no flush yet)
+        assert_eq!(wal_queue.get_last_processed_seq(), 0,
+                   "Persisted checkpoint should still be 0 since no flush occurred");
     }
 }
