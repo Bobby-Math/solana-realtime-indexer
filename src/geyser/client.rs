@@ -7,6 +7,7 @@ use futures::pin_mut;
 use crate::geyser::consumer::GeyserConfig;
 use crate::geyser::decoder::{GeyserEvent, decode_subscribe_update};
 use crate::geyser::wal_queue::WalQueue;
+use crate::geyser::reconnect::ReconnectPolicy;
 
 #[derive(Debug)]
 pub enum GeyserClientError {
@@ -33,14 +34,68 @@ pub struct GeyserClient {
     config: GeyserConfig,
     api_key: String,
     run_duration_seconds: Option<u64>,
+    reconnect_policy: ReconnectPolicy,
 }
 
 impl GeyserClient {
     pub fn new(config: GeyserConfig, api_key: String, run_duration_seconds: Option<u64>) -> Self {
-        Self { config, api_key, run_duration_seconds }
+        Self {
+            config,
+            api_key,
+            run_duration_seconds,
+            reconnect_policy: ReconnectPolicy::default(),
+        }
+    }
+
+    pub fn with_reconnect_policy(mut self, policy: ReconnectPolicy) -> Self {
+        self.reconnect_policy = policy;
+        self
     }
 
     pub async fn connect_and_subscribe(
+        &self,
+        wal_queue: &WalQueue,
+    ) -> Result<u64, GeyserClientError> {
+        let mut total_events_processed = 0u64;
+        let mut reconnect_count = 0u64;
+
+        loop {
+            match self.run_single_session(wal_queue).await {
+                Ok(events_processed) => {
+                    total_events_processed += events_processed;
+
+                    // Check if this was a graceful shutdown (timeout) or an error
+                    if self.run_duration_seconds.is_some() && self.run_duration_seconds != Some(0) {
+                        // Run duration limit reached - exit gracefully
+                        log::info!("✅ Geyser client shutting down after run duration limit");
+                        return Ok(total_events_processed);
+                    }
+
+                    // Stream ended normally - this is unexpected, try to reconnect
+                    log::warn!("Geyser stream ended unexpectedly, attempting to reconnect...");
+                }
+                Err(e) => {
+                    // Connection error - reconnect with backoff
+                    log::error!("Geyser connection error: {}", e);
+
+                    // Calculate backoff delay with exponential increase
+                    let backoff_ms = self.reconnect_policy.initial_backoff_ms
+                        .saturating_mul(2u64.pow(reconnect_count.min(8) as u32))
+                        .min(self.reconnect_policy.max_backoff_ms);
+
+                    reconnect_count += 1;
+                    log::info!("Waiting {}ms before reconnect attempt {} (max: {}ms)",
+                              backoff_ms, reconnect_count, self.reconnect_policy.max_backoff_ms);
+
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+
+                    log::info!("Reconnecting to Geyser (attempt {})...", reconnect_count);
+                }
+            }
+        }
+    }
+
+    async fn run_single_session(
         &self,
         wal_queue: &WalQueue,
     ) -> Result<u64, GeyserClientError> {
