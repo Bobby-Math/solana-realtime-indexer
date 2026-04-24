@@ -74,12 +74,20 @@ impl GeyserConsumer {
         // Use current timestamp so the materialized view time filter includes it
         let now_ms = chrono::Utc::now().timestamp_millis();
 
+        // Use real 32-byte Solana pubkeys (decoded from base58)
+        let tracked_account = bs58::decode("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU").into_vec().unwrap();
+        let orca_program = bs58::decode("9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM").into_vec().unwrap();
+        let token_program = bs58::decode("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").into_vec().unwrap();
+        let tracked_signature = bs58::decode("5j7s6NiJS3JAkvgkoc18WVAsiSaci2pxB2A6ueCJP4tprv2W1qY1qrk7jjFgJG3kGpYcQHxUxYWBZgmhnfYTLuLr").into_vec().unwrap();
+        let ignored_account = bs58::decode("Noise1111111111111111111111111111111111111111").into_vec().unwrap();
+        let system_program = bs58::decode("11111111111111111111111111111111").into_vec().unwrap();
+
         vec![
             GeyserEvent::AccountUpdate(AccountUpdate {
                 timestamp_unix_ms: now_ms,
                 slot: 9_001,
-                pubkey: "tracked-account".as_bytes().to_vec(),
-                owner: "amm-program".as_bytes().to_vec(),
+                pubkey: tracked_account.clone(),
+                owner: orca_program.clone(),
                 lamports: 42,
                 write_version: 7,
                 data: vec![1, 2, 3, 4],
@@ -87,10 +95,10 @@ impl GeyserConsumer {
             GeyserEvent::Transaction(TransactionUpdate {
                 timestamp_unix_ms: now_ms + 1,
                 slot: 9_001,
-                signature: "tracked-signature".as_bytes().to_vec(),
+                signature: tracked_signature,
                 fee: 5_000,
                 success: true,
-                program_ids: vec![b"amm-program".to_vec(), b"token-program".to_vec()],
+                program_ids: vec![orca_program.clone(), token_program],
                 log_messages: vec!["swap".to_string(), "settled".to_string()],
             }),
             GeyserEvent::SlotUpdate(SlotUpdate {
@@ -109,8 +117,8 @@ impl GeyserConsumer {
             GeyserEvent::AccountUpdate(AccountUpdate {
                 timestamp_unix_ms: now_ms + 3,
                 slot: 9_001,
-                pubkey: "ignored-account".as_bytes().to_vec(),
-                owner: "noise-program".as_bytes().to_vec(),
+                pubkey: ignored_account,
+                owner: system_program,
                 lamports: 1,
                 write_version: 1,
                 data: vec![9, 9, 9],
@@ -165,33 +173,20 @@ mod tests {
 
     #[test]
     fn forwards_only_events_that_match_filters() {
-        // Use valid base58 program IDs (32 bytes when decoded)
-        let valid_program_id = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"; // Valid Solana pubkey
+        // Filter on Orca program (already in fixture with real 32-byte pubkey)
+        let orca_program_id = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM";
         let consumer = GeyserConsumer::new(GeyserConfig {
             endpoint: "mock://geyser".to_string(),
             channel_capacity: 4,
             filters: vec![
-                SubscriptionFilter::Program(valid_program_id.to_string()),
+                SubscriptionFilter::Program(orca_program_id.to_string()),
                 SubscriptionFilter::Slots,
             ],
         });
         let (sender, receiver) = sync_channel(4);
 
-        // Create fixture with valid base58 program IDs
-        let program_bytes = bs58::decode(valid_program_id).into_vec().unwrap();
-        let mut fixture = GeyserConsumer::simulated_fixture();
-
-        // Only update the events that should match the filter
-        // First AccountUpdate should match (tracked-account)
-        if let GeyserEvent::AccountUpdate(account) = &mut fixture[0] {
-            account.owner = program_bytes.clone();
-        }
-        // Transaction should match
-        if let GeyserEvent::Transaction(tx) = &mut fixture[1] {
-            tx.program_ids = vec![program_bytes.clone()];
-        }
-        // SlotUpdates should match (we have Slots filter)
-        // Second AccountUpdate should NOT match (noise-program)
+        // Fixture already uses real 32-byte pubkeys - no manual patching needed
+        let fixture = GeyserConsumer::simulated_fixture();
 
         let forwarded = consumer
             .forward_events(&sender, fixture)
@@ -200,8 +195,9 @@ mod tests {
 
         let events: Vec<GeyserEvent> = receiver.iter().collect();
 
-        // Should forward: AccountUpdate (tracked), Transaction, SlotUpdate (processed), SlotUpdate (confirmed)
-        // Should NOT forward: AccountUpdate (ignored)
+        // Should forward: AccountUpdate (Orca program), Transaction (Orca + Token),
+        //               SlotUpdate (processed), SlotUpdate (confirmed)
+        // Should NOT forward: AccountUpdate (System program - not in filter)
         assert_eq!(forwarded, 4);
         assert_eq!(events.len(), 4);
     }
