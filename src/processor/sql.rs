@@ -105,31 +105,17 @@ async fn execute_transactions_insert(
     for row in rows {
         let timestamp = to_utc_timestamp(row.timestamp_unix_ms)?;
 
-        // Encode Vec<Vec<u8>> as comma-separated base58 for each program_id
-        // Then use string_to_array and decode to convert back to bytea[]
-        let program_ids_b58: String = row.program_ids
+        // Decode program_ids from base58 to bytes client-side (PostgreSQL doesn't support base58 decode)
+        // Row already has Vec<Vec<u8>>, so we can bind directly as bytea[]
+        let program_ids_bytes: Vec<Vec<u8>> = row.program_ids
             .iter()
-            .map(|bytes| bs58::encode(bytes).into_string())
-            .collect::<Vec<_>>()
-            .join(",");
+            .map(|bytes| bytes.clone())
+            .collect();
 
-        // For log_messages (Vec<String>), join with a delimiter and split in SQL
-        let log_messages_joined = row.log_messages
-            .iter()
-            .map(|msg| msg.replace('|', "||")) // Escape the delimiter
-            .collect::<Vec<_>>()
-            .join("|");
-
+        // Bind log_messages directly as text[] - SQLX handles string arrays natively
         sqlx::query(
             "INSERT INTO transactions (timestamp, slot, signature, fee, success, program_ids, log_messages)
-             VALUES ($1, $2, $3, $4, $5,
-                 (SELECT ARRAY_agg(decode(trim(program_id), 'base58')::bytea)
-                  FROM unnest(string_to_array($6, ',')) AS program_id
-                  WHERE program_id != ''),
-                 (SELECT ARRAY_agg(log_msg)
-                  FROM unnest(string_to_array($7, '||')) AS log_msg
-                  WHERE log_msg != '')
-             )
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              ON CONFLICT (timestamp, signature) DO NOTHING"
         )
         .bind(timestamp)
@@ -137,8 +123,8 @@ async fn execute_transactions_insert(
         .bind(&row.signature)
         .bind(row.fee)
         .bind(row.success)
-        .bind(program_ids_b58)
-        .bind(log_messages_joined)
+        .bind(&program_ids_bytes)
+        .bind(&row.log_messages)
         .execute(&mut **transaction)
         .await?;
     }
