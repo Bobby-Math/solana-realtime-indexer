@@ -59,24 +59,56 @@ impl WalQueue {
         let metadata = db.keyspace("metadata", fjall::KeyspaceCreateOptions::default)
             .map_err(|e| format!("Failed to open metadata keyspace: {}", e))?;
 
-        // Recover sequence numbers from metadata
-        let slot_sequence = Arc::new(AtomicU64::new(0));
+        // CRITICAL: Scan events keyspace to find the maximum existing sequence number.
+        // This prevents the producer from overwriting unprocessed events on restart.
+        // last_flushed_seq is the consumer checkpoint, NOT the producer cursor.
+        let max_existing_seq = {
+            let mut rev = events.range::<Vec<u8>, _>(..).rev();
+            rev.next()
+                .and_then(|guard| guard.into_inner().ok())
+                .map(|(k, _)| {
+                    let key_bytes = k.to_vec();
+                    u64::from_be_bytes(key_bytes.try_into().unwrap())
+                })
+                .unwrap_or(0)
+        };
 
-        if let Ok(Some(last_seq_bytes)) = metadata.get(b"last_flushed_seq") {
+        // Recover consumer checkpoint from metadata (for resuming consumption)
+        let consumer_checkpoint_seq = if let Ok(Some(last_seq_bytes)) = metadata.get(b"last_flushed_seq") {
             if last_seq_bytes.len() == 8 {
                 let arr: [u8; 8] = last_seq_bytes.to_vec().try_into().unwrap();
-                let last_seq = u64::from_be_bytes(arr);
-                slot_sequence.store(last_seq + 1, Ordering::SeqCst);
-
-                // Also recover the last_flushed_slot if present
-                if let Ok(Some(slot_bytes)) = metadata.get(b"last_flushed_slot") {
-                    if slot_bytes.len() == 8 {
-                        let arr: [u8; 8] = slot_bytes.to_vec().try_into().unwrap();
-                        let last_slot = u64::from_be_bytes(arr);
-                        log::info!("WAL recovered from fjall, starting from slot {} seq {}", last_slot, last_seq + 1);
-                    }
-                }
+                Some(u64::from_be_bytes(arr))
+            } else {
+                None
             }
+        } else {
+            None
+        };
+
+        // Initialize producer cursor from actual max key in events keyspace
+        // For an empty WAL (max_existing_seq = 0), start at 0
+        // For a non-empty WAL (max_existing_seq = N), start at N+1 to avoid overwrites
+        let slot_sequence = Arc::new(AtomicU64::new(
+            if max_existing_seq == 0 {
+                0  // Empty WAL starts at sequence 0
+            } else {
+                max_existing_seq + 1  // Non-empty WAL continues after max
+            }
+        ));
+
+        log::info!("WAL init: max_existing_seq={}, producer_cursor={}", max_existing_seq,
+                   if max_existing_seq == 0 { 0 } else { max_existing_seq + 1 });
+
+        // Log recovery state
+        if max_existing_seq > 0 {
+            let unprocessed_count = max_existing_seq.saturating_add(1).saturating_sub(consumer_checkpoint_seq.unwrap_or(0));
+            log::info!(
+                "WAL recovered: max_seq={}, producer_cursor={}, consumer_checkpoint={:?}, unprocessed_events={}",
+                max_existing_seq,
+                max_existing_seq + 1,
+                consumer_checkpoint_seq,
+                unprocessed_count
+            );
         } else {
             log::info!("New WAL initialized at: {}", wal_path.display());
         }
@@ -375,5 +407,84 @@ mod tests {
         // Verify that read_next returns None (no more events)
         let next_entry = wal_queue.read_next().unwrap();
         assert!(next_entry.is_none(), "Expected no events remaining, but found one");
+    }
+
+    #[test]
+    fn test_restart_preserves_unprocessed_events() {
+        // This test verifies the fix for the critical bug where
+        // the producer cursor was initialized from the consumer checkpoint,
+        // causing unprocessed events to be overwritten on restart.
+        let temp_dir = tempdir().unwrap();
+        let wal_path = temp_dir.path().join("test_restart_wal");
+        std::fs::create_dir_all(&wal_path).unwrap();
+
+        // Phase 1: Write 200 events and process 100
+        {
+            let wal_queue = WalQueue::new(&wal_path).unwrap();
+            println!("Phase 1: Created WAL queue, total_written={}", wal_queue.get_total_written());
+
+            // Write 200 events
+            for seq in 0..200 {
+                let update = SubscribeUpdate {
+                    ..Default::default()
+                };
+                wal_queue.push_update(seq, &update).unwrap();
+            }
+
+            // Mark first 100 as processed (simulating consumer checkpoint at seq 99)
+            wal_queue.mark_processed(100, 99).unwrap();
+
+            // Verify state before "crash"
+            let total_written = wal_queue.get_total_written();
+            println!("After writing 200 events: total_written={}, last_processed_seq={}, unprocessed={}",
+                      total_written, wal_queue.get_last_processed_seq(), wal_queue.get_unprocessed_count());
+            assert_eq!(total_written, 200, "Should have written exactly 200 events");
+            assert_eq!(wal_queue.get_last_processed_seq(), 100);
+            assert_eq!(wal_queue.get_unprocessed_count(), 100);
+        }
+
+        // Phase 2: Simulate crash/restart by opening WAL again
+        // This is the critical test: producer cursor must start at 200, not 100
+        {
+            let wal_queue = WalQueue::new(&wal_path).unwrap();
+
+            // CRITICAL: Producer cursor must be at 200 (max_existing_seq=199 + 1)
+            // NOT at 100 (consumer_checkpoint=99 + 1)
+            assert_eq!(wal_queue.get_total_written(), 200,
+                       "Producer cursor should start at max_existing_seq + 1 (200), not consumer_checkpoint + 1 (100)");
+
+            // Consumer checkpoint should still be at 100
+            assert_eq!(wal_queue.get_last_processed_seq(), 100,
+                       "Consumer checkpoint should be preserved");
+
+            // Should have 100 unprocessed events (seq 100-199)
+            assert_eq!(wal_queue.get_unprocessed_count(), 100,
+                       "All unprocessed events should be preserved");
+
+            // Verify events 100-199 are still readable (not overwritten)
+            for expected_seq in 100..200 {
+                let entry = wal_queue.read_from(0, expected_seq).unwrap()
+                    .expect(&format!("Event {} should still exist", expected_seq));
+                assert_eq!(entry.seq, expected_seq,
+                           "Event sequence should match expected value");
+            }
+
+            // Now write new event starting from cursor 200
+            let update = SubscribeUpdate {
+                ..Default::default()
+            };
+            let new_seq = wal_queue.push_update(200, &update).unwrap();
+            assert_eq!(new_seq, 200, "New event should be written at sequence 200");
+
+            // Verify new event is at sequence 200 (not overwriting 100)
+            let new_entry = wal_queue.read_from(0, 200).unwrap()
+                .expect("New event should be at sequence 200");
+            assert_eq!(new_entry.seq, 200);
+
+            // Verify event 100 still exists (proves no overwrite occurred)
+            let old_entry = wal_queue.read_from(0, 100).unwrap()
+                .expect("Event 100 should still exist (not overwritten)");
+            assert_eq!(old_entry.seq, 100);
+        }
     }
 }

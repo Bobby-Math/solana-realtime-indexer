@@ -26,7 +26,10 @@ cp .env.example .env
 echo "GEYSER_ENDPOINT=https://your-helius-geyser-endpoint.com" >> .env
 
 # Start TimescaleDB
-docker-compose up -d
+docker compose up -d
+
+# Run database migrations
+./scripts/run-migrations.sh
 
 # Run with real Geyser connection
 cargo run
