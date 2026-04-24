@@ -6,6 +6,7 @@ use prost::Message;
 
 const WAL_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const WAL_GC_INTERVAL: Duration = Duration::from_secs(10);
+const WAL_GC_SAFETY_MARGIN_DEFAULT: u64 = 1000; // Keep 1000 entries as safety buffer
 
 /// WAL durability mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +29,34 @@ impl WalDurabilityMode {
                 log::warn!("Unknown WAL_DURABILITY_MODE value, using 'relaxed'");
                 WalDurabilityMode::Relaxed
             }
+        }
+    }
+}
+
+/// Get GC safety margin from environment variable
+/// Returns the number of entries to keep as a safety buffer to prevent race conditions
+/// between consumer reads and GC deletes
+fn gc_safety_margin_from_env() -> u64 {
+    match std::env::var("WAL_GC_SAFETY_MARGIN") {
+        Ok(val) => {
+            match val.parse::<u64>() {
+                Ok(margin) if margin >= 100 => {
+                    log::info!("WAL GC safety margin: {} entries", margin);
+                    margin
+                }
+                Ok(margin) => {
+                    log::warn!("WAL_GC_SAFETY_MARGIN too small ({}), using minimum 100", margin);
+                    100
+                }
+                Err(_) => {
+                    log::warn!("Invalid WAL_GC_SAFETY_MARGIN value, using default {}", WAL_GC_SAFETY_MARGIN_DEFAULT);
+                    WAL_GC_SAFETY_MARGIN_DEFAULT
+                }
+            }
+        }
+        Err(_) => {
+            log::info!("WAL GC safety margin: {} entries (default)", WAL_GC_SAFETY_MARGIN_DEFAULT);
+            WAL_GC_SAFETY_MARGIN_DEFAULT
         }
     }
 }
@@ -62,6 +91,7 @@ pub struct WalQueue {
     slot_sequence: Arc<AtomicU64>,
     wal_path: String,
     durability_mode: WalDurabilityMode,
+    gc_safety_margin: u64, // Number of entries to keep as safety buffer
 }
 
 impl WalQueue {
@@ -154,6 +184,7 @@ impl WalQueue {
             slot_sequence,
             wal_path: wal_path.display().to_string(),
             durability_mode,
+            gc_safety_margin: gc_safety_margin_from_env(),
         })
     }
 
@@ -396,8 +427,23 @@ impl WalQueue {
             return Ok(0);
         }
 
-        // Iterate from sequence 0 up to last_flushed_seq and delete each event
-        let end_key = last_flushed_seq.to_be_bytes();
+        // CRITICAL: Apply safety margin to prevent race condition between consumer reads and GC deletes
+        //
+        // The race: Consumer calls read_next() which reads last_flushed_seq, then fetches the entry.
+        //           GC runs in parallel, reads last_flushed_seq, and deletes entries < last_flushed_seq.
+        //           If GC deletes the entry consumer is currently reading, we get read errors or data loss.
+        //
+        // The fix: Only delete entries that are definitely safe (seq < last_flushed_seq - safety_margin).
+        //          This creates a buffer zone where consumer can safely read without GC interference.
+        let delete_up_to = last_flushed_seq.saturating_sub(self.gc_safety_margin);
+
+        if delete_up_to == 0 {
+            // Not enough entries to safely delete yet
+            return Ok(0);
+        }
+
+        // Iterate from sequence 0 up to (last_flushed_seq - safety_margin) and delete each event
+        let end_key = delete_up_to.to_be_bytes();
         let mut iter = self.events.range(..end_key);
 
         let mut deleted_count = 0u64;
@@ -415,7 +461,8 @@ impl WalQueue {
         }
 
         if deleted_count > 0 {
-            log::debug!("WAL GC: Deleted {} processed events (seq < {})", deleted_count, last_flushed_seq);
+            log::debug!("WAL GC: Deleted {} processed events (seq < {}, checkpoint: {}, margin: {})",
+                       deleted_count, delete_up_to, last_flushed_seq, self.gc_safety_margin);
         }
 
         Ok(deleted_count)
@@ -472,6 +519,9 @@ mod tests {
 
     #[test]
     fn test_normal_operation_garbage_collection() {
+        // Set safety margin to 100 for this test (default is 1000)
+        std::env::set_var("WAL_GC_SAFETY_MARGIN", "100");
+
         let temp_dir = tempdir().unwrap();
         let wal_path = temp_dir.path();
         let wal_queue = WalQueue::new(wal_path).unwrap();
@@ -490,14 +540,16 @@ mod tests {
         wal_queue.mark_processed(500, 499).unwrap();
 
         // Run garbage collection
+        // With safety_margin=100, should delete entries < (500 - 100) = 400
+        // So it should delete 400 entries (seq 0-399)
         let deleted = wal_queue.delete_processed_events().unwrap();
 
-        // Verify that 500 events were deleted
-        assert_eq!(deleted, 500);
+        // Verify that 400 events were deleted (safety margin prevents deleting 400-499)
+        assert_eq!(deleted, 400);
 
-        // Verify that the events keyspace contains exactly 500 items (sequences 500-999)
+        // Verify that the events keyspace contains exactly 600 items (sequences 400-999)
         let remaining_count = wal_queue.events.iter().count();
-        assert_eq!(remaining_count, 500, "Expected 500 remaining events, found {}", remaining_count);
+        assert_eq!(remaining_count, 600, "Expected 600 remaining events, found {}", remaining_count);
 
         // Verify that read_next returns sequence 500 (first unprocessed event)
         let next_entry = wal_queue.read_next().unwrap().unwrap();
@@ -506,12 +558,15 @@ mod tests {
 
     #[test]
     fn test_full_catchup_garbage_collection() {
+        // Set safety margin to 100 for this test (minimum allowed value)
+        std::env::set_var("WAL_GC_SAFETY_MARGIN", "100");
+
         let temp_dir = tempdir().unwrap();
         let wal_path = temp_dir.path();
         let wal_queue = WalQueue::new(wal_path).unwrap();
 
-        // Write 100 mock events to the WAL
-        for seq in 0..100 {
+        // Write 300 mock events to the WAL
+        for seq in 0..300 {
             let update = SubscribeUpdate {
                 ..Default::default()
             };
@@ -519,22 +574,24 @@ mod tests {
             wal_queue.push_update(seq, &update).unwrap();
         }
 
-        // Mark all 100 events as processed
-        wal_queue.mark_processed(100, 99).unwrap();
+        // Mark first 200 events as processed (last_flushed_seq becomes 200)
+        wal_queue.mark_processed(200, 199).unwrap();
 
         // Run garbage collection
+        // With safety_margin=100, should delete entries < (200 - 100) = 100
+        // So it should delete 100 entries (seq 0-99), keeping 100 as safety buffer
         let deleted = wal_queue.delete_processed_events().unwrap();
 
-        // Verify that all 100 events were deleted
+        // Verify that 100 events were deleted (safety margin of 100 preserved)
         assert_eq!(deleted, 100);
 
-        // Verify that the events keyspace is completely empty
+        // Verify that the events keyspace contains exactly 200 items (sequences 100-299)
         let remaining_count = wal_queue.events.iter().count();
-        assert_eq!(remaining_count, 0, "Expected 0 remaining events, found {}", remaining_count);
+        assert_eq!(remaining_count, 200, "Expected 200 remaining events (safety buffer + unprocessed), found {}", remaining_count);
 
-        // Verify that read_next returns None (no more events)
-        let next_entry = wal_queue.read_next().unwrap();
-        assert!(next_entry.is_none(), "Expected no events remaining, but found one");
+        // Verify that read_next returns sequence 200 (first unprocessed event)
+        let next_entry = wal_queue.read_next().unwrap().unwrap();
+        assert_eq!(next_entry.seq, 200);
     }
 
     #[test]
