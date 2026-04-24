@@ -156,27 +156,28 @@ impl WalQueue {
             None
         };
 
-        // Initialize producer cursor from actual max key in events keyspace
-        // For an empty WAL (max_existing_seq = 0), start at 0
-        // For a non-empty WAL (max_existing_seq = N), start at N+1 to avoid overwrites
-        let slot_sequence = Arc::new(AtomicU64::new(
-            if max_existing_seq == 0 {
-                0  // Empty WAL starts at sequence 0
-            } else {
-                max_existing_seq + 1  // Non-empty WAL continues after max
-            }
-        ));
+        // CRITICAL FIX: Distinguish empty WAL from WAL with one entry at seq=0
+        // max_existing_seq == 0 is ambiguous - could be empty OR could have entry at seq=0
+        // Use range().next().is_none() to check if WAL is truly empty
+        let is_empty = events.range::<Vec<u8>, _>(..).next().is_none();
+        let initial_seq = if is_empty {
+            0  // Empty WAL starts at sequence 0
+        } else {
+            max_existing_seq + 1  // Non-empty WAL continues after max to avoid overwrites
+        };
 
-        log::info!("WAL init: max_existing_seq={}, producer_cursor={}", max_existing_seq,
-                   if max_existing_seq == 0 { 0 } else { max_existing_seq + 1 });
+        let slot_sequence = Arc::new(AtomicU64::new(initial_seq));
+
+        log::info!("WAL init: is_empty={}, max_existing_seq={}, producer_cursor={}",
+                   is_empty, max_existing_seq, initial_seq);
 
         // Log recovery state
-        if max_existing_seq > 0 {
+        if !is_empty {
             let unprocessed_count = max_existing_seq.saturating_add(1).saturating_sub(consumer_checkpoint_seq.unwrap_or(0));
             log::info!(
                 "WAL recovered: max_seq={}, producer_cursor={}, consumer_checkpoint={:?}, unprocessed_events={}",
                 max_existing_seq,
-                max_existing_seq + 1,
+                initial_seq,
                 consumer_checkpoint_seq,
                 unprocessed_count
             );
