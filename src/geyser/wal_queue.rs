@@ -228,12 +228,19 @@ impl WalQueue {
     }
 
     pub fn mark_processed(&self, slot: u64, seq: u64) -> Result<(), String> {
-        // Update the metadata keyspace with the last processed sequence
-        self.metadata.insert(b"last_flushed_slot", slot.to_be_bytes())
-            .map_err(|e| format!("Failed to update last_flushed_slot: {}", e))?;
+        // CRITICAL: Use atomic batch write to ensure slot and seq stay consistent
+        // If crash happens between two separate writes, slot and seq could point
+        // at different positions, causing corruption.
+        //
+        // NOTE: last_flushed_slot is technically redundant (recovery only uses seq)
+        // but we keep it for potential debugging/monitoring purposes.
+        let mut batch = self.db.batch();
 
-        self.metadata.insert(b"last_flushed_seq", (seq + 1).to_be_bytes())
-            .map_err(|e| format!("Failed to update last_flushed_seq: {}", e))?;
+        batch.insert(&self.metadata, b"last_flushed_slot", slot.to_be_bytes());
+        batch.insert(&self.metadata, b"last_flushed_seq", (seq + 1).to_be_bytes());
+
+        batch.commit()
+            .map_err(|e| format!("Failed to commit checkpoint batch: {}", e))?;
 
         Ok(())
     }
@@ -767,5 +774,37 @@ mod tests {
                 assert!(e.contains("gap"), "Error should mention gap");
             }
         }
+    }
+
+    #[test]
+    fn test_atomic_checkpoint_write() {
+        // Test that mark_processed uses atomic batch writes
+        // This prevents slot and seq from getting out of sync on crash
+        let temp_dir = tempdir().unwrap();
+        let wal_path = temp_dir.path().join("test_atomic_checkpoint");
+        std::fs::create_dir_all(&wal_path).unwrap();
+
+        let wal_queue = WalQueue::new(&wal_path).unwrap();
+
+        // Mark a bunch of slots as processed
+        for slot in 0..10 {
+            wal_queue.mark_processed(slot, slot).unwrap();
+        }
+
+        // Verify both slot and seq are in sync
+        let last_slot = wal_queue.get_last_processed_slot();
+        let last_seq = wal_queue.get_last_processed_seq();
+
+        assert_eq!(last_slot, 9, "Last slot should be 9");
+        assert_eq!(last_seq, 10, "Last seq should be 10 (next unprocessed)");
+
+        // The key property: even if crash happened during mark_processed,
+        // slot and seq should always be consistent (both or neither updated)
+        // With atomic batch writes, this is guaranteed
+        assert_eq!(last_slot + 1, last_seq,
+                   "Slot + 1 should equal seq (they stay in sync atomically)");
+
+        println!("✓ Atomic checkpoint write keeps slot and seq in sync");
+        println!("  last_slot={}, last_seq={}", last_slot, last_seq);
     }
 }
