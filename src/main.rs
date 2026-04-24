@@ -75,6 +75,12 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     }
 
     // Create WAL queue instead of bounded channel
+    if config.clear_wal_on_startup {
+        log::warn!("CLEAR_WAL_ON_STARTUP=true - removing existing WAL at: {}", config.wal_path);
+        std::fs::remove_dir_all(&config.wal_path).unwrap_or_else(|e| {
+            log::debug!("WAL directory didn't exist or couldn't be removed: {}", e);
+        });
+    }
     std::fs::create_dir_all(&config.wal_path).ok();
     let wal_queue = Arc::new(WalQueue::new(&config.wal_path)?);
 
