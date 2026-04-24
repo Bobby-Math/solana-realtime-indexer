@@ -337,24 +337,48 @@ impl RpcGapFiller {
     async fn fill_via_rpc(&self, from_seq: u64, to_seq: u64) -> Result<(), String> {
         log::info!("Attempting to fill gap from sequence {} to {} via RPC", from_seq, to_seq);
 
-        // For each missing sequence number, try to get the data from RPC
-        // This is a placeholder - actual implementation would call Solana RPC
-        for seq in from_seq..to_seq {
-            match self.wal_queue.read_from(0, seq) { // We don't know the slot, so use 0
-                Ok(Some(entry)) => {
-                    log::debug!("Recovered entry slot {} seq {} from WAL", entry.slot, seq);
-                    // Process the recovered entry
-                }
-                Ok(None) => {
-                    log::warn!("Sequence {} not found in WAL, will need RPC recovery", seq);
-                    // TODO: Implement actual RPC call to get missing slot/transaction data
-                }
-                Err(e) => {
-                    log::error!("Error reading entry {} from WAL: {}", seq, e);
-                }
-            }
+        // Detect all gaps in the range
+        let gaps = self.wal_queue.detect_gaps(from_seq, to_seq);
+
+        if gaps.is_empty() {
+            log::info!("No gaps detected in range {}..{}", from_seq, to_seq);
+            return Ok(());
         }
 
+        log::warn!("Detected {} holes in WAL: {:?}", gaps.len(), gaps);
+
+        // For each missing sequence, try to repair it using RPC
+        for seq in gaps {
+            // Look up which slot corresponds to this sequence
+            let slot = match self.wal_queue.get_slot_for_seq(seq) {
+                Some(s) => {
+                    log::debug!("Seq {} maps to slot {} (from metadata)", seq, s);
+                    s
+                }
+                None => {
+                    log::error!("No slot mapping found for seq {} - cannot repair", seq);
+                    continue;
+                }
+            };
+
+            // TODO: Implement actual RPC call to fetch slot/transaction data
+            // For now, we log what needs to be fetched:
+            log::warn!(
+                "Need to fetch slot {} from RPC to repair seq {}. \
+                This slot's data was lost due to a crash between seq allocation and write.",
+                slot, seq
+            );
+
+            // Pseudo-code for RPC repair:
+            // 1. Call Solana RPC to get block/transaction data for this slot
+            // 2. Convert the data into SubscribeUpdate format
+            // 3. Call self.wal_queue.repair_hole(seq, slot, &update)
+            // 4. Process the repaired entry normally
+
+            log::info!("Would repair seq {} with slot {} data from RPC", seq, slot);
+        }
+
+        // TODO: Return error if any repairs failed
         Ok(())
     }
 }

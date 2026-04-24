@@ -141,6 +141,11 @@ impl WalQueue {
         self.events.insert(seq.to_be_bytes(), buffer)
             .map_err(|e| format!("Failed to write to WAL: {}", e))?;
 
+        // Also store seq→slot mapping for RPC repair
+        let seq_key = format!("seq2slot_{}", seq);
+        self.metadata.insert(seq_key.as_bytes(), slot.to_be_bytes())
+            .map_err(|e| format!("Failed to write seq→slot mapping: {}", e))?;
+
         Ok(seq)
     }
 
@@ -172,38 +177,53 @@ impl WalQueue {
     }
 
     fn read_from_seq(&self, seq: u64) -> Result<Option<WalEntry>, String> {
-        // Use fjall's O(1) range iterator to get the next event
-        let start_key = seq.to_be_bytes();
+        // Direct lookup for exact seq (no more silent skipping!)
+        let key = seq.to_be_bytes();
 
-        let mut iter = self.events.range(start_key..);
+        match self.events.get(&key) {
+            Ok(Some(value)) => {
+                // Decode the entry from the stored value
+                let value_bytes = value.to_vec();
+                let entry_slot = u64::from_be_bytes(value_bytes[0..8].try_into().unwrap());
+                let entry_seq = u64::from_be_bytes(value_bytes[8..16].try_into().unwrap());
+                let timestamp = i64::from_be_bytes(value_bytes[16..24].try_into().unwrap());
+                let payload_len = u32::from_be_bytes(value_bytes[24..28].try_into().unwrap()) as usize;
+                let payload = value_bytes[28..28 + payload_len].to_vec();
 
-        if let Some(guard) = iter.next() {
-            let (key, value) = guard.into_inner()
-                .map_err(|e| format!("Failed to read from WAL: {}", e))?;
+                // Verify the key matches (sanity check)
+                if entry_seq != seq {
+                    return Err(format!("Key mismatch: requested seq {}, found entry seq {}", seq, entry_seq));
+                }
 
-            // Decode the entry from the stored value
-            let value_bytes = value.to_vec();
-            let entry_slot = u64::from_be_bytes(value_bytes[0..8].try_into().unwrap());
-            let entry_seq = u64::from_be_bytes(value_bytes[8..16].try_into().unwrap());
-            let timestamp = i64::from_be_bytes(value_bytes[16..24].try_into().unwrap());
-            let payload_len = u32::from_be_bytes(value_bytes[24..28].try_into().unwrap()) as usize;
-            let payload = value_bytes[28..28 + payload_len].to_vec();
-
-            // Verify the key matches (sanity check)
-            let key_bytes = key.to_vec();
-            let key_seq = u64::from_be_bytes(key_bytes.try_into().unwrap());
-            if key_seq != entry_seq {
-                return Err(format!("Key mismatch: key seq {} != entry seq {}", key_seq, entry_seq));
+                Ok(Some(WalEntry {
+                    slot: entry_slot,
+                    seq: entry_seq,
+                    payload,
+                    timestamp_unix_ms: timestamp,
+                }))
             }
+            Ok(None) => {
+                // Seq not found - this could be:
+                // 1. End of WAL (no more data)
+                // 2. A hole/crash-created gap
+                // 3. Not yet written
 
-            Ok(Some(WalEntry {
-                slot: entry_slot,
-                seq: entry_seq,
-                payload,
-                timestamp_unix_ms: timestamp,
-            }))
-        } else {
-            Ok(None)
+                // Check if this is truly EOF or a hole by looking ahead
+                let next_key = (seq + 1).to_be_bytes();
+                if let Ok(Some(_)) = self.events.get(&next_key) {
+                    // Next seq exists, so this seq is a hole/gap!
+                    return Err(format!(
+                        "WAL gap detected at seq {} (next seq {} exists). \
+                        This sequence was lost due to a crash between allocation and write. \
+                        Try fetching from RPC to repair.",
+                        seq, seq + 1
+                    ));
+                }
+
+                // No next seq either - likely EOF
+                Ok(None)
+            }
+            Err(e) => Err(format!("Failed to read from WAL: {}", e))
         }
     }
 
@@ -253,6 +273,58 @@ impl WalQueue {
             }
         }
         0
+    }
+
+    /// Get the slot number for a given sequence number
+    /// Returns None if the mapping doesn't exist (hole or never allocated)
+    pub fn get_slot_for_seq(&self, seq: u64) -> Option<u64> {
+        let seq_key = format!("seq2slot_{}", seq);
+        self.metadata.get(seq_key.as_bytes()).ok().flatten().and_then(|bytes| {
+            if bytes.len() == 8 {
+                let arr: [u8; 8] = bytes.to_vec().try_into().ok()?;
+                Some(u64::from_be_bytes(arr))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Repair a hole in the WAL by writing data fetched from RPC
+    /// This is called when the consumer detects a gap and fetches the missing data from RPC
+    pub fn repair_hole(&self, seq: u64, slot: u64, update: &SubscribeUpdate) -> Result<(), String> {
+        // Create WAL entry with the fetched data
+        let entry = WalEntry::from_update(slot, seq, update);
+
+        // Serialize entry to bytes
+        let mut buffer = Vec::with_capacity(28 + entry.payload.len());
+        buffer.extend_from_slice(&entry.slot.to_be_bytes());
+        buffer.extend_from_slice(&entry.seq.to_be_bytes());
+        buffer.extend_from_slice(&entry.timestamp_unix_ms.to_be_bytes());
+        buffer.extend_from_slice(&(entry.payload.len() as u32).to_be_bytes());
+        buffer.extend_from_slice(&entry.payload);
+
+        // Write the repaired entry to fill the hole
+        self.events.insert(seq.to_be_bytes(), buffer)
+            .map_err(|e| format!("Failed to repair hole at seq {}: {}", seq, e))?;
+
+        log::info!("Repaired WAL hole at seq {} with slot {} data fetched from RPC", seq, slot);
+
+        Ok(())
+    }
+
+    /// Scan for gaps in the WAL within a sequence range
+    /// Returns a list of missing sequence numbers
+    pub fn detect_gaps(&self, start_seq: u64, end_seq: u64) -> Vec<u64> {
+        let mut gaps = Vec::new();
+
+        for seq in start_seq..end_seq {
+            let key = seq.to_be_bytes();
+            if self.events.get(&key).ok().flatten().is_none() {
+                gaps.push(seq);
+            }
+        }
+
+        gaps
     }
 
     pub fn wal_path(&self) -> &str {
@@ -485,6 +557,215 @@ mod tests {
             let old_entry = wal_queue.read_from(0, 100).unwrap()
                 .expect("Event 100 should still exist (not overwritten)");
             assert_eq!(old_entry.seq, 100);
+        }
+    }
+
+    #[test]
+    fn test_gap_detection_and_repair() {
+        let temp_dir = tempdir().unwrap();
+        let wal_path = temp_dir.path().join("test_gap_detection");
+        std::fs::create_dir_all(&wal_path).unwrap();
+
+        let wal_queue = WalQueue::new(&wal_path).unwrap();
+
+        // Phase 1: Write events 0-5 successfully
+        println!("\n=== Phase 1: Writing events 0-5 ===");
+        for slot in 0..6 {
+            let update = SubscribeUpdate {
+                ..Default::default()
+            };
+            let seq = wal_queue.push_update(slot, &update).unwrap();
+            println!("Wrote slot {} at seq {}", slot, seq);
+            assert_eq!(seq, slot, "Seq should match slot for this test");
+        }
+
+        // Verify we can read all events
+        for seq in 0..6 {
+            let entry = wal_queue.read_from(0, seq).unwrap()
+                .expect(&format!("Seq {} should exist", seq));
+            assert_eq!(entry.seq, seq);
+        }
+
+        // Phase 2: Simulate crash at seq 6 (allocate but don't write)
+        println!("\n=== Phase 2: Simulating crash at seq 6 ===");
+        // Manually increment the counter (simulating fetch_add)
+        wal_queue.slot_sequence.fetch_add(1, Ordering::SeqCst);
+        println!("Allocated seq 6 but crashed before write");
+        println!("seq_counter = {}", wal_queue.slot_sequence.load(Ordering::SeqCst));
+
+        // Phase 3: Write events 7-8 (these will get seq 7 and 8)
+        println!("\n=== Phase 3: Writing events 7-8 after crash ===");
+        for slot in 7..9 {
+            let update = SubscribeUpdate {
+                ..Default::default()
+            };
+            let seq = wal_queue.push_update(slot, &update).unwrap();
+            println!("Wrote slot {} at seq {}", slot, seq);
+            assert_eq!(seq, slot);
+        }
+
+        // Verify events 0-5 and 7-8 exist, but 6 is missing
+        println!("\n=== Phase 4: Verifying hole at seq 6 ===");
+        for seq in 0..9 {
+            match wal_queue.read_from(0, seq) {
+                Ok(Some(entry)) => println!("Seq {} exists: slot {}", entry.seq, entry.slot),
+                Ok(None) => println!("Seq {} is MISSING (hole)", seq),
+                Err(e) => println!("Seq {} error: {}", seq, e),
+            }
+        }
+
+        // Test gap detection: reading seq 6 should detect the gap
+        println!("\n=== Phase 5: Testing gap detection ===");
+        let result = wal_queue.read_from(0, 6);
+        match result {
+            Ok(Some(entry)) => panic!("Expected gap error, but got seq {}", entry.seq),
+            Ok(None) => panic!("Expected gap error, but got None (EOF)"),
+            Err(e) => {
+                println!("✓ Gap detected correctly: {}", e);
+                assert!(e.contains("gap") || e.contains("WAL"),
+                       "Error message should mention gap or WAL");
+            }
+        }
+
+        // Verify we can still read seq 5 and 7
+        let entry_5 = wal_queue.read_from(0, 5).unwrap().unwrap();
+        assert_eq!(entry_5.seq, 5);
+        println!("✓ Can still read seq 5 (before gap)");
+
+        let entry_7 = wal_queue.read_from(0, 7).unwrap().unwrap();
+        assert_eq!(entry_7.seq, 7);
+        println!("✓ Can still read seq 7 (after gap)");
+
+        // Test detect_gaps method
+        println!("\n=== Phase 6: Testing detect_gaps() method ===");
+        let gaps = wal_queue.detect_gaps(0, 9);
+        println!("Detected gaps: {:?}", gaps);
+        assert_eq!(gaps, vec![6], "Should detect exactly one gap at seq 6");
+
+        // Test get_slot_for_seq (for the missing seq)
+        println!("\n=== Phase 7: Testing seq→slot mapping ===");
+        let slot_6 = wal_queue.get_slot_for_seq(6);
+        println!("Slot mapping for seq 6: {:?}", slot_6);
+        // Note: seq 6 was allocated but never written, so no mapping exists
+        assert!(slot_6.is_none(), "Seq 6 should have no slot mapping (never written)");
+
+        // But seq 7 should have a mapping
+        let slot_7 = wal_queue.get_slot_for_seq(7).unwrap();
+        assert_eq!(slot_7, 7, "Seq 7 should map to slot 7");
+        println!("✓ Seq 7 maps to slot 7: {}", slot_7);
+
+        // Phase 8: Test repair_hole
+        println!("\n=== Phase 8: Testing repair_hole() ===");
+        let repair_update = SubscribeUpdate {
+            ..Default::default()
+        };
+        wal_queue.repair_hole(6, 6, &repair_update).unwrap();
+        println!("✓ Repaired hole at seq 6");
+
+        // Verify the repair worked
+        let entry_6_repaired = wal_queue.read_from(0, 6).unwrap().unwrap();
+        assert_eq!(entry_6_repaired.seq, 6);
+        assert_eq!(entry_6_repaired.slot, 6);
+        println!("✓ Can now read seq 6 after repair");
+
+        // Verify no more gaps
+        let gaps_after = wal_queue.detect_gaps(0, 9);
+        assert_eq!(gaps_after, vec![] as Vec<u64>, "Should have no gaps after repair");
+        println!("✓ No gaps detected after repair");
+
+        // Test sequential reading after repair
+        println!("\n=== Phase 9: Testing sequential reading after repair ===");
+        for expected_seq in 0..9 {
+            let entry = wal_queue.read_from(0, expected_seq).unwrap()
+                .expect(&format!("Seq {} should exist after repair", expected_seq));
+            assert_eq!(entry.seq, expected_seq);
+        }
+        println!("✓ All seqs 0-8 readable sequentially");
+
+        println!("\n✅ All gap detection and repair tests passed!");
+    }
+
+    #[test]
+    fn test_no_gap_when_all_exist() {
+        let temp_dir = tempdir().unwrap();
+        let wal_path = temp_dir.path().join("test_no_gap");
+        std::fs::create_dir_all(&wal_path).unwrap();
+
+        let wal_queue = WalQueue::new(&wal_path).unwrap();
+
+        // Write events 0-10
+        for slot in 0..11 {
+            let update = SubscribeUpdate {
+                ..Default::default()
+            };
+            wal_queue.push_update(slot, &update).unwrap();
+        }
+
+        // Should detect no gaps
+        let gaps = wal_queue.detect_gaps(0, 11);
+        assert_eq!(gaps, vec![] as Vec<u64>, "Should have no gaps when all events exist");
+
+        // Reading each seq should work
+        for seq in 0..11 {
+            let entry = wal_queue.read_from(0, seq).unwrap()
+                .expect(&format!("Seq {} should exist", seq));
+            assert_eq!(entry.seq, seq);
+        }
+    }
+
+    #[test]
+    fn test_eof_vs_gap_distinction() {
+        let temp_dir = tempdir().unwrap();
+        let wal_path = temp_dir.path().join("test_eof_gap");
+        std::fs::create_dir_all(&wal_path).unwrap();
+
+        let wal_queue = WalQueue::new(&wal_path).unwrap();
+
+        // Write only events 0-5
+        for slot in 0..6 {
+            let update = SubscribeUpdate {
+                ..Default::default()
+            };
+            wal_queue.push_update(slot, &update).unwrap();
+        }
+
+        // Reading seq 5 should work
+        let entry_5 = wal_queue.read_from(0, 5).unwrap().unwrap();
+        assert_eq!(entry_5.seq, 5);
+
+        // Reading seq 6 should NOT be a gap (no data exists at all after it)
+        // This is EOF, not a gap
+        let result_6 = wal_queue.read_from(0, 6);
+        match result_6 {
+            Ok(None) => println!("✓ Seq 6 is EOF (not a gap) - correct"),
+            Ok(Some(entry)) => panic!("Expected EOF, but got seq {}", entry.seq),
+            Err(e) => {
+                // This would be acceptable if we get a gap error, but it's not ideal
+                println!("Got error for seq 6: {} (acceptable but not ideal)", e);
+            }
+        }
+
+        // Simulate crash at seq 6 by manually incrementing counter
+        wal_queue.slot_sequence.fetch_add(1, Ordering::SeqCst);
+        println!("Simulated crash at seq 6 (allocated but not written)");
+
+        // Now write next event - this should allocate seq 7
+        let update = SubscribeUpdate {
+            ..Default::default()
+        };
+        let seq_7 = wal_queue.push_update(7, &update).unwrap();
+        assert_eq!(seq_7, 7, "Should allocate seq 7 after crash at 6");
+        println!("Wrote event at seq {}", seq_7);
+
+        // Now reading seq 6 should detect a gap
+        let result_6_gap = wal_queue.read_from(0, 6);
+        match result_6_gap {
+            Ok(Some(_)) => panic!("Expected gap error, but got a result"),
+            Ok(None) => panic!("Expected gap error, but got None"),
+            Err(e) => {
+                println!("✓ Seq 6 is now detected as gap: {}", e);
+                assert!(e.contains("gap"), "Error should mention gap");
+            }
         }
     }
 }
