@@ -5,7 +5,7 @@ use helius_laserstream::grpc::subscribe_update::UpdateOneof;
 use futures::pin_mut;
 
 use crate::geyser::consumer::GeyserConfig;
-use crate::geyser::decoder::{GeyserEvent, TransactionUpdate, AccountUpdate, SlotUpdate};
+use crate::geyser::decoder::{GeyserEvent, decode_subscribe_update};
 use crate::geyser::wal_queue::WalQueue;
 
 #[derive(Debug)]
@@ -103,7 +103,8 @@ impl GeyserClient {
                     Ok(Some(Ok(data))) => {
                         // Extract slot for WAL ordering and convert to GeyserEvent for filtering
                         let slot = self.extract_slot(&data);
-                        if let Some(event) = self.handle_helius_data(data.clone()) {
+                        let timestamp_unix_ms = chrono::Utc::now().timestamp_millis();
+                        if let Some(event) = decode_subscribe_update(&data, timestamp_unix_ms) {
                             // Apply client-side filtering to ensure event matches configured filters
                             if !self.event_matches_filters(&event) {
                                 log::trace!("Event filtered out by client-side filters: {:?}", event);
@@ -150,7 +151,8 @@ impl GeyserClient {
                     Some(Ok(data)) => {
                         // Extract slot for WAL ordering and convert to GeyserEvent for filtering
                         let slot = self.extract_slot(&data);
-                        if let Some(event) = self.handle_helius_data(data.clone()) {
+                        let timestamp_unix_ms = chrono::Utc::now().timestamp_millis();
+                        if let Some(event) = decode_subscribe_update(&data, timestamp_unix_ms) {
                             // Apply client-side filtering to ensure event matches configured filters
                             if !self.event_matches_filters(&event) {
                                 log::trace!("Event filtered out by client-side filters: {:?}", event);
@@ -343,148 +345,6 @@ impl GeyserClient {
         }
     }
 
-    fn map_slot_status(status: i32) -> String {
-        // Map prost protobuf enum values to strings
-        // SlotStatus enum values from geyser.proto:
-        // SLOT_PROCESSED = 0
-        // SLOT_CONFIRMED = 1
-        // SLOT_FINALIZED = 2
-        // SLOT_FIRST_SHRED_RECEIVED = 3
-        // SLOT_COMPLETED = 4
-        // SLOT_CREATED_BANK = 5
-        // SLOT_DEAD = 6
-        let status_str = match status {
-            0 => "processed",
-            1 => "confirmed",
-            2 => "finalized",
-            3 => "first_shred_received",
-            4 => "completed",
-            5 => "created_bank",
-            6 => "dead",
-            _ => {
-                log::warn!("Unknown slot status value: {}, using 'unknown'", status);
-                "unknown"
-            }
-        };
-
-        log::debug!("Mapping slot status {} -> '{}'", status, status_str);
-        status_str.to_string()
-    }
-
-    fn handle_helius_data(&self, data: SubscribeUpdate) -> Option<GeyserEvent> {
-        let timestamp_unix_ms = chrono::Utc::now().timestamp_millis();
-
-        // Parse the update based on its type
-        match data.update_oneof? {
-            UpdateOneof::Account(account_update) => {
-                log::debug!("Received account update for slot {}", account_update.slot);
-
-                // Extract account info if available
-                if let Some(account_info) = account_update.account {
-                    log::trace!("Account update: pubkey (bytes), owner (bytes), lamports={}, slot={}",
-                              account_info.lamports, account_update.slot);
-
-                    Some(GeyserEvent::AccountUpdate(AccountUpdate {
-                        timestamp_unix_ms,
-                        slot: account_update.slot,
-                        pubkey: account_info.pubkey.clone(),
-                        owner: account_info.owner.clone(),
-                        lamports: account_info.lamports,
-                        write_version: account_info.write_version,
-                        data: account_info.data,
-                    }))
-                } else {
-                    log::warn!("Account update missing account info for slot {}", account_update.slot);
-                    None
-                }
-            }
-            UpdateOneof::Transaction(tx_update) => {
-                log::debug!("Received transaction update for slot {}", tx_update.slot);
-
-                // Extract transaction info if available
-                if let Some(tx_info) = tx_update.transaction {
-                    // Determine success (err is None means success)
-                    let success = tx_info.meta.as_ref()
-                        .map(|meta| meta.err.is_none())
-                        .unwrap_or(false);  // If no meta, assume failed
-
-                    // Extract fee
-                    let fee = tx_info.meta.as_ref()
-                        .map(|meta| meta.fee)
-                        .unwrap_or(0);
-
-                    // Extract log messages
-                    let log_messages = tx_info.meta.as_ref()
-                        .map(|meta| meta.log_messages.clone())
-                        .unwrap_or_default();
-
-                    // Extract program_ids from transaction data
-                    // In Solana transactions, each instruction has a program_id_index that points
-                    // to the account key that is the program being invoked
-                    let program_ids = if let Some(tx) = &tx_info.transaction {
-                        // Access the message field which contains account_keys and instructions
-                        if let Some(message) = &tx.message {
-                            // Extract program IDs from instructions (keep as raw bytes, not base58 strings)
-                            let mut invoked_programs = std::collections::HashSet::new();
-                            for instruction in &message.instructions {
-                                let program_idx = instruction.program_id_index as usize;
-                                if program_idx < message.account_keys.len() {
-                                    // Store as raw bytes directly for database compatibility
-                                    invoked_programs.insert(message.account_keys[program_idx].clone());
-                                }
-                            }
-                            invoked_programs.into_iter().collect()
-                        } else {
-                            log::debug!("No message field in transaction, program_ids will be empty");
-                            Vec::new()
-                        }
-                    } else {
-                        // Fallback: try to extract from transaction meta if available
-                        // This is less reliable but better than nothing
-                        log::debug!("No transaction field available, program_ids will be empty");
-                        Vec::new()
-                    };
-
-                    log::trace!("Transaction update: signature (bytes), success={}, fee={}, slot={}",
-                              success, fee, tx_update.slot);
-
-                    Some(GeyserEvent::Transaction(TransactionUpdate {
-                        timestamp_unix_ms,
-                        slot: tx_update.slot,
-                        signature: tx_info.signature.clone(),
-                        fee,
-                        success,
-                        program_ids,
-                        log_messages,
-                    }))
-                } else {
-                    log::warn!("Transaction update missing transaction info for slot {}", tx_update.slot);
-                    None
-                }
-            }
-            UpdateOneof::Slot(slot_update) => {
-                log::debug!("Received slot update: {} with status value: {:?}", slot_update.slot, slot_update.status);
-                Some(GeyserEvent::SlotUpdate(SlotUpdate {
-                    timestamp_unix_ms,
-                    slot: slot_update.slot,
-                    parent_slot: slot_update.parent,
-                    status: Self::map_slot_status(slot_update.status),
-                }))
-            }
-            UpdateOneof::Ping(_) => {
-                log::trace!("Received ping - ignoring");
-                None
-            }
-            UpdateOneof::Pong(_) => {
-                log::trace!("Received pong - ignoring");
-                None
-            }
-            other => {
-                log::warn!("Received unhandled update type: {:?}", std::mem::discriminant(&other));
-                None
-            }
-        }
-    }
 }
 
 fn program_filter_bytes(program_id: &str) -> Vec<u8> {

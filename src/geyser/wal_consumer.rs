@@ -1,5 +1,5 @@
 use crate::geyser::wal_queue::{WalQueue, WalEntry};
-use crate::geyser::decoder::GeyserEvent;
+use crate::geyser::decoder::decode_subscribe_update;
 use crate::processor::pipeline::PipelineReport;
 use crate::processor::batch_writer::{BatchWriter, BufferedBatch};
 use crate::processor::decoder::{CustomDecoder, Type1Decoder, PersistedBatch};
@@ -9,8 +9,6 @@ use crate::processor::store::StoreSnapshot;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use helius_laserstream::grpc::SubscribeUpdate;
-use helius_laserstream::grpc::subscribe_update::UpdateOneof;
 
 pub struct WalPipelineConfig {
     pub wal_path: String,
@@ -105,8 +103,9 @@ impl WalPipelineRunner {
         let update = entry.decode_update()
             .map_err(|e| format!("Failed to decode protobuf: {}", e))?;
 
-        // Convert SubscribeUpdate to GeyserEvent
-        let geyser_event = self.convert_update_to_event(&update, entry)?;
+        // Convert SubscribeUpdate to GeyserEvent using shared decoder
+        let geyser_event = decode_subscribe_update(&update, entry.timestamp_unix_ms)
+            .ok_or_else(|| "Failed to decode SubscribeUpdate to GeyserEvent".to_string())?;
 
         // Add to batch
         report.received_events += 1;
@@ -144,108 +143,6 @@ impl WalPipelineRunner {
         }
 
         Ok(())
-    }
-
-    fn convert_update_to_event(&self, update: &SubscribeUpdate, entry: &WalEntry) -> Result<GeyserEvent, String> {
-        let timestamp_unix_ms = entry.timestamp_unix_ms;
-
-        match &update.update_oneof {
-            Some(UpdateOneof::Account(account_update)) => {
-                if let Some(account_info) = &account_update.account {
-                    Ok(GeyserEvent::AccountUpdate(crate::geyser::decoder::AccountUpdate {
-                        timestamp_unix_ms,
-                        slot: account_update.slot,
-                        pubkey: account_info.pubkey.clone(),
-                        owner: account_info.owner.clone(),
-                        lamports: account_info.lamports,
-                        write_version: account_info.write_version,
-                        data: account_info.data.clone(),
-                    }))
-                } else {
-                    Err("Account update missing account info".to_string())
-                }
-            }
-            Some(UpdateOneof::Transaction(tx_update)) => {
-                if let Some(tx_info) = &tx_update.transaction {
-                    let success = tx_info.meta.as_ref()
-                        .map(|meta| meta.err.is_none())
-                        .unwrap_or(false);
-
-                    let fee = tx_info.meta.as_ref()
-                        .map(|meta| meta.fee)
-                        .unwrap_or(0);
-
-                    let log_messages = tx_info.meta.as_ref()
-                        .map(|meta| meta.log_messages.clone())
-                        .unwrap_or_default();
-
-                    let program_ids = if let Some(tx) = &tx_info.transaction {
-                        if let Some(message) = &tx.message {
-                            let mut invoked_programs = std::collections::HashSet::new();
-                            for instruction in &message.instructions {
-                                let program_idx = instruction.program_id_index as usize;
-                                if program_idx < message.account_keys.len() {
-                                    invoked_programs.insert(message.account_keys[program_idx].clone());
-                                }
-                            }
-                            invoked_programs.into_iter().collect()
-                        } else {
-                            Vec::new()
-                        }
-                    } else {
-                        Vec::new()
-                    };
-
-                    Ok(GeyserEvent::Transaction(crate::geyser::decoder::TransactionUpdate {
-                        timestamp_unix_ms,
-                        slot: tx_update.slot,
-                        signature: tx_info.signature.clone(),
-                        fee,
-                        success,
-                        program_ids,
-                        log_messages,
-                    }))
-                } else {
-                    Err("Transaction update missing transaction info".to_string())
-                }
-            }
-            Some(UpdateOneof::Slot(slot_update)) => {
-                Ok(GeyserEvent::SlotUpdate(crate::geyser::decoder::SlotUpdate {
-                    timestamp_unix_ms,
-                    slot: slot_update.slot,
-                    parent_slot: slot_update.parent,
-                    status: Self::map_slot_status(slot_update.status),
-                }))
-            }
-            Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => {
-                Err("Ping/Pong should not be stored in WAL".to_string())
-            }
-            Some(UpdateOneof::Block(_)) | Some(UpdateOneof::BlockMeta(_)) | Some(UpdateOneof::TransactionStatus(_)) | Some(UpdateOneof::Entry(_)) => {
-                Err("Unsupported update type for WAL".to_string())
-            }
-            None => {
-                Err("SubscribeUpdate has no variant".to_string())
-            }
-        }
-    }
-
-    fn map_slot_status(status: i32) -> String {
-        let status_str = match status {
-            0 => "processed",
-            1 => "confirmed",
-            2 => "finalized",
-            3 => "first_shred_received",
-            4 => "completed",
-            5 => "created_bank",
-            6 => "dead",
-            _ => {
-                log::warn!("Unknown slot status value: {}, using 'unknown'", status);
-                "unknown"
-            }
-        };
-
-        log::debug!("Mapping slot status {} -> '{}'", status, status_str);
-        status_str.to_string()
     }
 
     pub fn start_background_processor(mut self) -> tokio::task::JoinHandle<Result<PipelineReport, String>>

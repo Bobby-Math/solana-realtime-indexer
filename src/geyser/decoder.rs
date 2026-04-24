@@ -1,3 +1,6 @@
+use helius_laserstream::grpc::SubscribeUpdate;
+use helius_laserstream::grpc::subscribe_update::UpdateOneof;
+
 #[derive(Debug, Clone)]
 pub enum GeyserEvent {
     AccountUpdate(AccountUpdate),
@@ -33,4 +36,109 @@ pub struct SlotUpdate {
     pub slot: u64,
     pub parent_slot: Option<u64>,
     pub status: String,
+}
+
+/// Decodes a SubscribeUpdate protobuf into a GeyserEvent.
+/// This is a shared function used by both the Geyser client (for filtering)
+/// and the WAL consumer (for processing), eliminating code duplication.
+pub fn decode_subscribe_update(update: &SubscribeUpdate, timestamp_unix_ms: i64) -> Option<GeyserEvent> {
+    match &update.update_oneof {
+        Some(UpdateOneof::Account(account_update)) => {
+            if let Some(account_info) = &account_update.account {
+                Some(GeyserEvent::AccountUpdate(AccountUpdate {
+                    timestamp_unix_ms,
+                    slot: account_update.slot,
+                    pubkey: account_info.pubkey.clone(),
+                    owner: account_info.owner.clone(),
+                    lamports: account_info.lamports,
+                    write_version: account_info.write_version,
+                    data: account_info.data.clone(),
+                }))
+            } else {
+                log::warn!("Account update missing account info for slot {}", account_update.slot);
+                None
+            }
+        }
+        Some(UpdateOneof::Transaction(tx_update)) => {
+            if let Some(tx_info) = &tx_update.transaction {
+                let success = tx_info.meta.as_ref()
+                    .map(|meta| meta.err.is_none())
+                    .unwrap_or(false);
+
+                let fee = tx_info.meta.as_ref()
+                    .map(|meta| meta.fee)
+                    .unwrap_or(0);
+
+                let log_messages = tx_info.meta.as_ref()
+                    .map(|meta| meta.log_messages.clone())
+                    .unwrap_or_default();
+
+                // Extract program IDs from transaction instructions
+                let program_ids = if let Some(tx) = &tx_info.transaction {
+                    if let Some(message) = &tx.message {
+                        let mut invoked_programs = std::collections::HashSet::new();
+                        for instruction in &message.instructions {
+                            let program_idx = instruction.program_id_index as usize;
+                            if program_idx < message.account_keys.len() {
+                                invoked_programs.insert(message.account_keys[program_idx].clone());
+                            }
+                        }
+                        invoked_programs.into_iter().collect()
+                    } else {
+                        log::debug!("No message field in transaction, program_ids will be empty");
+                        Vec::new()
+                    }
+                } else {
+                    log::debug!("No transaction field available, program_ids will be empty");
+                    Vec::new()
+                };
+
+                Some(GeyserEvent::Transaction(TransactionUpdate {
+                    timestamp_unix_ms,
+                    slot: tx_update.slot,
+                    signature: tx_info.signature.clone(),
+                    fee,
+                    success,
+                    program_ids,
+                    log_messages,
+                }))
+            } else {
+                log::warn!("Transaction update missing transaction info for slot {}", tx_update.slot);
+                None
+            }
+        }
+        Some(UpdateOneof::Slot(slot_update)) => {
+            Some(GeyserEvent::SlotUpdate(SlotUpdate {
+                timestamp_unix_ms,
+                slot: slot_update.slot,
+                parent_slot: slot_update.parent,
+                status: map_slot_status(slot_update.status),
+            }))
+        }
+        Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => {
+            log::trace!("Received ping/pong - ignoring");
+            None
+        }
+        other => {
+            log::warn!("Received unhandled update type: {:?}", other);
+            None
+        }
+    }
+}
+
+/// Maps protobuf slot status enum values to human-readable strings.
+fn map_slot_status(status: i32) -> String {
+    match status {
+        0 => "processed".to_string(),
+        1 => "confirmed".to_string(),
+        2 => "finalized".to_string(),
+        3 => "first_shred_received".to_string(),
+        4 => "completed".to_string(),
+        5 => "created_bank".to_string(),
+        6 => "dead".to_string(),
+        _ => {
+            log::warn!("Unknown slot status value: {}, using 'unknown'", status);
+            "unknown".to_string()
+        }
+    }
 }
