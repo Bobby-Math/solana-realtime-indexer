@@ -23,6 +23,7 @@ pub struct ProtocolSubscription {
     pub program_ids: Vec<[u8; 32]>,
     pub account_pubkeys: Vec<[u8; 32]>,
     pub include_slots: bool,
+    pub include_blocks_meta: bool,
 }
 
 /// TOML configuration file structure for protocol subscriptions.
@@ -34,6 +35,12 @@ pub struct ProtocolConfig {
     pub accounts: Vec<String>,
     #[serde(default)]
     pub include_slots: bool,
+    #[serde(default = "default_include_blocks_meta")]
+    pub include_blocks_meta: bool,
+}
+
+fn default_include_blocks_meta() -> bool {
+    true // Default to true for accurate block_time timestamps
 }
 
 impl ProtocolConfig {
@@ -69,6 +76,7 @@ impl ProtocolConfig {
             program_ids,
             account_pubkeys,
             include_slots: config.include_slots,
+            include_blocks_meta: config.include_blocks_meta,
         };
 
         Ok((config, subscription))
@@ -144,12 +152,14 @@ pub fn merge_subscriptions(protocols: &[Box<dyn Protocol>]) -> ProtocolSubscript
     let mut program_ids: Vec<[u8; 32]> = Vec::new();
     let mut account_pubkeys: Vec<[u8; 32]> = Vec::new();
     let mut include_slots = false;
+    let mut include_blocks_meta = false;
 
     for p in protocols {
         let sub = p.subscription();
         program_ids.extend_from_slice(&sub.program_ids);
         account_pubkeys.extend_from_slice(&sub.account_pubkeys);
         include_slots |= sub.include_slots;
+        include_blocks_meta |= sub.include_blocks_meta;
     }
 
     // Deduplicate - two protocols may share the Token program
@@ -158,7 +168,7 @@ pub fn merge_subscriptions(protocols: &[Box<dyn Protocol>]) -> ProtocolSubscript
     account_pubkeys.sort_unstable();
     account_pubkeys.dedup();
 
-    ProtocolSubscription { program_ids, account_pubkeys, include_slots }
+    ProtocolSubscription { program_ids, account_pubkeys, include_slots, include_blocks_meta }
 }
 
 /// Load all protocol TOML files from a directory.
@@ -229,11 +239,13 @@ mod tests {
                 programs: vec![valid.to_string()],
                 accounts: vec![],
                 include_slots: false,
+                include_blocks_meta: false,
             },
             subscription: ProtocolSubscription {
                 program_ids: vec![decode_to_32_bytes(valid, "test").unwrap()],
                 account_pubkeys: vec![],
                 include_slots: false,
+                include_blocks_meta: false,
             },
         };
 
@@ -252,11 +264,13 @@ mod tests {
                 programs: vec!["9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".to_string()],
                 accounts: vec![],
                 include_slots: false,
+                include_blocks_meta: false,
             },
             subscription: ProtocolSubscription {
                 program_ids: vec![program_id],
                 account_pubkeys: vec![],
                 include_slots: false,
+                include_blocks_meta: false,
             },
         };
 
@@ -266,11 +280,13 @@ mod tests {
                 programs: vec!["9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM".to_string()],
                 accounts: vec![],
                 include_slots: false,
+                include_blocks_meta: false,
             },
             subscription: ProtocolSubscription {
                 program_ids: vec![program_id],
                 account_pubkeys: vec![],
                 include_slots: false,
+                include_blocks_meta: false,
             },
         };
 

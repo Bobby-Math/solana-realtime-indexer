@@ -49,10 +49,11 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     // Merge all protocol subscriptions into one (deduplicates shared programs like Token)
     let merged_subscription = merge_subscriptions(&protocols);
 
-    log::info!("Merged subscription: {} programs, {} accounts, slots: {}",
+    log::info!("Merged subscription: {} programs, {} accounts, slots: {}, blocks_meta: {}",
               merged_subscription.program_ids.len(),
               merged_subscription.account_pubkeys.len(),
-              merged_subscription.include_slots);
+              merged_subscription.include_slots,
+              merged_subscription.include_blocks_meta);
 
     // Convert merged [u8; 32] pubkeys to base58 strings for SubscriptionFilter
     let mut filters = Vec::new();
@@ -64,6 +65,9 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     }
     if merged_subscription.include_slots {
         filters.push(SubscriptionFilter::Slots);
+    }
+    if merged_subscription.include_blocks_meta {
+        filters.push(SubscriptionFilter::Blocks);
     }
 
     let geyser_config = GeyserConfig::new(
