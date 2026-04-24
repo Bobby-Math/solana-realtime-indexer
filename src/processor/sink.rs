@@ -74,7 +74,7 @@ impl StorageSink for DryRunStorageSink {
         if !batch.transaction_rows.is_empty() { statement_count += 1; }
         if !batch.slot_rows.is_empty() { statement_count += 1; }
         if !batch.custom_rows.is_empty() { statement_count += 1; }
-        if batch.latest_timestamp_unix_ms().is_some() { statement_count += 4; } // retention deletes for 4 tables
+        if batch.latest_timestamp_unix_ms().is_some() { statement_count += 5; } // retention deletes for 5 tables
         if checkpoint.is_some() { statement_count += 1; }
 
         self.last_statement_count = statement_count;
@@ -207,7 +207,7 @@ mod tests {
             .expect("dry-run write");
 
         assert_eq!(result.snapshot.account_rows, 1);
-        assert_eq!(result.sql_statements_planned, 6); // 1 account + 1 checkpoint + 4 retention deletes
-        assert_eq!(sink.last_statement_count(), 6);
+        assert_eq!(result.sql_statements_planned, 7); // 1 account + 1 checkpoint + 5 retention deletes
+        assert_eq!(sink.last_statement_count(), 7);
     }
 }

@@ -231,7 +231,7 @@ mod tests {
         assert_eq!(report.account_rows_written, 1);
         assert_eq!(report.slot_rows_written, 1);
         assert_eq!(report.custom_rows_written, 1);
-        assert_eq!(report.sql_statements_planned, 8);
+        assert_eq!(report.sql_statements_planned, 9);
         assert_eq!(report.retained_account_rows, 1);
         assert_eq!(report.last_processed_slot, Some(10));
         assert_eq!(report.last_observed_at_unix_ms, Some(1_710_000_000_001));
