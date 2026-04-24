@@ -1,7 +1,6 @@
 docs/
 target/
 .env
-.env.*
 .codex
 
 # Runtime artifacts

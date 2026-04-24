@@ -13,6 +13,7 @@ pub struct Config {
     pub geyser_account_filters: Vec<String>,
     pub geyser_include_slots: bool,
     pub geyser_run_duration_seconds: Option<u64>,
+    pub wal_path: String,
     pub database_url: Option<String>,
     pub db_pool_max_connections: u32,
     pub batch_size: usize,
@@ -37,6 +38,7 @@ impl Config {
             geyser_run_duration_seconds: env::var("GEYSER_RUN_DURATION_SECONDS")
                 .ok()
                 .and_then(|v| v.parse().ok()),
+            wal_path: env::var("WAL_PATH").unwrap_or_else(|_| "./data/wal/geyser-main".to_string()),
             database_url: read_optional_env("DATABASE_URL"),
             db_pool_max_connections: env::var("DB_POOL_MAX_CONNECTIONS")
                 .ok()

@@ -75,16 +75,15 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     }
 
     // Create WAL queue instead of bounded channel
-    let wal_path = format!("./data/wal/geyser_{}", chrono::Utc::now().timestamp());
-    std::fs::create_dir_all("./data/wal").ok();
-    let wal_queue = Arc::new(WalQueue::new(&wal_path)?);
+    std::fs::create_dir_all(&config.wal_path).ok();
+    let wal_queue = Arc::new(WalQueue::new(&config.wal_path)?);
 
     // Start WAL background flusher
     let _wal_flush_handle = wal_queue.clone().start_background_flush().await;
 
     // Configure WAL pipeline
     let wal_pipeline_config = WalPipelineConfig {
-        wal_path: wal_path.clone(),
+        wal_path: config.wal_path.clone(),
         poll_interval: Duration::from_millis(10), // Poll every 10ms
         batch_size: config.batch_size,
         batch_flush_ms: config.batch_flush_ms,
@@ -210,7 +209,7 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     log::info!("   - No event drops (correctness guaranteed)");
     log::info!("   - No blocking (OS buffer + disk storage)");
     log::info!("   - Gap detection + RPC fallback enabled");
-    log::info!("   - WAL path: {}", wal_path);
+    log::info!("   - WAL path: {}", config.wal_path);
     log::info!("   - WAL metrics exposed via /api/metrics");
 
     serve_api(config.bind_address, api_state).await
