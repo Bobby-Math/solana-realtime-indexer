@@ -102,67 +102,46 @@ async fn execute_transactions_insert(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     rows: &[TransactionRow],
 ) -> Result<(), sqlx::Error> {
-    // Collect scalar fields into arrays
-    let timestamps: Vec<chrono::DateTime<Utc>> = rows
-        .iter()
-        .map(|row| to_utc_timestamp(row.timestamp_unix_ms))
-        .collect::<Result<Vec<_>, _>>()?;
-    let slots: Vec<i64> = rows.iter().map(|row| row.slot).collect();
-    let signatures: Vec<Vec<u8>> = rows.iter().map(|row| row.signature.clone()).collect();
-    let fees: Vec<i64> = rows.iter().map(|row| row.fee).collect();
-    let success: Vec<bool> = rows.iter().map(|row| row.success).collect();
+    for row in rows {
+        let timestamp = to_utc_timestamp(row.timestamp_unix_ms)?;
 
-    // Encode 2D arrays as JSON (sqlx doesn't support binding Vec<Vec<u8>> or Vec<String> directly)
-    // PostgreSQL will convert JSON arrays to native bytea[] and text[] types
-    let program_ids_json: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|row| {
-            serde_json::to_value(&row.program_ids)
-                .map_err(|e| sqlx::Error::Protocol(format!("Failed to encode program_ids: {}", e).into()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        // Encode Vec<Vec<u8>> as comma-separated base58 for each program_id
+        // Then use string_to_array and decode to convert back to bytea[]
+        let program_ids_b58: String = row.program_ids
+            .iter()
+            .map(|bytes| bs58::encode(bytes).into_string())
+            .collect::<Vec<_>>()
+            .join(",");
 
-    let log_messages_json: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|row| {
-            serde_json::to_value(&row.log_messages)
-                .map_err(|e| sqlx::Error::Protocol(format!("Failed to encode log_messages: {}", e).into()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        // For log_messages (Vec<String>), join with a delimiter and split in SQL
+        let log_messages_joined = row.log_messages
+            .iter()
+            .map(|msg| msg.replace('|', "||")) // Escape the delimiter
+            .collect::<Vec<_>>()
+            .join("|");
 
-    // Use PostgreSQL JSON array handling to convert to native arrays
-    // jsonb_array_elements_text expands JSON arrays, we aggregate back into PostgreSQL arrays
-    sqlx::query(
-        "INSERT INTO transactions (timestamp, slot, signature, fee, success, program_ids, log_messages)
-         SELECT
-            unnested.timestamp,
-            unnested.slot,
-            unnested.signature,
-            unnested.fee,
-            unnested.success,
-            unnested.program_ids::bytea[],
-            unnested.log_messages::text[]
-         FROM (
-             SELECT
-                 unnest($1::timestamptz[]) as timestamp,
-                 unnest($2::bigint[]) as slot,
-                 unnest($3::bytea[]) as signature,
-                 unnest($4::bigint[]) as fee,
-                 unnest($5::boolean[]) as success,
-                 unnest($6::jsonb[])::bytea[] as program_ids,
-                 unnest($7::jsonb[])::text[] as log_messages
-         ) unnested
-         ON CONFLICT (timestamp, signature) DO NOTHING"
-    )
-    .bind(&timestamps)
-    .bind(&slots)
-    .bind(&signatures)
-    .bind(&fees)
-    .bind(&success)
-    .bind(&program_ids_json)
-    .bind(&log_messages_json)
-    .execute(&mut **transaction)
-    .await?;
+        sqlx::query(
+            "INSERT INTO transactions (timestamp, slot, signature, fee, success, program_ids, log_messages)
+             VALUES ($1, $2, $3, $4, $5,
+                 (SELECT ARRAY_agg(decode(trim(program_id), 'base58')::bytea)
+                  FROM unnest(string_to_array($6, ',')) AS program_id
+                  WHERE program_id != ''),
+                 (SELECT ARRAY_agg(log_msg)
+                  FROM unnest(string_to_array($7, '||')) AS log_msg
+                  WHERE log_msg != '')
+             )
+             ON CONFLICT (timestamp, signature) DO NOTHING"
+        )
+        .bind(timestamp)
+        .bind(row.slot)
+        .bind(&row.signature)
+        .bind(row.fee)
+        .bind(row.success)
+        .bind(program_ids_b58)
+        .bind(log_messages_joined)
+        .execute(&mut **transaction)
+        .await?;
+    }
 
     Ok(())
 }
