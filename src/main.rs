@@ -118,17 +118,8 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
         batch_flush_ms: config.batch_flush_ms,
     };
 
-    // Start RPC gap filler
+    // Create RPC gap filler for event-driven repair
     let gap_filler = RpcGapFiller::new(config.rpc_endpoints.clone(), wal_queue.clone());
-    let gap_filler_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            if let Err(e) = gap_filler.detect_and_fill_gaps().await {
-                log::error!("Gap filler error: {}", e);
-            }
-        }
-    });
 
     // Start Geyser client writing to WAL
     let geyser_client = GeyserClient::new(
@@ -162,7 +153,7 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     ];
     let decoder = Type1Decoder::new();
 
-    // Start WAL pipeline consumer (now handles batching and DB writes directly)
+    // Start WAL pipeline consumer with event-driven gap repair
     let wal_runner = WalPipelineRunner::new(
         wal_queue.clone(),
         wal_pipeline_config,
@@ -171,12 +162,12 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
         decoder,
         custom_decoders,
         sink,
-    );
+    )
+    .with_gap_filler(gap_filler);
     let wal_pipeline_handle = wal_runner.start_background_processor();
 
     log_background_wal_pipeline(wal_pipeline_handle);
     log_background_geyser(geyser_handle);
-    log_background_gap_filler(gap_filler_handle);
 
     // Start WAL metrics reporter
     let _metrics_reporter = {
@@ -320,14 +311,6 @@ fn log_background_wal_pipeline(handle: tokio::task::JoinHandle<Result<PipelineRe
             Ok(Ok(report)) => log::info!("WAL Pipeline completed: {:?}", report),
             Ok(Err(error)) => log::error!("WAL Pipeline failed: {}", error),
             Err(error) => log::error!("WAL Pipeline task join failed: {}", error),
-        }
-    });
-}
-
-fn log_background_gap_filler(handle: tokio::task::JoinHandle<()>) {
-    tokio::spawn(async move {
-        if let Err(error) = handle.await {
-            log::error!("Gap filler task join failed: {}", error);
         }
     });
 }

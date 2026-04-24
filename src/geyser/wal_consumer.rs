@@ -27,6 +27,7 @@ pub struct WalPipelineRunner {
     custom_decoders: Vec<Box<dyn CustomDecoder>>,
     sink: Box<dyn StorageSink>,
     pending_checkpoint_seqs: Vec<u64>, // Track seqs to checkpoint after DB commit
+    gap_filler: Option<RpcGapFiller>, // Event-driven gap repair
 }
 
 impl WalPipelineRunner {
@@ -48,7 +49,13 @@ impl WalPipelineRunner {
             custom_decoders,
             sink,
             pending_checkpoint_seqs: Vec::new(),
+            gap_filler: None,
         }
+    }
+
+    pub fn with_gap_filler(mut self, gap_filler: RpcGapFiller) -> Self {
+        self.gap_filler = Some(gap_filler);
+        self
     }
 
     pub async fn run(&mut self) -> Result<PipelineReport, String> {
@@ -91,7 +98,50 @@ impl WalPipelineRunner {
                     tokio::time::sleep(self.config.poll_interval).await;
                 }
                 Err(e) => {
-                    log::error!("Error reading from WAL: {}", e);
+                    // Check if this is a gap error
+                    if e.contains("gap detected") {
+                        log::warn!("⚠️ Gap detected in WAL: {}", e);
+
+                        // Extract the sequence number from the error message
+                        if let Some(seq_str) = e.split(" seq ").nth(1) {
+                            if let Some(seq_end) = seq_str.find(' ') {
+                                if let Ok(seq) = seq_str[..seq_end].parse::<u64>() {
+                                    // Trigger immediate repair if gap filler is available
+                                    if let Some(gap_filler) = &self.gap_filler {
+                                        log::info!("🔧 Triggering immediate RPC repair for seq {}", seq);
+                                        match gap_filler.repair_gap(seq).await {
+                                            Ok(true) => {
+                                                log::info!("✅ Gap repaired successfully, will retry read");
+                                                // Retry immediately after repair
+                                                continue;
+                                            }
+                                            Ok(false) => {
+                                                log::error!("❌ Gap repair failed for seq {}, skipping", seq);
+                                                // Mark as processed to skip this gap
+                                                let last_flushed = self.wal_queue.get_last_processed_seq();
+                                                let _ = self.wal_queue.mark_processed(0, last_flushed + 1);
+                                            }
+                                            Err(repair_err) => {
+                                                log::error!("❌ Gap repair error for seq {}: {}, skipping", seq, repair_err);
+                                                // Mark as processed to skip this gap
+                                                let last_flushed = self.wal_queue.get_last_processed_seq();
+                                                let _ = self.wal_queue.mark_processed(0, last_flushed + 1);
+                                            }
+                                        }
+                                    } else {
+                                        log::warn!("No gap filler available, skipping gap");
+                                        // Mark as processed to skip this gap
+                                        let last_flushed = self.wal_queue.get_last_processed_seq();
+                                        let _ = self.wal_queue.mark_processed(0, last_flushed + 1);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        log::error!("Error reading from WAL: {}", e);
+                    }
+
+                    // Sleep before retrying
                     tokio::time::sleep(self.config.poll_interval).await;
                 }
             }
@@ -218,80 +268,130 @@ fn checkpoint_update_for_batch(batch: &PersistedBatch) -> Option<CheckpointUpdat
 
 // RPC Fallback for gap detection and filling
 pub struct RpcGapFiller {
-    _rpc_endpoints: Vec<String>,
+    rpc_endpoints: Vec<String>,
     wal_queue: Arc<WalQueue>,
+    client: reqwest::Client,
 }
 
 impl RpcGapFiller {
-    pub fn new(_rpc_endpoints: Vec<String>, wal_queue: Arc<WalQueue>) -> Self {
+    pub fn new(rpc_endpoints: Vec<String>, wal_queue: Arc<WalQueue>) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|e| {
+                panic!("Failed to create HTTP client: {}", e);
+            });
+
         Self {
-            _rpc_endpoints,
+            rpc_endpoints,
             wal_queue,
+            client,
         }
     }
 
-    pub async fn detect_and_fill_gaps(&self) -> Result<(), String> {
-        let last_processed_seq = self.wal_queue.get_last_processed_seq();
-        let total_written = self.wal_queue.get_total_written();
+    /// Repair a single gap immediately upon detection
+    /// Returns true if repair succeeded, false if it failed
+    pub async fn repair_gap(&self, seq: u64) -> Result<bool, String> {
+        log::warn!("🔧 Immediate gap repair triggered for seq {}", seq);
 
-        if total_written > last_processed_seq {
-            let gap_size = total_written - last_processed_seq;
-            log::warn!("Detected gap in WAL processing: {} unprocessed entries (last_processed_seq: {}, total: {})",
-                       gap_size, last_processed_seq, total_written);
+        // Look up which slot corresponds to this sequence
+        let slot = match self.wal_queue.get_slot_for_seq(seq) {
+            Some(s) => {
+                log::debug!("Seq {} maps to slot {} (from metadata)", seq, s);
+                s
+            }
+            None => {
+                log::error!("No slot mapping found for seq {} - cannot repair", seq);
+                return Ok(false);
+            }
+        };
 
-            // Try to recover missing data via RPC
-            self.fill_via_rpc(last_processed_seq, total_written).await?;
-        }
-
-        Ok(())
-    }
-
-    async fn fill_via_rpc(&self, from_seq: u64, to_seq: u64) -> Result<(), String> {
-        log::info!("Attempting to fill gap from sequence {} to {} via RPC", from_seq, to_seq);
-
-        // Detect all gaps in the range
-        let gaps = self.wal_queue.detect_gaps(from_seq, to_seq);
-
-        if gaps.is_empty() {
-            log::info!("No gaps detected in range {}..{}", from_seq, to_seq);
-            return Ok(());
-        }
-
-        log::warn!("Detected {} holes in WAL: {:?}", gaps.len(), gaps);
-
-        // For each missing sequence, try to repair it using RPC
-        for seq in gaps {
-            // Look up which slot corresponds to this sequence
-            let slot = match self.wal_queue.get_slot_for_seq(seq) {
-                Some(s) => {
-                    log::debug!("Seq {} maps to slot {} (from metadata)", seq, s);
-                    s
+        // Try each RPC endpoint until one succeeds
+        for endpoint in &self.rpc_endpoints {
+            match self.fetch_and_repair_slot(endpoint, slot, seq).await {
+                Ok(true) => {
+                    log::info!("✅ Successfully repaired seq {} (slot {})", seq, slot);
+                    return Ok(true);
                 }
-                None => {
-                    log::error!("No slot mapping found for seq {} - cannot repair", seq);
+                Ok(false) => {
+                    log::warn!("Slot {} not found or unavailable, trying next endpoint", slot);
                     continue;
                 }
-            };
-
-            // TODO: Implement actual RPC call to fetch slot/transaction data
-            // For now, we log what needs to be fetched:
-            log::warn!(
-                "Need to fetch slot {} from RPC to repair seq {}. \
-                This slot's data was lost due to a crash between seq allocation and write.",
-                slot, seq
-            );
-
-            // Pseudo-code for RPC repair:
-            // 1. Call Solana RPC to get block/transaction data for this slot
-            // 2. Convert the data into SubscribeUpdate format
-            // 3. Call self.wal_queue.repair_hole(seq, slot, &update)
-            // 4. Process the repaired entry normally
-
-            log::info!("Would repair seq {} with slot {} data from RPC", seq, slot);
+                Err(e) => {
+                    log::warn!("Failed to fetch slot {} from {}: {}", slot, endpoint, e);
+                    continue;
+                }
+            }
         }
 
-        // TODO: Return error if any repairs failed
-        Ok(())
+        log::error!("❌ Failed to repair seq {} (slot {}) from all endpoints", seq, slot);
+        Ok(false)
+    }
+
+    async fn fetch_and_repair_slot(&self, endpoint: &str, slot: u64, seq: u64) -> Result<bool, String> {
+        // Fetch block from Solana RPC
+        let url = format!("{}/", endpoint.trim_end_matches('/'));
+        let response = self.client
+            .post(&url)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBlock",
+                "params": [
+                    slot,
+                    {
+                        "encoding": "base64",
+                        "transactionDetails": "full",
+                        "rewards": false,
+                        "maxSupportedTransactionVersion": 0
+                    }
+                ]
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("RPC request failed: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(format!("RPC returned status {}", response.status()));
+        }
+
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse JSON response: {}", e))?;
+
+        // Check if slot was found
+        if let Some(error) = json.get("error") {
+            if error["code"] == -32007 || error["message"].as_str().map_or(false, |m| m.contains("skipped")) {
+                // Slot was skipped or not finalized
+                return Ok(false);
+            }
+            return Err(format!("RPC error: {}", error));
+        }
+
+        let block_data = json.get("result")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| "No result in RPC response".to_string())?;
+
+        // Convert block data to SubscribeUpdate
+        let update = self.block_to_subscribe_update(block_data, slot)
+            .map_err(|e| format!("Failed to convert block data: {}", e))?;
+
+        // Repair the hole
+        self.wal_queue.repair_hole(seq, slot, &update)?;
+
+        Ok(true)
+    }
+
+    fn block_to_subscribe_update(&self, _block_data: &serde_json::Map<String, serde_json::Value>, _slot: u64) -> Result<helius_laserstream::grpc::SubscribeUpdate, String> {
+        // TODO: Convert block data to SubscribeUpdate protobuf format
+        // For now, return a placeholder to satisfy the type system
+        // This needs actual implementation to convert:
+        // - Block metadata -> SlotUpdate
+        // - Transactions -> Transaction messages
+        // - Account changes -> Account messages
+
+        Err("Block to SubscribeUpdate conversion not yet implemented".to_string())
     }
 }
 
