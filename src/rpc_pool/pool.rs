@@ -72,8 +72,8 @@ impl RpcPool {
     }
 
     pub fn choose_endpoint(&self) -> Option<String> {
-        let mut endpoints = self.endpoints.write().ok()?;
-        let index = select_endpoint_index(&mut endpoints, &self.config.health_policy, Instant::now())?;
+        let endpoints = self.endpoints.read().ok()?;
+        let index = select_endpoint_index(&endpoints, &self.config.health_policy, Instant::now())?;
         Some(endpoints[index].url.clone())
     }
 
@@ -211,8 +211,7 @@ impl EndpointState {
     }
 
     fn circuit_rank(&self, now: Instant) -> CircuitState {
-        let mut circuit = self.circuit.clone();
-        circuit.current_state(now)
+        self.circuit.current_state(now) // Now takes &self, no clone needed
     }
 }
 
@@ -224,7 +223,7 @@ fn newest_observed_slot(endpoints: &[EndpointState]) -> Option<u64> {
 }
 
 fn select_endpoint_index(
-    endpoints: &mut [EndpointState],
+    endpoints: &[EndpointState],
     health_policy: &HealthPolicy,
     now: Instant,
 ) -> Option<usize> {
@@ -232,7 +231,7 @@ fn select_endpoint_index(
     let mut selected_index = None;
     let mut selected_key = None;
 
-    for (index, endpoint) in endpoints.iter_mut().enumerate() {
+    for (index, endpoint) in endpoints.iter().enumerate() {
         if endpoint.circuit.current_state(now) == CircuitState::Open {
             continue;
         }

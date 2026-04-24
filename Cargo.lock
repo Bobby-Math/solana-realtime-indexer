@@ -3823,6 +3823,7 @@ dependencies = [
 name = "solana-realtime-indexer"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum 0.8.8",
  "bs58",
  "chrono",

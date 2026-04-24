@@ -29,13 +29,33 @@ impl CircuitBreaker {
         }
     }
 
-    pub fn current_state(&mut self, now: Instant) -> CircuitState {
-        self.sync_state(now);
-        self.state
+    pub fn current_state(&self, now: Instant) -> CircuitState {
+        // Check if we should transition to HalfOpen without mutating
+        if self.state == CircuitState::Open
+            && self
+                .opened_at
+                .is_some_and(|opened_at| now.saturating_duration_since(opened_at) >= self.half_open_after)
+        {
+            CircuitState::HalfOpen
+        } else {
+            self.state
+        }
+    }
+
+    pub fn sync_state(&mut self, now: Instant) {
+        // Explicitly sync state - call this at mutation points
+        if self.state == CircuitState::Open
+            && self
+                .opened_at
+                .is_some_and(|opened_at| now.saturating_duration_since(opened_at) >= self.half_open_after)
+        {
+            self.state = CircuitState::HalfOpen;
+            self.half_open_probe_in_flight = false;
+        }
     }
 
     pub fn allow_request(&mut self, now: Instant) -> bool {
-        self.sync_state(now);
+        self.sync_state(now); // Explicit sync before checking
 
         match self.state {
             CircuitState::Closed => true,
@@ -59,7 +79,7 @@ impl CircuitBreaker {
     }
 
     pub fn record_failure(&mut self, now: Instant) -> bool {
-        self.sync_state(now);
+        self.sync_state(now); // Explicit sync before recording
 
         match self.state {
             CircuitState::Closed => {
@@ -76,17 +96,6 @@ impl CircuitBreaker {
                 true
             }
             CircuitState::Open => false,
-        }
-    }
-
-    fn sync_state(&mut self, now: Instant) {
-        if self.state == CircuitState::Open
-            && self
-                .opened_at
-                .is_some_and(|opened_at| now.saturating_duration_since(opened_at) >= self.half_open_after)
-        {
-            self.state = CircuitState::HalfOpen;
-            self.half_open_probe_in_flight = false;
         }
     }
 
