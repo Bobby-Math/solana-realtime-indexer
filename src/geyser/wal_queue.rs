@@ -96,8 +96,15 @@ pub struct WalQueue {
 
 impl WalQueue {
     pub fn new(wal_path: impl AsRef<Path>) -> Result<Self, String> {
-        let durability_mode = WalDurabilityMode::from_env();
+        Self::with_config(wal_path, WalDurabilityMode::from_env(), gc_safety_margin_from_env())
+    }
 
+    /// Create a WalQueue with explicit configuration (for testing)
+    pub fn with_config(
+        wal_path: impl AsRef<Path>,
+        durability_mode: WalDurabilityMode,
+        gc_safety_margin: u64,
+    ) -> Result<Self, String> {
         log::info!("WAL durability mode: {:?}", durability_mode);
         if durability_mode == WalDurabilityMode::Relaxed {
             log::warn!("WAL in relaxed durability mode: up to 100ms of events can be lost on power failure");
@@ -184,7 +191,7 @@ impl WalQueue {
             slot_sequence,
             wal_path: wal_path.display().to_string(),
             durability_mode,
-            gc_safety_margin: gc_safety_margin_from_env(),
+            gc_safety_margin,
         })
     }
 
@@ -527,12 +534,14 @@ mod tests {
 
     #[test]
     fn test_normal_operation_garbage_collection() {
-        // Set safety margin to 100 for this test (default is 1000)
-        std::env::set_var("WAL_GC_SAFETY_MARGIN", "100");
-
         let temp_dir = tempdir().unwrap();
         let wal_path = temp_dir.path();
-        let wal_queue = WalQueue::new(wal_path).unwrap();
+        // Use safety_margin=100 for this test (default is 1000)
+        let wal_queue = WalQueue::with_config(
+            wal_path,
+            WalDurabilityMode::Relaxed,
+            100,
+        ).unwrap();
 
         // Write 1,000 mock events to the WAL
         // Create dummy SubscribeUpdate with minimal valid protobuf data
@@ -566,12 +575,14 @@ mod tests {
 
     #[test]
     fn test_full_catchup_garbage_collection() {
-        // Set safety margin to 100 for this test (minimum allowed value)
-        std::env::set_var("WAL_GC_SAFETY_MARGIN", "100");
-
         let temp_dir = tempdir().unwrap();
         let wal_path = temp_dir.path();
-        let wal_queue = WalQueue::new(wal_path).unwrap();
+        // Use safety_margin=100 for this test (minimum allowed value)
+        let wal_queue = WalQueue::with_config(
+            wal_path,
+            WalDurabilityMode::Relaxed,
+            100,
+        ).unwrap();
 
         // Write 300 mock events to the WAL
         for seq in 0..300 {
