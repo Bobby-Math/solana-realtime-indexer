@@ -1,0 +1,10 @@
+# Example protocol configuration for Orca DEX
+name = "Orca DEX"
+
+programs = [
+    "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM",  # Orca swap program
+    "whirLbMiicVdio4qvUfMX5SBLJK1bbVENQVPtY5wVsk",  # Orca whirlpool program
+]
+
+accounts = []
+include_slots = false
