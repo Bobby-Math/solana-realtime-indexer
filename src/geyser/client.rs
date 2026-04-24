@@ -395,6 +395,7 @@ impl GeyserClient {
                 false // Placeholder - requires full transaction parsing
             }
             (SubscriptionFilter::Slots, GeyserEvent::SlotUpdate(_)) => true,
+            (SubscriptionFilter::Blocks, GeyserEvent::BlockMeta(_)) => true,
             (SubscriptionFilter::Blocks, GeyserEvent::SlotUpdate(_)) => false,
             _ => false,
         })
