@@ -153,7 +153,13 @@ impl ApiSnapshot {
 
     fn slot_to_indexed_lag_ms(&self) -> Option<i64> {
         self.last_observed_at_unix_ms
-            .map(|observed_at| self.indexed_at_unix_ms.saturating_sub(observed_at))
+            .map(|observed_at| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                now.saturating_sub(observed_at).max(0)
+            })
     }
 }
 
@@ -209,8 +215,74 @@ mod tests {
         let metrics = snapshot.metrics_response();
 
         assert_eq!(health.last_processed_slot, Some(55));
-        assert_eq!(health.slot_to_indexed_lag_ms, Some(25));
+
+        // Verify lag is computed correctly (current_time - event_time)
+        // The event was at 1000ms, so lag should be >= 0 and reasonably large
+        // (since we're running this test after the event occurred)
+        let lag = health.slot_to_indexed_lag_ms.expect("lag should be present");
+        assert!(lag >= 0, "lag should be non-negative, got {}", lag);
+        // The event was at timestamp 1000, so current time should be significantly later
+        // This test will fail if we're running before Unix timestamp 1000ms (impossible)
+        assert!(lag > 0, "lag should be positive for a past event, got {}", lag);
+
         assert_eq!(metrics.ingest_events_per_sec, 50.0);
         assert_eq!(metrics.db_rows_written_per_sec, 50.0);
+    }
+
+    #[test]
+    fn slot_to_indexed_lag_returns_none_when_no_events_processed() {
+        let report = PipelineReport {
+            last_observed_at_unix_ms: None,
+            ..PipelineReport::default()
+        };
+
+        let snapshot = ApiSnapshot::from_report(
+            "solana-realtime-indexer",
+            "dry-run",
+            "127.0.0.1:8080",
+            2,
+            0,
+            Duration::from_secs(2),
+            1000,
+            report,
+        );
+        let health = snapshot.health_response();
+
+        assert_eq!(health.slot_to_indexed_lag_ms, None);
+    }
+
+    #[test]
+    fn slot_to_indexed_lag_measures_time_since_event() {
+        // Create an event that happened "recently" (within last 10 seconds)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // Event happened 5 seconds ago
+        let event_time = now - 5_000;
+
+        let report = PipelineReport {
+            last_observed_at_unix_ms: Some(event_time),
+            ..PipelineReport::default()
+        };
+
+        let snapshot = ApiSnapshot::from_report(
+            "solana-realtime-indexer",
+            "dry-run",
+            "127.0.0.1:8080",
+            2,
+            0,
+            Duration::from_secs(2),
+            now,
+            report,
+        );
+
+        let lag = snapshot.slot_to_indexed_lag_ms()
+            .expect("lag should be present");
+
+        // Lag should be approximately 5000ms (allowing for test execution time)
+        assert!(lag >= 4_900 && lag <= 5_500,
+                "lag should be ~5000ms for event 5s ago, got {}ms", lag);
     }
 }
