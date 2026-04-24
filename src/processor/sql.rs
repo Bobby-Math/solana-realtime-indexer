@@ -242,6 +242,7 @@ async fn execute_retention_deletes(
         "transactions",
         "custom_decoded_events",
         "pipeline_metrics",
+        "slots",
     ];
 
     let mut statement_count = 0u64;
