@@ -4,7 +4,7 @@ use crate::processor::store::{StoreSnapshot, Type1Store};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use tokio::runtime::Runtime;
+use async_trait::async_trait;
 
 #[derive(Debug, Clone, Default)]
 pub struct StorageWriteResult {
@@ -14,7 +14,6 @@ pub struct StorageWriteResult {
 
 #[derive(Debug)]
 pub enum StorageError {
-    RuntimeInit(String),
     Connect(String),
     Execute(String),
 }
@@ -22,9 +21,6 @@ pub enum StorageError {
 impl Display for StorageError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            StorageError::RuntimeInit(message) => {
-                write!(formatter, "storage runtime init failed: {message}")
-            }
             StorageError::Connect(message) => {
                 write!(formatter, "timescale connection failed: {message}")
             }
@@ -37,8 +33,9 @@ impl Display for StorageError {
 
 impl Error for StorageError {}
 
+#[async_trait]
 pub trait StorageSink: Send {
-    fn write_batch(
+    async fn write_batch(
         &mut self,
         batch: &PersistedBatch,
         checkpoint: Option<CheckpointUpdate>,
@@ -64,8 +61,9 @@ impl DryRunStorageSink {
     }
 }
 
+#[async_trait]
 impl StorageSink for DryRunStorageSink {
-    fn write_batch(
+    async fn write_batch(
         &mut self,
         batch: &PersistedBatch,
         checkpoint: Option<CheckpointUpdate>,
@@ -88,73 +86,32 @@ impl StorageSink for DryRunStorageSink {
     }
 }
 
-struct PoolWithRuntime {
-    pool: PgPool,
-    runtime: Runtime,
-}
-
 pub struct TimescaleStorageSink {
     store: Type1Store,
-    pool: PoolWithRuntime,
+    pool: PgPool,
     last_statement_count: u64,
 }
 
 impl TimescaleStorageSink {
-    pub fn connect(database_url: &str, store: Type1Store) -> Result<Self, StorageError> {
-        Self::connect_with_pool_size(database_url, store, 20)
+    pub async fn connect(database_url: &str, store: Type1Store) -> Result<Self, StorageError> {
+        Self::connect_with_pool_size(database_url, store, 20).await
     }
 
-    pub fn connect_with_pool_size(database_url: &str, store: Type1Store, max_connections: u32) -> Result<Self, StorageError> {
-        // Check if we're already in a runtime
-        let in_runtime = tokio::runtime::Handle::try_current().is_ok();
-
-        let (pool, runtime) = if in_runtime {
-            // We're in a runtime, create the pool using spawn_blocking
-            let database_url = database_url.to_string();
-            let (sender, receiver) = std::sync::mpsc::channel();
-
-            std::thread::spawn(move || {
-                let rt = Runtime::new().unwrap();
-                let pool = rt.block_on(
-                    PgPoolOptions::new()
-                        .max_connections(max_connections)
-                        .min_connections(2)
-                        .acquire_timeout(std::time::Duration::from_secs(60))
-                        .idle_timeout(std::time::Duration::from_secs(600))
-                        .max_lifetime(std::time::Duration::from_secs(1800))
-                        .test_before_acquire(true)
-                        .connect(&database_url),
-                );
-                sender.send((pool, rt)).unwrap();
-            });
-
-            let (pool, rt) = receiver.recv()
-                .map_err(|e| StorageError::Connect(format!("thread communication error: {}", e)))?;
-            let pool = pool.map_err(|e| StorageError::Connect(format!("connection error: {}", e)))?;
-            (pool, rt)
-        } else {
-            // Not in a runtime, create directly
-            let rt = Runtime::new()
-                .map_err(|error| StorageError::RuntimeInit(error.to_string()))?;
-
-            let pool = rt.block_on(
-                PgPoolOptions::new()
-                    .max_connections(max_connections)
-                    .min_connections(2)
-                    .acquire_timeout(std::time::Duration::from_secs(60))
-                    .idle_timeout(std::time::Duration::from_secs(600))
-                    .max_lifetime(std::time::Duration::from_secs(1800))
-                    .test_before_acquire(true)
-                    .connect(database_url),
-            )
-                .map_err(|error| StorageError::Connect(error.to_string()))?;
-
-            (pool, rt)
-        };
+    pub async fn connect_with_pool_size(database_url: &str, store: Type1Store, max_connections: u32) -> Result<Self, StorageError> {
+        let pool = PgPoolOptions::new()
+            .max_connections(max_connections)
+            .min_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(60))
+            .idle_timeout(std::time::Duration::from_secs(600))
+            .max_lifetime(std::time::Duration::from_secs(1800))
+            .test_before_acquire(true)
+            .connect(database_url)
+            .await
+            .map_err(|error| StorageError::Connect(error.to_string()))?;
 
         Ok(Self {
             store,
-            pool: PoolWithRuntime { pool, runtime },
+            pool,
             last_statement_count: 0,
         })
     }
@@ -164,27 +121,27 @@ impl TimescaleStorageSink {
     }
 }
 
+#[async_trait]
 impl StorageSink for TimescaleStorageSink {
-    fn write_batch(
+    async fn write_batch(
         &mut self,
         batch: &PersistedBatch,
         checkpoint: Option<CheckpointUpdate>,
     ) -> Result<StorageWriteResult, StorageError> {
-        // Use our dedicated runtime for database operations
-        let statement_count = self.pool.runtime.block_on({
-            let pool = self.pool.pool.clone();
+        let statement_count = {
+            let pool = self.pool.clone();
             let batch = batch.clone();
             let retention_policy = self.store.retention_policy.clone();
             let checkpoint = checkpoint.clone();
 
-            async move {
-                let mut transaction = pool.begin().await?;
-                let count = execute_batch(&mut transaction, &batch, &retention_policy, checkpoint.as_ref()).await?;
-                transaction.commit().await?;
-                Ok::<u64, sqlx::Error>(count)
-            }
-        })
-            .map_err(|error| StorageError::Execute(error.to_string()))?;
+            let mut transaction = pool.begin().await
+                .map_err(|error| StorageError::Execute(error.to_string()))?;
+            let count = execute_batch(&mut transaction, &batch, &retention_policy, checkpoint.as_ref()).await
+                .map_err(|error| StorageError::Execute(error.to_string()))?;
+            transaction.commit().await
+                .map_err(|error| StorageError::Execute(error.to_string()))?;
+            count
+        };
 
         self.last_statement_count = statement_count;
         let snapshot = self.store.apply_batch(batch.clone());
@@ -207,8 +164,8 @@ mod tests {
     use crate::processor::store::{RetentionPolicy, Type1Store};
     use std::time::Duration;
 
-    #[test]
-    fn dry_run_sink_estimates_statement_count_and_updates_store_snapshot() {
+    #[tokio::test]
+    async fn dry_run_sink_estimates_statement_count_and_updates_store_snapshot() {
         let mut sink = DryRunStorageSink::new(Type1Store::new(RetentionPolicy {
             max_age: Duration::from_secs(60),
         }));
@@ -238,6 +195,7 @@ mod tests {
                     notes: None,
                 }),
             )
+            .await
             .expect("dry-run write");
 
         assert_eq!(result.snapshot.account_rows, 1);

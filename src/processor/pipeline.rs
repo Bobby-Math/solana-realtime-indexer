@@ -54,11 +54,11 @@ impl ProcessorPipeline {
         }
     }
 
-    pub fn run(&mut self) -> Result<PipelineReport, StorageError> {
-        self.run_with_reporter(|_| {})
+    pub async fn run(&mut self) -> Result<PipelineReport, StorageError> {
+        self.run_with_reporter(|_| {}).await
     }
 
-    pub fn run_with_reporter<F>(&mut self, mut report_progress: F) -> Result<PipelineReport, StorageError>
+    pub async fn run_with_reporter<F>(&mut self, mut report_progress: F) -> Result<PipelineReport, StorageError>
     where
         F: FnMut(&PipelineReport),
     {
@@ -71,13 +71,13 @@ impl ProcessorPipeline {
                     self.writer.push(event);
 
                     if let Some(batch) = self.writer.flush_if_needed(Instant::now()) {
-                        self.process_batch(batch, &mut report)?;
+                        self.process_batch(batch, &mut report).await?;
                         report_progress(&report);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if let Some(batch) = self.writer.flush(FlushReason::Interval, Instant::now()) {
-                        self.process_batch(batch, &mut report)?;
+                        self.process_batch(batch, &mut report).await?;
                         report_progress(&report);
                     }
                 }
@@ -86,7 +86,7 @@ impl ProcessorPipeline {
                         .writer
                         .flush(FlushReason::ChannelClosed, Instant::now())
                     {
-                        self.process_batch(batch, &mut report)?;
+                        self.process_batch(batch, &mut report).await?;
                         report_progress(&report);
                     }
                     break;
@@ -97,7 +97,7 @@ impl ProcessorPipeline {
         Ok(report)
     }
 
-    fn process_batch(
+    async fn process_batch(
         &mut self,
         batch: crate::processor::batch_writer::BufferedBatch,
         report: &mut PipelineReport,
@@ -105,7 +105,7 @@ impl ProcessorPipeline {
         let persisted = self.decoder.decode(batch, &mut self.custom_decoders);
         let result = self
             .sink
-            .write_batch(&persisted, checkpoint_update_for_batch(&persisted))?;
+            .write_batch(&persisted, checkpoint_update_for_batch(&persisted)).await?;
         apply_batch(report, persisted, result);
         Ok(())
     }
@@ -184,8 +184,8 @@ mod tests {
     use std::sync::mpsc::sync_channel;
     use std::time::Duration;
 
-    #[test]
-    fn drains_channel_and_flushes_remaining_items_when_sender_closes() {
+    #[tokio::test]
+    async fn drains_channel_and_flushes_remaining_items_when_sender_closes() {
         let (sender, receiver) = sync_channel(4);
         sender
             .send(GeyserEvent::AccountUpdate(AccountUpdate {
@@ -217,7 +217,7 @@ mod tests {
                 max_age: Duration::from_secs(60),
             }))),
         );
-        let report: PipelineReport = pipeline.run().expect("pipeline should drain");
+        let report: PipelineReport = pipeline.run().await.expect("pipeline should drain");
 
         assert_eq!(report.received_events, 2);
         assert_eq!(report.flush_count, 1);

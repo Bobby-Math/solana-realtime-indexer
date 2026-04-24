@@ -150,7 +150,7 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     });
 
     // Build database sink and batch writer
-    let sink = build_sink(&config)?;
+    let sink = build_sink(&config).await?;
     let writer = BatchWriter::new(
         config.batch_size,
         Duration::from_millis(config.batch_flush_ms),
@@ -243,7 +243,7 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     serve_api(config.bind_address, api_state).await
 }
 
-fn build_sink(config: &Config) -> Result<Box<dyn StorageSink>, Box<dyn std::error::Error>> {
+async fn build_sink(config: &Config) -> Result<Box<dyn StorageSink>, Box<dyn std::error::Error>> {
     let retention_policy = RetentionPolicy {
         max_age: Duration::from_secs(60),
     };
@@ -253,7 +253,7 @@ fn build_sink(config: &Config) -> Result<Box<dyn StorageSink>, Box<dyn std::erro
             database_url,
             Type1Store::new(retention_policy),
             config.db_pool_max_connections,
-        )?))
+        ).await?))
     } else {
         Ok(Box::new(DryRunStorageSink::new(Type1Store::new(
             retention_policy,

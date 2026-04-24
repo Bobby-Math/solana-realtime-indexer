@@ -51,7 +51,7 @@ impl WalPipelineRunner {
         }
     }
 
-    pub fn run(&mut self) -> Result<PipelineReport, String> {
+    pub async fn run(&mut self) -> Result<PipelineReport, String> {
         let started_at = Instant::now();
         let mut report = PipelineReport::default();
         let mut last_log_time = started_at;
@@ -65,14 +65,14 @@ impl WalPipelineRunner {
 
             // Check if we should flush due to interval
             if let Some(batch) = self.writer.flush_if_needed(now) {
-                self.process_batch(batch, &mut report)?;
+                self.process_batch(batch, &mut report).await?;
             }
 
             // Check for new entries in WAL
             match self.wal_queue.read_next() {
                 Ok(Some(entry)) => {
                     // Process the event (just add to buffer, DON'T mark yet)
-                    if let Err(e) = self.process_entry(&entry, &mut report) {
+                    if let Err(e) = self.process_entry(&entry, &mut report).await {
                         log::error!("Error processing entry slot {} seq {}: {}", entry.slot, entry.seq, e);
                     }
 
@@ -88,17 +88,17 @@ impl WalPipelineRunner {
                 }
                 Ok(None) => {
                     // No new entries, sleep for poll interval
-                    std::thread::sleep(self.config.poll_interval);
+                    tokio::time::sleep(self.config.poll_interval).await;
                 }
                 Err(e) => {
                     log::error!("Error reading from WAL: {}", e);
-                    std::thread::sleep(self.config.poll_interval);
+                    tokio::time::sleep(self.config.poll_interval).await;
                 }
             }
         }
     }
 
-    fn process_entry(&mut self, entry: &WalEntry, report: &mut PipelineReport) -> Result<(), String> {
+    async fn process_entry(&mut self, entry: &WalEntry, report: &mut PipelineReport) -> Result<(), String> {
         // Decode the protobuf bytes back to SubscribeUpdate
         let update = entry.decode_update()
             .map_err(|e| format!("Failed to decode protobuf: {}", e))?;
@@ -117,10 +117,10 @@ impl WalPipelineRunner {
         Ok(())
     }
 
-    fn process_batch(&mut self, batch: BufferedBatch, report: &mut PipelineReport) -> Result<(), String> {
+    async fn process_batch(&mut self, batch: BufferedBatch, report: &mut PipelineReport) -> Result<(), String> {
         let persisted = self.decoder.decode(batch, &mut self.custom_decoders);
         let checkpoint = checkpoint_update_for_batch(&persisted);
-        let result = self.sink.write_batch(&persisted, checkpoint)
+        let result = self.sink.write_batch(&persisted, checkpoint).await
             .map_err(|e| format!("Storage error: {}", e))?;
 
         apply_batch_report(report, persisted, result);
@@ -149,8 +149,8 @@ impl WalPipelineRunner {
     where
         Self: Send + 'static,
     {
-        tokio::task::spawn_blocking(move || {
-            self.run()
+        tokio::spawn(async move {
+            self.run().await
         })
     }
 }
