@@ -28,6 +28,7 @@ pub struct WalPipelineRunner {
     decoder: Type1Decoder,
     custom_decoders: Vec<Box<dyn CustomDecoder>>,
     sink: Box<dyn StorageSink>,
+    pending_checkpoint_seqs: Vec<u64>, // Track seqs to checkpoint after DB commit
 }
 
 impl WalPipelineRunner {
@@ -48,6 +49,7 @@ impl WalPipelineRunner {
             decoder,
             custom_decoders,
             sink,
+            pending_checkpoint_seqs: Vec::new(),
         }
     }
 
@@ -71,27 +73,19 @@ impl WalPipelineRunner {
             // Check for new entries in WAL
             match self.wal_queue.read_next() {
                 Ok(Some(entry)) => {
-                    // Process the event
-                    match self.process_entry(&entry, &mut report) {
-                        Ok(()) => {
-                            // Mark as processed in WAL
-                            if let Err(e) = self.wal_queue.mark_processed(entry.slot, entry.seq) {
-                                log::error!("Failed to mark entry slot {} seq {} as processed: {}", entry.slot, entry.seq, e);
-                            }
+                    // Process the event (just add to buffer, DON'T mark yet)
+                    if let Err(e) = self.process_entry(&entry, &mut report) {
+                        log::error!("Error processing entry slot {} seq {}: {}", entry.slot, entry.seq, e);
+                    }
 
-                            // Log progress every 5 seconds
-                            if now.duration_since(last_log_time) >= log_interval {
-                                let elapsed = now.duration_since(started_at);
-                                let events_per_sec = report.received_events as f64 / elapsed.as_secs_f64();
-                                let unprocessed_count = self.wal_queue.get_unprocessed_count();
-                                log::info!("📊 WAL Pipeline Progress: {:.1}s elapsed, {} events processed ({:.1} events/sec), {} unprocessed in WAL",
-                                          elapsed.as_secs_f64(), report.received_events, events_per_sec, unprocessed_count);
-                                last_log_time = now;
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("Error processing entry slot {} seq {}: {}", entry.slot, entry.seq, e);
-                        }
+                    // Log progress every 5 seconds
+                    if now.duration_since(last_log_time) >= log_interval {
+                        let elapsed = now.duration_since(started_at);
+                        let events_per_sec = report.received_events as f64 / elapsed.as_secs_f64();
+                        let unprocessed_count = self.wal_queue.get_unprocessed_count();
+                        log::info!("📊 WAL Pipeline Progress: {:.1}s elapsed, {} events processed ({:.1} events/sec), {} unprocessed in WAL",
+                                  elapsed.as_secs_f64(), report.received_events, events_per_sec, unprocessed_count);
+                        last_log_time = now;
                     }
                 }
                 Ok(None) => {
@@ -118,6 +112,9 @@ impl WalPipelineRunner {
         report.received_events += 1;
         self.writer.push(geyser_event);
 
+        // Track this sequence for later checkpointing (after DB commit)
+        self.pending_checkpoint_seqs.push(entry.seq);
+
         Ok(())
     }
 
@@ -128,6 +125,24 @@ impl WalPipelineRunner {
             .map_err(|e| format!("Storage error: {}", e))?;
 
         apply_batch_report(report, persisted, result);
+
+        // CRITICAL FIX: Mark sequences as processed ONLY AFTER DB commit succeeds
+        // This prevents data loss if crash occurs between buffering and DB flush
+        let checkpointed_seqs: Vec<_> = self.pending_checkpoint_seqs.drain(..).collect();
+        for &seq in &checkpointed_seqs {
+            if let Err(e) = self.wal_queue.mark_processed(0, seq) {
+                log::error!("Failed to mark seq {} as processed after DB commit: {}", seq, e);
+                // Note: We don't return error here because the DB commit succeeded,
+                // and the seq will be retried on next startup
+            }
+        }
+
+        if !checkpointed_seqs.is_empty() {
+            log::debug!("Checkpointed {} sequences after DB commit (last: {})",
+                       checkpointed_seqs.len(),
+                       checkpointed_seqs.last().unwrap_or(&0));
+        }
+
         Ok(())
     }
 
