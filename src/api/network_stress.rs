@@ -25,10 +25,14 @@ pub struct SlotHealthBucket {
 }
 
 pub async fn get_network_stress(State(state): State<SharedApiState>) -> Json<NetworkStressResponse> {
-    let snapshot = state.lock().await;
+    // Extract pool clone under lock, then release immediately
+    let pool = {
+        let snapshot = state.lock().await;
+        snapshot.pool.clone()
+    }; // Lock released here
 
     // Get the database pool from the snapshot if available
-    let response = if let Some(pool) = snapshot.pool.as_ref() {
+    let response = if let Some(ref pool) = pool {
         // Query the last 30 buckets from the slot health materialized view
         let query_result = sqlx::query(
             r#"
@@ -101,7 +105,6 @@ pub async fn get_network_stress(State(state): State<SharedApiState>) -> Json<Net
         empty_stress_response()
     };
 
-    drop(snapshot); // Release lock before returning
     Json(response)
 }
 
@@ -142,5 +145,16 @@ mod tests {
         assert_eq!(calculate_stress_level(0.09), "high");     // 9% skip rate
         assert_eq!(calculate_stress_level(0.10), "critical"); // 10% skip rate
         assert_eq!(calculate_stress_level(0.15), "critical"); // 15% skip rate
+    }
+
+    #[test]
+    fn test_empty_stress_response_returns_defaults() {
+        let response = empty_stress_response();
+        assert_eq!(response.buckets.len(), 0);
+        assert_eq!(response.slot_skip_rate, 0.0);
+        assert_eq!(response.slots_per_second, 0.0);
+        assert_eq!(response.skipped_slots_1h, 0);
+        assert_eq!(response.total_slots_1h, 0);
+        assert_eq!(response.stress_level, "normal");
     }
 }
