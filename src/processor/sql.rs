@@ -102,24 +102,67 @@ async fn execute_transactions_insert(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     rows: &[TransactionRow],
 ) -> Result<(), sqlx::Error> {
-    for row in rows {
-        let timestamp = to_utc_timestamp(row.timestamp_unix_ms)?;
+    // Collect scalar fields into arrays
+    let timestamps: Vec<chrono::DateTime<Utc>> = rows
+        .iter()
+        .map(|row| to_utc_timestamp(row.timestamp_unix_ms))
+        .collect::<Result<Vec<_>, _>>()?;
+    let slots: Vec<i64> = rows.iter().map(|row| row.slot).collect();
+    let signatures: Vec<Vec<u8>> = rows.iter().map(|row| row.signature.clone()).collect();
+    let fees: Vec<i64> = rows.iter().map(|row| row.fee).collect();
+    let success: Vec<bool> = rows.iter().map(|row| row.success).collect();
 
-        sqlx::query(
-            "INSERT INTO transactions (timestamp, slot, signature, fee, success, program_ids, log_messages)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT (timestamp, signature) DO NOTHING"
-        )
-        .bind(timestamp)
-        .bind(row.slot)
-        .bind(&row.signature)
-        .bind(row.fee)
-        .bind(row.success)
-        .bind(&row.program_ids)
-        .bind(&row.log_messages)
-        .execute(&mut **transaction)
-        .await?;
-    }
+    // Encode 2D arrays as JSON (sqlx doesn't support binding Vec<Vec<u8>> or Vec<String> directly)
+    // PostgreSQL will convert JSON arrays to native bytea[] and text[] types
+    let program_ids_json: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            serde_json::to_value(&row.program_ids)
+                .map_err(|e| sqlx::Error::Protocol(format!("Failed to encode program_ids: {}", e).into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let log_messages_json: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            serde_json::to_value(&row.log_messages)
+                .map_err(|e| sqlx::Error::Protocol(format!("Failed to encode log_messages: {}", e).into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Use PostgreSQL JSON array handling to convert to native arrays
+    // jsonb_array_elements_text expands JSON arrays, we aggregate back into PostgreSQL arrays
+    sqlx::query(
+        "INSERT INTO transactions (timestamp, slot, signature, fee, success, program_ids, log_messages)
+         SELECT
+            unnested.timestamp,
+            unnested.slot,
+            unnested.signature,
+            unnested.fee,
+            unnested.success,
+            unnested.program_ids::bytea[],
+            unnested.log_messages::text[]
+         FROM (
+             SELECT
+                 unnest($1::timestamptz[]) as timestamp,
+                 unnest($2::bigint[]) as slot,
+                 unnest($3::bytea[]) as signature,
+                 unnest($4::bigint[]) as fee,
+                 unnest($5::boolean[]) as success,
+                 unnest($6::jsonb[])::bytea[] as program_ids,
+                 unnest($7::jsonb[])::text[] as log_messages
+         ) unnested
+         ON CONFLICT (timestamp, signature) DO NOTHING"
+    )
+    .bind(&timestamps)
+    .bind(&slots)
+    .bind(&signatures)
+    .bind(&fees)
+    .bind(&success)
+    .bind(&program_ids_json)
+    .bind(&log_messages_json)
+    .execute(&mut **transaction)
+    .await?;
 
     Ok(())
 }
