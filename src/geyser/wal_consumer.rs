@@ -95,11 +95,35 @@ impl WalPipelineRunner {
             match self.wal_queue.read_from(0, self.next_read_seq) {
                 Ok(Some(entry)) => {
                     // Process the event (just add to buffer, DON'T mark yet)
-                    if let Err(e) = self.process_entry(&entry, &mut report).await {
-                        log::error!("Error processing entry slot {} seq {}: {}", entry.slot, entry.seq, e);
-                    } else {
-                        // Only advance read cursor after successful processing
-                        self.next_read_seq = entry.seq + 1;
+                    match self.process_entry(&entry, &mut report).await {
+                        Ok(()) => {
+                            // Only advance read cursor after successful processing
+                            self.next_read_seq = entry.seq + 1;
+                        }
+                        Err(e) => {
+                            // Check if this is an unrecoverable decode error
+                            let is_decode_error = e.contains("Failed to decode protobuf") ||
+                                                 e.contains("Failed to decode SubscribeUpdate");
+
+                            if is_decode_error {
+                                // Corrupted WAL entry - skip it to prevent permanent block
+                                log::error!("🔴 CORRUPT WAL ENTRY at slot {} seq {}: {}. Skipping to prevent consumer block.",
+                                          entry.slot, entry.seq, e);
+
+                                // Mark as processed to advance past corrupted entry
+                                if let Err(mark_err) = self.wal_queue.mark_processed(entry.slot, entry.seq) {
+                                    log::error!("Failed to mark corrupted entry slot {} seq {} as processed: {}",
+                                              entry.slot, entry.seq, mark_err);
+                                }
+
+                                // Advance in-memory cursor past this entry
+                                self.next_read_seq = entry.seq + 1;
+                            } else {
+                                // Other processing errors - log but don't skip (may be transient)
+                                log::error!("Error processing entry slot {} seq {}: {}", entry.slot, entry.seq, e);
+                                // Don't advance cursor - will retry on next iteration
+                            }
+                        }
                     }
 
                     // Log progress every 5 seconds
