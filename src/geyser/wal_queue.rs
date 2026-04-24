@@ -455,8 +455,15 @@ impl WalQueue {
 
             // Delete the event (convert UserKey to Vec<u8> first)
             let key_bytes = key.to_vec();
-            self.events.remove(key_bytes)
+            self.events.remove(key_bytes.clone())
                 .map_err(|e| format!("Failed to delete event during GC: {}", e))?;
+
+            // CRITICAL: Also delete the seq→slot mapping from metadata to prevent unbounded growth
+            // These mappings are only needed while the event is in the WAL
+            let seq = u64::from_be_bytes(key_bytes.try_into().unwrap());
+            let seq_key = format!("seq2slot_{}", seq);
+            self.metadata.remove(seq_key.as_bytes())
+                .map_err(|e| format!("Failed to delete seq→slot mapping during GC: {}", e))?;
 
             deleted_count += 1;
         }
