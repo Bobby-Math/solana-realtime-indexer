@@ -348,7 +348,14 @@ impl GeyserClient {
 }
 
 fn program_filter_bytes(program_id: &str) -> Vec<u8> {
-    bs58::decode(program_id)
+    let trimmed = program_id.trim();
+    bs58::decode(trimmed)
         .into_vec()
-        .unwrap_or_else(|_| program_id.as_bytes().to_vec())
+        .unwrap_or_else(|e| {
+            panic!(
+                "Invalid base58 in program_filter_bytes for '{}': {}. \
+                 Config validation should have caught this at startup.",
+                trimmed, e
+            )
+        })
 }

@@ -145,9 +145,16 @@ impl SubscriptionFilter {
 }
 
 fn program_filter_bytes(program: &str) -> Vec<u8> {
-    bs58::decode(program)
+    let trimmed = program.trim();
+    bs58::decode(trimmed)
         .into_vec()
-        .unwrap_or_else(|_| program.as_bytes().to_vec())
+        .unwrap_or_else(|e| {
+            panic!(
+                "Invalid base58 in program_filter_bytes for '{}': {}. \
+                 Config validation should have caught this at startup.",
+                trimmed, e
+            )
+        })
 }
 
 #[cfg(test)]
@@ -158,24 +165,44 @@ mod tests {
 
     #[test]
     fn forwards_only_events_that_match_filters() {
+        // Use valid base58 program IDs (32 bytes when decoded)
+        let valid_program_id = "9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM"; // Valid Solana pubkey
         let consumer = GeyserConsumer::new(GeyserConfig {
             endpoint: "mock://geyser".to_string(),
             channel_capacity: 4,
             filters: vec![
-                SubscriptionFilter::Program("amm-program".to_string()),
+                SubscriptionFilter::Program(valid_program_id.to_string()),
                 SubscriptionFilter::Slots,
             ],
         });
         let (sender, receiver) = sync_channel(4);
 
+        // Create fixture with valid base58 program IDs
+        let program_bytes = bs58::decode(valid_program_id).into_vec().unwrap();
+        let mut fixture = GeyserConsumer::simulated_fixture();
+
+        // Only update the events that should match the filter
+        // First AccountUpdate should match (tracked-account)
+        if let GeyserEvent::AccountUpdate(account) = &mut fixture[0] {
+            account.owner = program_bytes.clone();
+        }
+        // Transaction should match
+        if let GeyserEvent::Transaction(tx) = &mut fixture[1] {
+            tx.program_ids = vec![program_bytes.clone()];
+        }
+        // SlotUpdates should match (we have Slots filter)
+        // Second AccountUpdate should NOT match (noise-program)
+
         let forwarded = consumer
-            .forward_events(&sender, GeyserConsumer::simulated_fixture())
+            .forward_events(&sender, fixture)
             .expect("channel open");
         drop(sender);
 
         let events: Vec<GeyserEvent> = receiver.iter().collect();
 
-        assert_eq!(forwarded, 3);
-        assert_eq!(events.len(), 3);
+        // Should forward: AccountUpdate (tracked), Transaction, SlotUpdate (processed), SlotUpdate (confirmed)
+        // Should NOT forward: AccountUpdate (ignored)
+        assert_eq!(forwarded, 4);
+        assert_eq!(events.len(), 4);
     }
 }

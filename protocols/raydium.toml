@@ -1,0 +1,24 @@
+# Example protocol configuration for Raydium AMM
+# This file defines which program IDs and accounts to watch on Geyser
+
+name = "Raydium AMM"
+
+# Program IDs to monitor (base58 format, will be validated at startup)
+programs = [
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",  # Raydium AMM program
+]
+
+# WARNING: Including the Token program as a program filter will capture EVERY SPL
+# token account on Solana (millions of updates per second). Only include it if
+# you truly need all token account updates. For most DEX indexing, you only need
+# the DEX program itself - Helius will send you transactions that invoke both.
+#
+# programs = [
+#     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # Token program - CAUTION!
+# ]
+
+# Specific account pubkeys to monitor (optional)
+accounts = []
+
+# Include slot status updates (optional)
+include_slots = false

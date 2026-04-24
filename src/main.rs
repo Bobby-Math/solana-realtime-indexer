@@ -5,14 +5,13 @@ use solana_realtime_indexer::api;
 use solana_realtime_indexer::api::rest::ApiSnapshot;
 use solana_realtime_indexer::config::Config;
 use solana_realtime_indexer::geyser::client::GeyserClient;
-use solana_realtime_indexer::geyser::consumer::GeyserConfig;
+use solana_realtime_indexer::geyser::consumer::{GeyserConfig, SubscriptionFilter};
+use solana_realtime_indexer::geyser::{Protocol, load_protocols_from_dir, merge_subscriptions};
 use solana_realtime_indexer::geyser::wal_queue::WalQueue;
 use solana_realtime_indexer::geyser::wal_consumer::{WalPipelineConfig, WalPipelineRunner, RpcGapFiller};
 use solana_realtime_indexer::processor::batch_writer::BatchWriter;
 use solana_realtime_indexer::processor::cpi_decoder::CpiLogDecoder;
-use solana_realtime_indexer::processor::decoder::{
-    CustomDecoder, ProgramActivityDecoder, Type1Decoder,
-};
+use solana_realtime_indexer::processor::decoder::{CustomDecoder, Type1Decoder};
 use solana_realtime_indexer::processor::pipeline::PipelineReport;
 use solana_realtime_indexer::processor::sink::{
     DryRunStorageSink, StorageSink, TimescaleStorageSink,
@@ -43,13 +42,37 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
         .geyser_api_key
         .clone()
         .ok_or("Geyser API key must be set for real Geyser connection")?;
+
+    // Load protocols from TOML files or fall back to env vars
+    let protocols = load_protocols(&config)?;
+
+    // Merge all protocol subscriptions into one (deduplicates shared programs like Token)
+    let merged_subscription = merge_subscriptions(&protocols);
+
+    log::info!("Merged subscription: {} programs, {} accounts, slots: {}",
+              merged_subscription.program_ids.len(),
+              merged_subscription.account_pubkeys.len(),
+              merged_subscription.include_slots);
+
+    // Convert merged [u8; 32] pubkeys to base58 strings for SubscriptionFilter
+    let mut filters = Vec::new();
+    for program_id in &merged_subscription.program_ids {
+        filters.push(SubscriptionFilter::Program(bs58::encode(program_id).into_string()));
+    }
+    for account in &merged_subscription.account_pubkeys {
+        filters.push(SubscriptionFilter::Account(bs58::encode(account).into_string()));
+    }
+    if merged_subscription.include_slots {
+        filters.push(SubscriptionFilter::Slots);
+    }
+
     let geyser_config = GeyserConfig::new(
         config
             .geyser_endpoint
             .clone()
             .ok_or("Geyser endpoint must be set")?,
-        config.geyser_channel_capacity, // Still used for initial WAL sizing
-        config.geyser_subscription_filters(),
+        config.geyser_channel_capacity,
+        filters,
     );
 
     let storage_mode = storage_mode(&config);
@@ -133,9 +156,8 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
         Duration::from_millis(config.batch_flush_ms),
     );
 
-    // Create custom decoders
+    // Create custom decoders (protocol-specific decoders will be registered here)
     let custom_decoders: Vec<Box<dyn CustomDecoder>> = vec![
-        Box::new(ProgramActivityDecoder::new("amm-program")),
         Box::new(CpiLogDecoder::new()),
     ];
     let decoder = Type1Decoder::new();
@@ -315,4 +337,41 @@ fn unix_now_millis() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+/// Load protocols from TOML files in the protocols/ directory.
+/// Fails explicitly if no protocol configs are found - no silent fallback.
+fn load_protocols(_config: &Config) -> Result<Vec<Box<dyn Protocol>>, Box<dyn std::error::Error>> {
+    let protocols_dir = "protocols";
+
+    // Check if protocols directory exists
+    if !std::path::Path::new(protocols_dir).exists() {
+        return Err(format!(
+            "Protocols directory '{}' does not exist. \
+             Create a 'protocols/' directory with at least one .toml configuration file. \
+             See protocols/README.md for examples.",
+            protocols_dir
+        ).into());
+    }
+
+    // Load all TOML files using the protocol module's directory scanner
+    let config_only_protocols = load_protocols_from_dir(protocols_dir)
+        .map_err(|e| format!("Failed to load protocols from directory '{}': {}", protocols_dir, e))?;
+
+    if config_only_protocols.is_empty() {
+        return Err(format!(
+            "No protocol .toml files found in '{}' directory. \
+             Add at least one protocol configuration file (e.g., raydium.toml). \
+             See protocols/README.md for examples.",
+            protocols_dir
+        ).into());
+    }
+
+    // Convert ConfigOnlyProtocol to Box<dyn Protocol>
+    let protocols: Vec<Box<dyn Protocol>> = config_only_protocols
+        .into_iter()
+        .map(|p| Box::new(p) as Box<dyn Protocol>)
+        .collect();
+
+    Ok(protocols)
 }
