@@ -5,7 +5,32 @@ use helius_laserstream::grpc::SubscribeUpdate;
 use prost::Message;
 
 const WAL_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
-const WAL_GC_INTERVAL: Duration = Duration::from_secs(10); // Run GC every 10 seconds
+const WAL_GC_INTERVAL: Duration = Duration::from_secs(10);
+
+/// WAL durability mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalDurabilityMode {
+    /// Strict durability: fsync after every write (true WAL semantics)
+    /// Guarantees no data loss on power failure, but slower
+    Strict,
+
+    /// Relaxed durability: fsync every 100ms in background
+    /// Faster but up to 100ms of events can be lost on power failure
+    Relaxed,
+}
+
+impl WalDurabilityMode {
+    pub fn from_env() -> Self {
+        match std::env::var("WAL_DURABILITY_MODE").as_deref() {
+            Ok("strict") => WalDurabilityMode::Strict,
+            Ok("relaxed") | Ok("") | Err(_) => WalDurabilityMode::Relaxed, // Default
+            _ => {
+                log::warn!("Unknown WAL_DURABILITY_MODE value, using 'relaxed'");
+                WalDurabilityMode::Relaxed
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WalEntry {
@@ -36,10 +61,19 @@ pub struct WalQueue {
     metadata: Arc<fjall::Keyspace>,
     slot_sequence: Arc<AtomicU64>,
     wal_path: String,
+    durability_mode: WalDurabilityMode,
 }
 
 impl WalQueue {
     pub fn new(wal_path: impl AsRef<Path>) -> Result<Self, String> {
+        let durability_mode = WalDurabilityMode::from_env();
+
+        log::info!("WAL durability mode: {:?}", durability_mode);
+        if durability_mode == WalDurabilityMode::Relaxed {
+            log::warn!("WAL in relaxed durability mode: up to 100ms of events can be lost on power failure");
+            log::warn!("Set WAL_DURABILITY_MODE=strict for true WAL semantics (fsync after every write)");
+        }
+
         let wal_path = wal_path.as_ref();
 
         // Create WAL directory if it doesn't exist
@@ -119,6 +153,7 @@ impl WalQueue {
             metadata: Arc::new(metadata),
             slot_sequence,
             wal_path: wal_path.display().to_string(),
+            durability_mode,
         })
     }
 
@@ -137,7 +172,8 @@ impl WalQueue {
         buffer.extend_from_slice(&entry.payload);
 
         // Write to fjall events keyspace with seq as key (big-endian for correct sorting)
-        // This is O(1) and does NOT block - writes go to OS buffer immediately
+        // NOTE: This writes to fjall's memtable (in-memory LSM buffer)
+        // Data is NOT durable until fsync happens (either immediately in strict mode or 100ms later in relaxed mode)
         self.events.insert(seq.to_be_bytes(), buffer)
             .map_err(|e| format!("Failed to write to WAL: {}", e))?;
 
@@ -145,6 +181,13 @@ impl WalQueue {
         let seq_key = format!("seq2slot_{}", seq);
         self.metadata.insert(seq_key.as_bytes(), slot.to_be_bytes())
             .map_err(|e| format!("Failed to write seq→slot mapping: {}", e))?;
+
+        // CRITICAL: In strict mode, fsync immediately to guarantee durability
+        // In relaxed mode, background flush handles fsync every 100ms
+        if self.durability_mode == WalDurabilityMode::Strict {
+            self.flush()
+                .map_err(|e| format!("Failed to fsync WAL: {}", e))?;
+        }
 
         Ok(seq)
     }
@@ -383,16 +426,22 @@ impl WalQueue {
             let mut flush_interval = tokio::time::interval(WAL_FLUSH_INTERVAL);
             let mut gc_interval = tokio::time::interval(WAL_GC_INTERVAL);
 
+            // Only run periodic flushes in relaxed mode
+            // In strict mode, we flush on every write already
+            let use_periodic_flush = self.durability_mode == WalDurabilityMode::Relaxed;
+
             loop {
                 tokio::select! {
                     _ = flush_interval.tick() => {
-                        // Flush every 100ms
-                        if let Err(e) = self.flush() {
-                            log::error!("WAL flush error: {}", e);
-                        } else {
-                            let unprocessed = self.get_unprocessed_count();
-                            if unprocessed > 0 {
-                                log::debug!("WAL flushed, {} unprocessed entries", unprocessed);
+                        if use_periodic_flush {
+                            // Flush every 100ms in relaxed mode
+                            if let Err(e) = self.flush() {
+                                log::error!("WAL flush error: {}", e);
+                            } else {
+                                let unprocessed = self.get_unprocessed_count();
+                                if unprocessed > 0 {
+                                    log::trace!("WAL flushed (relaxed mode), {} unprocessed entries", unprocessed);
+                                }
                             }
                         }
                     }
@@ -806,5 +855,35 @@ mod tests {
 
         println!("✓ Atomic checkpoint write keeps slot and seq in sync");
         println!("  last_slot={}, last_seq={}", last_slot, last_seq);
+    }
+
+    #[test]
+    fn test_durability_mode_from_env() {
+        // Test that WAL correctly reads durability mode from env
+
+        // Test default (relaxed mode)
+        std::env::remove_var("WAL_DURABILITY_MODE");
+        let mode = WalDurabilityMode::from_env();
+        assert_eq!(mode, WalDurabilityMode::Relaxed, "Default should be relaxed");
+
+        // Test explicit relaxed
+        std::env::set_var("WAL_DURABILITY_MODE", "relaxed");
+        let mode = WalDurabilityMode::from_env();
+        assert_eq!(mode, WalDurabilityMode::Relaxed);
+
+        // Test strict
+        std::env::set_var("WAL_DURABILITY_MODE", "strict");
+        let mode = WalDurabilityMode::from_env();
+        assert_eq!(mode, WalDurabilityMode::Strict);
+
+        // Test unknown value (should fallback to relaxed)
+        std::env::set_var("WAL_DURABILITY_MODE", "unknown");
+        let mode = WalDurabilityMode::from_env();
+        assert_eq!(mode, WalDurabilityMode::Relaxed, "Unknown should fallback to relaxed");
+
+        // Clean up
+        std::env::remove_var("WAL_DURABILITY_MODE");
+
+        println!("✓ WAL durability mode correctly reads from env");
     }
 }
