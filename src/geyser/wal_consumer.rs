@@ -162,28 +162,24 @@ impl WalPipelineRunner {
                                 }
                                 Ok(false) => {
                                     log::error!("❌ Gap repair failed for seq {}, skipping", seq);
-                                    // Mark as processed to skip this gap - use actual slot not 0
-                                    let last_flushed = self.wal_queue.get_last_processed_seq();
-                                    let next_seq = last_flushed + 1;
-                                    if let Some(slot) = self.wal_queue.get_slot_for_seq(next_seq) {
-                                        let _ = self.wal_queue.mark_processed(slot, next_seq);
+                                    // Mark the actual gap seq as processed, not last_flushed + 1
+                                    if let Some(slot) = self.wal_queue.get_slot_for_seq(seq) {
+                                        let _ = self.wal_queue.mark_processed(slot, seq);
                                     } else {
-                                        log::warn!("No slot mapping for seq {}, using fallback", next_seq);
-                                        let _ = self.wal_queue.mark_processed(0, next_seq);
+                                        log::warn!("No slot mapping for seq {}, using fallback", seq);
+                                        let _ = self.wal_queue.mark_processed(0, seq);
                                     }
                                     // CRITICAL: Advance in-memory cursor to prevent infinite retry loop
                                     self.next_read_seq = seq + 1;
                                 }
                                 Err(repair_err) => {
                                     log::error!("❌ Gap repair error for seq {}: {}, skipping", seq, repair_err);
-                                    // Mark as processed to skip this gap - use actual slot not 0
-                                    let last_flushed = self.wal_queue.get_last_processed_seq();
-                                    let next_seq = last_flushed + 1;
-                                    if let Some(slot) = self.wal_queue.get_slot_for_seq(next_seq) {
-                                        let _ = self.wal_queue.mark_processed(slot, next_seq);
+                                    // Mark the actual gap seq as processed, not last_flushed + 1
+                                    if let Some(slot) = self.wal_queue.get_slot_for_seq(seq) {
+                                        let _ = self.wal_queue.mark_processed(slot, seq);
                                     } else {
-                                        log::warn!("No slot mapping for seq {}, using fallback", next_seq);
-                                        let _ = self.wal_queue.mark_processed(0, next_seq);
+                                        log::warn!("No slot mapping for seq {}, using fallback", seq);
+                                        let _ = self.wal_queue.mark_processed(0, seq);
                                     }
                                     // CRITICAL: Advance in-memory cursor to prevent infinite retry loop
                                     self.next_read_seq = seq + 1;
@@ -191,14 +187,12 @@ impl WalPipelineRunner {
                             }
                         } else {
                             log::warn!("No gap filler available, skipping gap");
-                            // Mark as processed to skip this gap - use actual slot not 0
-                            let last_flushed = self.wal_queue.get_last_processed_seq();
-                            let next_seq = last_flushed + 1;
-                            if let Some(slot) = self.wal_queue.get_slot_for_seq(next_seq) {
-                                let _ = self.wal_queue.mark_processed(slot, next_seq);
+                            // Mark the actual gap seq as processed, not last_flushed + 1
+                            if let Some(slot) = self.wal_queue.get_slot_for_seq(seq) {
+                                let _ = self.wal_queue.mark_processed(slot, seq);
                             } else {
-                                log::warn!("No slot mapping for seq {}, using fallback", next_seq);
-                                let _ = self.wal_queue.mark_processed(0, next_seq);
+                                log::warn!("No slot mapping for seq {}, using fallback", seq);
+                                let _ = self.wal_queue.mark_processed(0, seq);
                             }
                             // CRITICAL: Advance in-memory cursor to prevent infinite retry loop
                             self.next_read_seq = seq + 1;
