@@ -1,3 +1,5 @@
+// LEGACY: Channel-based pipeline (pre-WAL). Not used in production (WalPipelineRunner is used instead).
+// Retained for testing core pipeline behaviors (draining, checkpoint tracking, batch processing).
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Instant;
 use std::sync::Arc;

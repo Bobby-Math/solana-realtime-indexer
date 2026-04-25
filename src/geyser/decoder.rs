@@ -82,17 +82,19 @@ pub fn decode_subscribe_update(update: &SubscribeUpdate, timestamp_unix_ms: i64)
                     .map(|meta| meta.log_messages.clone())
                     .unwrap_or_default();
 
-                // Extract program IDs from transaction instructions
+                // Extract program IDs from transaction instructions (order-preserving dedup)
                 let (program_ids, accounts) = if let Some(tx) = &tx_info.transaction {
                     if let Some(message) = &tx.message {
-                        let mut invoked_programs = std::collections::HashSet::new();
-                        for instruction in &message.instructions {
-                            let program_idx = instruction.program_id_index as usize;
-                            if program_idx < message.account_keys.len() {
-                                invoked_programs.insert(message.account_keys[program_idx].clone());
-                            }
-                        }
-                        let program_ids = invoked_programs.into_iter().collect();
+                        let mut seen = std::collections::HashSet::new();
+                        let program_ids: Vec<Vec<u8>> = message.instructions
+                            .iter()
+                            .filter_map(|instruction| {
+                                let program_idx = instruction.program_id_index as usize;
+                                message.account_keys.get(program_idx)
+                            })
+                            .filter(|key| seen.insert(key.as_slice()))
+                            .cloned()
+                            .collect();
                         let accounts = message.account_keys.clone();
                         (program_ids, accounts)
                     } else {
