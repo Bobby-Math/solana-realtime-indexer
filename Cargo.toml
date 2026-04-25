@@ -32,6 +32,7 @@ fjall = "3.1.4"
 prost = "0.14.3"
 toml = "0.8"
 async-trait = "0.1.89"
+base64 = "0.22.1"
 
 [build-dependencies]
 tonic-build = "0.12"
