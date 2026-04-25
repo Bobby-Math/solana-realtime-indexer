@@ -46,8 +46,21 @@ impl WalPipelineRunner {
         // Cache last 1000 slots (~8KB of memory) - Solana produces ~216k slots/day
         let block_time_cache = BlockTimeCache::new(1000);
 
-        // Initialize in-memory read cursor from persisted checkpoint
-        let next_read_seq = wal_queue.get_last_processed_seq();
+        // CRITICAL FIX: get_last_processed_seq() now returns the actual last processed seq,
+        // NOT the next seq to read. Add +1 to compute the next unprocessed seq.
+        // This fixes the off-by-one error where restarting consumers would re-process
+        // the last committed seq.
+        //
+        // However, if get_last_processed_seq() == 0 and total_written == 0, this means
+        // "no checkpoint yet" (initial state), so we should start from seq 0, not seq 1.
+        // We detect this by checking if total_written == 0.
+        let last_processed = wal_queue.get_last_processed_seq();
+        let total_written = wal_queue.get_total_written();
+        let next_read_seq = if total_written == 0 {
+            0  // Initial state: no events written yet, start from seq 0
+        } else {
+            last_processed + 1  // Resume from next unprocessed seq
+        };
 
         Self {
             wal_queue,

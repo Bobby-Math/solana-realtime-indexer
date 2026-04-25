@@ -224,7 +224,9 @@ async fn execute_custom_decoded_insert(
     let decoder_names: Vec<String> = rows.iter().map(|row| row.decoder_name.clone()).collect();
     let record_keys: Vec<String> = rows.iter().map(|row| row.record_key.clone()).collect();
     let event_indexes: Vec<i16> = rows.iter().map(|row| row.event_index).collect();
-    let payloads: Vec<String> = rows.iter().map(|row| row.payload.clone()).collect();
+    // Convert serde_json::Value to JSONB for PostgreSQL
+    // This is safe because serde_json::Value is guaranteed to be valid JSON
+    let payloads: Vec<serde_json::Value> = rows.iter().map(|row| row.payload.clone()).collect();
 
     sqlx::query(
         "INSERT INTO custom_decoded_events (timestamp, slot, decoder_name, record_key, event_index, payload)

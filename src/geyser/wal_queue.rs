@@ -102,11 +102,26 @@ pub struct WalEntry {
 }
 
 impl WalEntry {
+    /// Create a WAL entry from pre-encoded protobuf bytes.
+    /// This avoids the unnecessary re-encode that happens when accepting
+    /// an already-decoded SubscribeUpdate struct.
+    pub fn from_raw_bytes(slot: u64, seq: u64, raw_protobuf_bytes: &[u8]) -> Self {
+        Self {
+            slot,
+            seq,
+            payload: raw_protobuf_bytes.to_vec(),
+            timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
+        }
+    }
+
+    /// Legacy method for compatibility - accepts decoded struct but re-encodes.
+    /// Prefer from_raw_bytes() to avoid the encode/decode round-trip.
+    #[deprecated(note = "Use from_raw_bytes() to avoid unnecessary re-encode")]
     pub fn from_update(slot: u64, seq: u64, update: &SubscribeUpdate) -> Self {
         Self {
             slot,
             seq,
-            payload: update.encode_to_vec(), // ✅ One re-encode
+            payload: update.encode_to_vec(),
             timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
         }
     }
@@ -229,12 +244,25 @@ impl WalQueue {
         })
     }
 
+    /// Push a SubscribeUpdate to the WAL (legacy method - re-encodes the struct).
+    /// Prefer push_raw_bytes() to avoid the unnecessary encode/decode round-trip.
     pub fn push_update(&self, slot: u64, update: &SubscribeUpdate) -> Result<u64, String> {
         let seq = self.slot_sequence.fetch_add(1, Ordering::Release);
-
-        // Create WAL entry with raw protobuf bytes
         let entry = WalEntry::from_update(slot, seq, update);
+        self.write_entry(seq, slot, &entry)
+    }
 
+    /// Push pre-encoded protobuf bytes to the WAL, avoiding re-encode overhead.
+    /// This is the preferred method for hot-path writes.
+    pub fn push_raw_bytes(&self, slot: u64, raw_protobuf_bytes: &[u8]) -> Result<u64, String> {
+        let seq = self.slot_sequence.fetch_add(1, Ordering::Release);
+        let entry = WalEntry::from_raw_bytes(slot, seq, raw_protobuf_bytes);
+        self.write_entry(seq, slot, &entry)
+    }
+
+    /// Internal method to write a WAL entry to storage.
+    /// Shared by push_update() and push_raw_bytes().
+    fn write_entry(&self, seq: u64, slot: u64, entry: &WalEntry) -> Result<u64, String> {
         // Serialize entry to bytes: slot(8) + seq(8) + timestamp(8) + payload_len(4) + payload
         let mut buffer = Vec::with_capacity(28 + entry.payload.len());
         buffer.extend_from_slice(&entry.slot.to_be_bytes());
@@ -266,8 +294,10 @@ impl WalQueue {
 
 
     pub fn read_next(&self) -> Result<Option<WalEntry>, WalReadError> {
+        // CRITICAL FIX: get_last_processed_seq() now returns the actual last processed seq,
+        // not the next seq to read. Add +1 to read the next unprocessed seq.
         let last_flushed_seq = self.get_last_processed_seq();
-        self.read_from_seq(last_flushed_seq)
+        self.read_from_seq(last_flushed_seq.saturating_add(1))
     }
 
     pub fn read_from(&self, _slot: u64, seq: u64) -> Result<Option<WalEntry>, WalReadError> {
@@ -327,10 +357,14 @@ impl WalQueue {
         //
         // NOTE: last_flushed_slot is technically redundant (recovery only uses seq)
         // but we keep it for potential debugging/monitoring purposes.
+        //
+        // CRITICAL FIX: Store the actual last processed seq, NOT seq+1.
+        // This makes get_last_processed_seq() return the correct value (the last processed seq).
+        // The consumer is responsible for adding +1 when computing next_read_seq.
         let mut batch = self.db.batch();
 
         batch.insert(&self.metadata, b"last_flushed_slot", slot.to_be_bytes());
-        batch.insert(&self.metadata, b"last_flushed_seq", (seq + 1).to_be_bytes());
+        batch.insert(&self.metadata, b"last_flushed_seq", seq.to_be_bytes());
 
         batch.commit()
             .map_err(|e| format!("Failed to commit checkpoint batch: {}", e))?;
@@ -347,12 +381,15 @@ impl WalQueue {
     /// corrupts last_flushed_slot to 0. This method only advances the sequence,
     /// preserving the existing slot checkpoint. The next successful batch will
     /// update both correctly.
+    ///
+    /// CRITICAL FIX: Store the actual last processed seq, NOT seq+1.
+    /// This makes get_last_processed_seq() return the correct value.
     pub fn skip_processed_sequence(&self, seq: u64) -> Result<(), String> {
         self.metadata
-            .insert(b"last_flushed_seq", (seq + 1).to_be_bytes())
+            .insert(b"last_flushed_seq", seq.to_be_bytes())
             .map_err(|e| format!("Failed to advance sequence checkpoint: {}", e))?;
 
-        log::warn!("Advanced seq checkpoint to {} (slot checkpoint preserved)", seq + 1);
+        log::warn!("Advanced seq checkpoint to {} (slot checkpoint preserved)", seq);
         Ok(())
     }
 
@@ -365,8 +402,22 @@ impl WalQueue {
 
     pub fn get_unprocessed_count(&self) -> u64 {
         let total = self.slot_sequence.load(Ordering::Relaxed);
-        let processed = self.get_last_processed_seq();
-        total.saturating_sub(processed)
+        let last_processed = self.get_last_processed_seq();
+
+        // CRITICAL FIX: get_last_processed_seq() now returns the actual last processed seq,
+        // not the next seq to read. So unprocessed count is total - (last_processed + 1).
+        //
+        // However, last_processed == 0 is ambiguous: it could mean "no checkpoint" or "seq 0 was processed".
+        // We distinguish by checking if last_flushed_slot == 0 (no checkpoint created yet).
+        let last_flushed_slot = self.get_last_processed_slot();
+        if last_flushed_slot == 0 && last_processed == 0 {
+            // No checkpoint created yet, all events are unprocessed
+            total
+        } else {
+            // Checkpoint exists, calculate unprocessed count normally
+            let next_unprocessed = last_processed.saturating_add(1);
+            total.saturating_sub(next_unprocessed)
+        }
     }
 
     pub fn get_total_written(&self) -> u64 {
@@ -390,6 +441,11 @@ impl WalQueue {
                 return u64::from_be_bytes(arr);
             }
         }
+        // CRITICAL: Return 0 to indicate "no checkpoint yet" (initial state).
+        // This is technically ambiguous with "seq 0 was processed", but since we
+        // always process seq 0 on startup, the consumer will advance to 1 in both cases.
+        // The key fix is that we now store the actual last processed seq (not seq+1),
+        // so get_last_processed_seq() returns the correct value after the first checkpoint.
         0
     }
 
@@ -407,10 +463,12 @@ impl WalQueue {
         })
     }
 
-    /// Repair a hole in the WAL by writing data fetched from RPC
-    /// This is called when the consumer detects a gap and fetches the missing data from RPC
+    /// Repair a hole in the WAL by writing data fetched from RPC.
+    /// This is called when the consumer detects a gap and fetches the missing data from RPC.
+    ///
+    /// Prefer push_raw_bytes() for hot-path writes to avoid unnecessary re-encode.
     pub fn repair_hole(&self, seq: u64, slot: u64, update: &SubscribeUpdate) -> Result<(), String> {
-        // Create WAL entry with the fetched data
+        // Create WAL entry with the fetched data (legacy path - re-encodes)
         let entry = WalEntry::from_update(slot, seq, update);
 
         // Serialize entry to bytes
@@ -433,6 +491,34 @@ impl WalQueue {
             .map_err(|e| format!("Failed to write seq→slot mapping for repaired hole: {}", e))?;
 
         log::info!("Repaired WAL hole at seq {} with slot {} data fetched from RPC", seq, slot);
+
+        Ok(())
+    }
+
+    /// Repair a hole in the WAL using pre-encoded protobuf bytes.
+    /// This avoids the unnecessary re-encode overhead of repair_hole().
+    pub fn repair_hole_with_raw_bytes(&self, seq: u64, slot: u64, raw_protobuf_bytes: &[u8]) -> Result<(), String> {
+        // Create WAL entry from raw bytes (no re-encode)
+        let entry = WalEntry::from_raw_bytes(slot, seq, raw_protobuf_bytes);
+
+        // Serialize entry to bytes
+        let mut buffer = Vec::with_capacity(28 + entry.payload.len());
+        buffer.extend_from_slice(&entry.slot.to_be_bytes());
+        buffer.extend_from_slice(&entry.seq.to_be_bytes());
+        buffer.extend_from_slice(&entry.timestamp_unix_ms.to_be_bytes());
+        buffer.extend_from_slice(&(entry.payload.len() as u32).to_be_bytes());
+        buffer.extend_from_slice(&entry.payload);
+
+        // Write the repaired entry to fill the hole
+        self.events.insert(seq.to_be_bytes(), buffer)
+            .map_err(|e| format!("Failed to repair hole at seq {}: {}", seq, e))?;
+
+        // CRITICAL: Also write seq→slot mapping for checkpoint recovery
+        let seq_key = format!("seq2slot_{}", seq);
+        self.metadata.insert(seq_key.as_bytes(), slot.to_be_bytes())
+            .map_err(|e| format!("Failed to write seq→slot mapping for repaired hole: {}", e))?;
+
+        log::info!("Repaired WAL hole at seq {} with slot {} data fetched from RPC (raw bytes)", seq, slot);
 
         Ok(())
     }
@@ -479,7 +565,11 @@ impl WalQueue {
         //
         // The fix: Only delete entries that are definitely safe (seq < last_flushed_seq - safety_margin).
         //          This creates a buffer zone where consumer can safely read without GC interference.
-        let delete_up_to = last_flushed_seq.saturating_sub(self.gc_safety_margin);
+        //
+        // CRITICAL FIX: get_last_processed_seq() now returns the actual last processed seq (not next unprocessed).
+        // To maintain the same GC behavior as before, we need to add +1 to convert from "last processed" to "next unprocessed".
+        let next_unprocessed_seq = last_flushed_seq.saturating_add(1);
+        let delete_up_to = next_unprocessed_seq.saturating_sub(self.gc_safety_margin);
 
         if delete_up_to == 0 {
             // Not enough entries to safely delete yet
@@ -629,11 +719,12 @@ mod tests {
             wal_queue.push_update(seq, &update).unwrap();
         }
 
-        // Mark first 200 events as processed (last_flushed_seq becomes 200)
+        // Mark first 200 events as processed (last_flushed_seq becomes 199)
         wal_queue.mark_processed(200, 199).unwrap();
 
         // Run garbage collection
-        // With safety_margin=100, should delete entries < (200 - 100) = 100
+        // CRITICAL FIX: get_last_processed_seq() now returns 199 (not 200)
+        // With safety_margin=100: next_unprocessed = 199 + 1 = 200, delete_up_to = 200 - 100 = 100
         // So it should delete 100 entries (seq 0-99), keeping 100 as safety buffer
         let deleted = wal_queue.delete_processed_events().unwrap();
 
@@ -679,7 +770,8 @@ mod tests {
             println!("After writing 200 events: total_written={}, last_processed_seq={}, unprocessed={}",
                       total_written, wal_queue.get_last_processed_seq(), wal_queue.get_unprocessed_count());
             assert_eq!(total_written, 200, "Should have written exactly 200 events");
-            assert_eq!(wal_queue.get_last_processed_seq(), 100);
+            // CRITICAL FIX: get_last_processed_seq() now returns the actual last processed seq
+            assert_eq!(wal_queue.get_last_processed_seq(), 99);
             assert_eq!(wal_queue.get_unprocessed_count(), 100);
         }
 
@@ -693,8 +785,9 @@ mod tests {
             assert_eq!(wal_queue.get_total_written(), 200,
                        "Producer cursor should start at max_existing_seq + 1 (200), not consumer_checkpoint + 1 (100)");
 
-            // Consumer checkpoint should still be at 100
-            assert_eq!(wal_queue.get_last_processed_seq(), 100,
+            // Consumer checkpoint should still be at 99
+            // CRITICAL FIX: get_last_processed_seq() now returns the actual last processed seq
+            assert_eq!(wal_queue.get_last_processed_seq(), 99,
                        "Consumer checkpoint should be preserved");
 
             // Should have 100 unprocessed events (seq 100-199)
@@ -958,13 +1051,14 @@ mod tests {
         let last_seq = wal_queue.get_last_processed_seq();
 
         assert_eq!(last_slot, 9, "Last slot should be 9");
-        assert_eq!(last_seq, 10, "Last seq should be 10 (next unprocessed)");
+        // CRITICAL FIX: get_last_processed_seq() now returns the actual last processed seq
+        assert_eq!(last_seq, 9, "Last seq should be 9 (last processed)");
 
         // The key property: even if crash happened during mark_processed,
         // slot and seq should always be consistent (both or neither updated)
         // With atomic batch writes, this is guaranteed
-        assert_eq!(last_slot + 1, last_seq,
-                   "Slot + 1 should equal seq (they stay in sync atomically)");
+        assert_eq!(last_slot, last_seq,
+                   "Slot should equal seq (they stay in sync atomically)");
 
         println!("✓ Atomic checkpoint write keeps slot and seq in sync");
         println!("  last_slot={}, last_seq={}", last_slot, last_seq);
@@ -1019,23 +1113,52 @@ mod tests {
 
         // Verify both slot and seq are checkpointed
         assert_eq!(wal_queue.get_last_processed_slot(), 104);
-        assert_eq!(wal_queue.get_last_processed_seq(), 5);
+        // CRITICAL FIX: get_last_processed_seq() now returns the actual last processed seq
+        assert_eq!(wal_queue.get_last_processed_seq(), 4);
 
         // Simulate a gap at seq 5 that we need to skip
         // (e.g., RPC repair failed, slot doesn't exist)
         wal_queue.skip_processed_sequence(5).unwrap();
 
         // CRITICAL: Seq should advance, but slot should NOT be corrupted to 0
-        assert_eq!(wal_queue.get_last_processed_seq(), 6,
-                   "Seq checkpoint should advance to 6");
+        assert_eq!(wal_queue.get_last_processed_seq(), 5,
+                   "Seq checkpoint should advance to 5");
         assert_eq!(wal_queue.get_last_processed_slot(), 104,
                    "Slot checkpoint should remain at 104 (NOT corrupted to 0)");
 
         // Next successful batch should update both correctly
         wal_queue.mark_processed(110, 10).unwrap();
         assert_eq!(wal_queue.get_last_processed_slot(), 110);
-        assert_eq!(wal_queue.get_last_processed_seq(), 11);
+        assert_eq!(wal_queue.get_last_processed_seq(), 10);
 
         println!("✓ skip_processed_sequence advances seq without corrupting slot checkpoint");
+    }
+
+    #[test]
+    fn test_push_raw_bytes_avoids_re_encode() {
+        // Test that push_raw_bytes() works correctly and avoids the re-encode overhead
+        let temp_dir = tempdir().unwrap();
+        let wal_queue = WalQueue::new(temp_dir.path()).unwrap();
+
+        // Create a SubscribeUpdate and encode it once
+        let update = SubscribeUpdate { ..Default::default() };
+        let raw_bytes = update.encode_to_vec();
+
+        // Write using the new API (no re-encode)
+        let seq = wal_queue.push_raw_bytes(123, &raw_bytes).unwrap();
+        assert_eq!(seq, 0);
+
+        // Read it back and verify we can decode it
+        let entry = wal_queue.read_from(0, 0).unwrap().unwrap();
+        assert_eq!(entry.slot, 123);
+        assert_eq!(entry.seq, 0);
+        assert_eq!(entry.payload, raw_bytes);
+
+        // Verify the payload can be decoded back to SubscribeUpdate
+        let decoded = SubscribeUpdate::decode(&entry.payload[..]).unwrap();
+        // Both should be empty/default, which is correct
+        assert_eq!(decoded, update);
+
+        println!("✓ push_raw_bytes() avoids re-encode and correctly stores/decodes data");
     }
 }

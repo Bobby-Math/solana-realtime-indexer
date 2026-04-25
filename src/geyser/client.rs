@@ -3,6 +3,7 @@ use helius_laserstream::{subscribe, LaserstreamConfig, ChannelOptions};
 use helius_laserstream::grpc::{SubscribeRequest, SubscribeUpdate};
 use helius_laserstream::grpc::subscribe_update::UpdateOneof;
 use futures::pin_mut;
+use prost::Message;
 
 use crate::geyser::consumer::GeyserConfig;
 use crate::geyser::decoder::{GeyserEvent, decode_subscribe_update};
@@ -170,8 +171,9 @@ impl GeyserClient {
                                 continue;
                             }
 
-                            // Write raw protobuf bytes to WAL - non-blocking, no drops
-                            if let Err(e) = wal_queue.push_update(slot, &data) {
+                            // Encode once and write raw bytes to WAL - eliminates re-encode overhead
+                            let raw_protobuf_bytes = data.encode_to_vec();
+                            if let Err(e) = wal_queue.push_raw_bytes(slot, &raw_protobuf_bytes) {
                                 log::error!("WAL write error: {}, stopping Geyser client", e);
                                 break;
                             }
@@ -218,8 +220,9 @@ impl GeyserClient {
                                 continue;
                             }
 
-                            // Write raw protobuf bytes to WAL - non-blocking, no drops
-                            if let Err(e) = wal_queue.push_update(slot, &data) {
+                            // Encode once and write raw bytes to WAL - eliminates re-encode overhead
+                            let raw_protobuf_bytes = data.encode_to_vec();
+                            if let Err(e) = wal_queue.push_raw_bytes(slot, &raw_protobuf_bytes) {
                                 log::error!("WAL write error: {}, stopping Geyser client", e);
                                 break;
                             }
@@ -282,10 +285,10 @@ impl GeyserClient {
 
         for filter in &self.config.filters {
             match filter {
-                SubscriptionFilter::Account(pubkey) => {
+                SubscriptionFilter::Account(pubkey, _bytes) => {
                     account_pubkeys.push(pubkey.clone());
                 }
-                SubscriptionFilter::Program(program_id) => {
+                SubscriptionFilter::Program(program_id, _bytes) => {
                     program_ids.push(program_id.clone());
                 }
                 SubscriptionFilter::Slots => {
@@ -377,25 +380,22 @@ impl GeyserClient {
         }
 
         // Check if any filter matches this event
+        // Note: Filters are pre-validated and contain parsed bytes, no parsing needed here
         self.config.filters.iter().any(|filter| match (filter, event) {
-            (SubscriptionFilter::Program(program_id), GeyserEvent::AccountUpdate(update)) => {
-                let program_id_bytes = program_filter_bytes(program_id);
-                update.owner == program_id_bytes
+            (SubscriptionFilter::Program(_program_str, program_bytes), GeyserEvent::AccountUpdate(update)) => {
+                update.owner == *program_bytes
             }
-            (SubscriptionFilter::Program(program_id), GeyserEvent::Transaction(update)) => {
-                let program_id_bytes = program_filter_bytes(program_id);
+            (SubscriptionFilter::Program(_program_str, program_bytes), GeyserEvent::Transaction(update)) => {
                 update
                     .program_ids
                     .iter()
-                    .any(|id_bytes| id_bytes == &program_id_bytes)
+                    .any(|id_bytes| id_bytes == program_bytes)
             }
-            (SubscriptionFilter::Account(pubkey), GeyserEvent::AccountUpdate(update)) => {
-                let pubkey_bytes = program_filter_bytes(pubkey);
-                update.pubkey == pubkey_bytes
+            (SubscriptionFilter::Account(_account_str, account_bytes), GeyserEvent::AccountUpdate(update)) => {
+                update.pubkey == *account_bytes
             }
-            (SubscriptionFilter::Account(pubkey), GeyserEvent::Transaction(update)) => {
-                let pubkey_bytes = program_filter_bytes(pubkey);
-                update.accounts.iter().any(|acc| acc == &pubkey_bytes)
+            (SubscriptionFilter::Account(_account_str, account_bytes), GeyserEvent::Transaction(update)) => {
+                update.accounts.iter().any(|acc| acc == account_bytes)
             }
             (SubscriptionFilter::Slots, GeyserEvent::SlotUpdate(_)) => true,
             (SubscriptionFilter::Blocks, GeyserEvent::BlockMeta(_)) => true,
@@ -418,15 +418,3 @@ impl GeyserClient {
 
 }
 
-fn program_filter_bytes(program_id: &str) -> Vec<u8> {
-    let trimmed = program_id.trim();
-    bs58::decode(trimmed)
-        .into_vec()
-        .unwrap_or_else(|e| {
-            panic!(
-                "Invalid base58 in program_filter_bytes for '{}': {}. \
-                 Config validation should have caught this at startup.",
-                trimmed, e
-            )
-        })
-}

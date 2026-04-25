@@ -190,7 +190,7 @@ impl CustomDecoder for ProgramActivityDecoder {
                     slot: update.slot as i64,
                     timestamp_unix_ms: update.timestamp_unix_ms,
                     event_index: 0,
-                    payload: "account_update".to_string(),
+                    payload: serde_json::json!("account_update"),
                 })
             }
             GeyserEvent::Transaction(update)
@@ -204,7 +204,7 @@ impl CustomDecoder for ProgramActivityDecoder {
                     slot: update.slot as i64,
                     timestamp_unix_ms: update.timestamp_unix_ms,
                     event_index: 0,
-                    payload: "transaction".to_string(),
+                    payload: serde_json::json!("transaction"),
                 })
             }
             _ => None,

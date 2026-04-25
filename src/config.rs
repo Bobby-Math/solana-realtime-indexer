@@ -61,21 +61,30 @@ impl Config {
     pub fn geyser_subscription_filters(&self) -> Vec<SubscriptionFilter> {
         let mut filters = Vec::new();
 
-        filters.extend(
-            self.geyser_program_filters
-                .iter()
-                .cloned()
-                .map(SubscriptionFilter::Program),
-        );
-        filters.extend(
-            self.geyser_account_filters
-                .iter()
-                .cloned()
-                .map(SubscriptionFilter::Account),
-        );
+        // Validate and create program filters at startup time
+        for program_id in &self.geyser_program_filters {
+            match SubscriptionFilter::program(program_id.clone()) {
+                Ok(filter) => filters.push(filter),
+                Err(e) => {
+                    log::error!("Invalid GEYSER_PROGRAM_FILTERS value '{}': {}. Skipping this filter.", program_id, e);
+                    // Continue with other filters instead of crashing
+                }
+            }
+        }
+
+        // Validate and create account filters at startup time
+        for account in &self.geyser_account_filters {
+            match SubscriptionFilter::account(account.clone()) {
+                Ok(filter) => filters.push(filter),
+                Err(e) => {
+                    log::error!("Invalid GEYSER_ACCOUNT_FILTERS value '{}': {}. Skipping this filter.", account, e);
+                    // Continue with other filters instead of crashing
+                }
+            }
+        }
 
         if self.geyser_include_slots {
-            filters.push(SubscriptionFilter::Slots);
+            filters.push(SubscriptionFilter::slots());
         }
 
         filters

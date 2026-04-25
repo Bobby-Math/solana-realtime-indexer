@@ -58,16 +58,18 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
     // Convert merged [u8; 32] pubkeys to base58 strings for SubscriptionFilter
     let mut filters = Vec::new();
     for program_id in &merged_subscription.program_ids {
-        filters.push(SubscriptionFilter::Program(bs58::encode(program_id).into_string()));
+        let program_id_str = bs58::encode(program_id).into_string();
+        filters.push(SubscriptionFilter::program(program_id_str).expect("valid base58"));
     }
     for account in &merged_subscription.account_pubkeys {
-        filters.push(SubscriptionFilter::Account(bs58::encode(account).into_string()));
+        let account_str = bs58::encode(account).into_string();
+        filters.push(SubscriptionFilter::account(account_str).expect("valid base58"));
     }
     if merged_subscription.include_slots {
-        filters.push(SubscriptionFilter::Slots);
+        filters.push(SubscriptionFilter::slots());
     }
     if merged_subscription.include_blocks_meta {
-        filters.push(SubscriptionFilter::Blocks);
+        filters.push(SubscriptionFilter::blocks());
     }
 
     let geyser_config = GeyserConfig::new(

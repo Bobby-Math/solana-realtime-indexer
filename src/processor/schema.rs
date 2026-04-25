@@ -35,5 +35,8 @@ pub struct CustomDecodedRow {
     pub slot: i64,
     pub timestamp_unix_ms: i64,
     pub event_index: i16,
-    pub payload: String,
+    /// JSON payload - typed to guarantee validity at compile time.
+    /// Use `serde_json::json!()` macro to construct with type safety.
+    /// The database will validate this is JSONB at insert time.
+    pub payload: serde_json::Value,
 }

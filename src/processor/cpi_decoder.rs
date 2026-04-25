@@ -50,7 +50,7 @@ impl CpiLogDecoder {
                                 "callee": callee,
                                 "depth": depth,
                                 "success": success
-                            }).to_string(),
+                            }),
                         });
                     }
                 }
@@ -216,7 +216,7 @@ mod tests {
         let first_edge = &rows[0];
         assert_eq!(first_edge.decoder_name, "cpi-edge");
         assert_eq!(first_edge.event_index, 2); // depth 2
-        let payload: serde_json::Value = serde_json::from_str(&first_edge.payload).unwrap();
+        let payload = &first_edge.payload;
         assert_eq!(payload["caller"], "5xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin");
         assert_eq!(payload["callee"], "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin");
         assert_eq!(payload["depth"], 2);
@@ -226,7 +226,7 @@ mod tests {
         let second_edge = &rows[1];
         assert_eq!(second_edge.decoder_name, "cpi-edge");
         assert_eq!(second_edge.event_index, 3); // depth 3
-        let payload2: serde_json::Value = serde_json::from_str(&second_edge.payload).unwrap();
+        let payload2 = &second_edge.payload;
         assert_eq!(payload2["caller"], "9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin");
         assert_eq!(payload2["callee"], "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
         assert_eq!(payload2["depth"], 3);

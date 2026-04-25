@@ -19,12 +19,46 @@ impl GeyserConfig {
     }
 }
 
+/// Subscription filter with validated base58 bytes.
+/// The base58 string is parsed once at construction time, not on every event match.
 #[derive(Debug, Clone)]
 pub enum SubscriptionFilter {
-    Program(String),
-    Account(String),
+    Program(String, Vec<u8>),  // (base58_string, parsed_bytes)
+    Account(String, Vec<u8>),   // (base58_string, parsed_bytes)
     Slots,
     Blocks,
+}
+
+impl SubscriptionFilter {
+    /// Create a new Program filter, validating the base58 string at construction time.
+    /// Returns Err if the base58 string is invalid.
+    pub fn program(program_id: String) -> Result<Self, String> {
+        let trimmed = program_id.trim();
+        bs58::decode(trimmed)
+            .into_vec()
+            .map(|bytes| SubscriptionFilter::Program(program_id.clone(), bytes))
+            .map_err(|e| format!("Invalid base58 for program '{}': {}", trimmed, e))
+    }
+
+    /// Create a new Account filter, validating the base58 string at construction time.
+    /// Returns Err if the base58 string is invalid.
+    pub fn account(pubkey: String) -> Result<Self, String> {
+        let trimmed = pubkey.trim();
+        bs58::decode(trimmed)
+            .into_vec()
+            .map(|bytes| SubscriptionFilter::Account(pubkey.clone(), bytes))
+            .map_err(|e| format!("Invalid base58 for account '{}': {}", trimmed, e))
+    }
+
+    /// Create a new Slots filter.
+    pub fn slots() -> Self {
+        SubscriptionFilter::Slots
+    }
+
+    /// Create a new Blocks filter.
+    pub fn blocks() -> Self {
+        SubscriptionFilter::Blocks
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -131,24 +165,20 @@ impl GeyserConsumer {
 impl SubscriptionFilter {
     fn matches(&self, event: &GeyserEvent) -> bool {
         match (self, event) {
-            (SubscriptionFilter::Program(program), GeyserEvent::AccountUpdate(update)) => {
-                let program_bytes = program_filter_bytes(program);
-                update.owner == program_bytes
+            (SubscriptionFilter::Program(_program_str, program_bytes), GeyserEvent::AccountUpdate(update)) => {
+                update.owner == *program_bytes
             }
-            (SubscriptionFilter::Program(program), GeyserEvent::Transaction(update)) => {
-                let program_bytes = program_filter_bytes(program);
+            (SubscriptionFilter::Program(_program_str, program_bytes), GeyserEvent::Transaction(update)) => {
                 update
                     .program_ids
                     .iter()
-                    .any(|program_id_bytes| program_id_bytes == &program_bytes)
+                    .any(|id_bytes| id_bytes == program_bytes)
             }
-            (SubscriptionFilter::Account(account), GeyserEvent::AccountUpdate(update)) => {
-                let account_bytes = program_filter_bytes(account);
-                update.pubkey == account_bytes
+            (SubscriptionFilter::Account(_account_str, account_bytes), GeyserEvent::AccountUpdate(update)) => {
+                update.pubkey == *account_bytes
             }
-            (SubscriptionFilter::Account(account), GeyserEvent::Transaction(update)) => {
-                let account_bytes = program_filter_bytes(account);
-                update.accounts.iter().any(|acc| acc == &account_bytes)
+            (SubscriptionFilter::Account(_account_str, account_bytes), GeyserEvent::Transaction(update)) => {
+                update.accounts.iter().any(|acc| acc == account_bytes)
             }
             (SubscriptionFilter::Slots, GeyserEvent::SlotUpdate(_)) => true,
             (SubscriptionFilter::Blocks, GeyserEvent::BlockMeta(_)) => true,
@@ -156,19 +186,6 @@ impl SubscriptionFilter {
             _ => false,
         }
     }
-}
-
-fn program_filter_bytes(program: &str) -> Vec<u8> {
-    let trimmed = program.trim();
-    bs58::decode(trimmed)
-        .into_vec()
-        .unwrap_or_else(|e| {
-            panic!(
-                "Invalid base58 in program_filter_bytes for '{}': {}. \
-                 Config validation should have caught this at startup.",
-                trimmed, e
-            )
-        })
 }
 
 #[cfg(test)]
@@ -185,8 +202,8 @@ mod tests {
             endpoint: "mock://geyser".to_string(),
             channel_capacity: 4,
             filters: vec![
-                SubscriptionFilter::Program(orca_program_id.to_string()),
-                SubscriptionFilter::Slots,
+                SubscriptionFilter::program(orca_program_id.to_string()).expect("valid base58"),
+                SubscriptionFilter::slots(),
             ],
         });
         let (sender, receiver) = sync_channel(4);
@@ -215,7 +232,7 @@ mod tests {
         let consumer = GeyserConsumer::new(GeyserConfig {
             endpoint: "mock://geyser".to_string(),
             channel_capacity: 4,
-            filters: vec![SubscriptionFilter::Account(tracked_account.to_string())],
+            filters: vec![SubscriptionFilter::account(tracked_account.to_string()).expect("valid base58")],
         });
         let (sender, receiver) = sync_channel(4);
 

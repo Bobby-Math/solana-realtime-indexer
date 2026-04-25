@@ -203,7 +203,7 @@ mod tests {
                 slot: 2,
                 timestamp_unix_ms: 125,
                 event_index: 0,
-                payload: "transaction".to_string(),
+                payload: serde_json::json!("transaction"),
             }],
             last_processed_slot: Some(2),
             last_observed_at_unix_ms: Some(125),
