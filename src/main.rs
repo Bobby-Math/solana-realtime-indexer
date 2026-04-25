@@ -236,9 +236,7 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
 }
 
 async fn build_sink(config: &Config, pool: Option<Arc<sqlx::PgPool>>) -> Result<Box<dyn StorageSink>, Box<dyn std::error::Error>> {
-    let retention_policy = RetentionPolicy {
-        max_age: Duration::from_secs(60),
-    };
+    let retention_policy = RetentionPolicy::from_env();
 
     if let Some(database_url) = config.database_url.as_deref() {
         match pool {

@@ -161,38 +161,26 @@ impl WalPipelineRunner {
                                 }
                                 Ok(false) => {
                                     log::error!("❌ Gap repair failed for seq {}, skipping", seq);
-                                    // Mark the actual gap seq as processed, not last_flushed + 1
-                                    if let Some(slot) = self.wal_queue.get_slot_for_seq(seq) {
-                                        let _ = self.wal_queue.mark_processed(slot, seq);
-                                    } else {
-                                        log::warn!("No slot mapping for seq {}, using fallback", seq);
-                                        let _ = self.wal_queue.mark_processed(0, seq);
-                                    }
+                                    // CRITICAL: Use skip_processed_sequence to avoid corrupting slot checkpoint
+                                    // mark_processed(0, seq) would permanently set last_flushed_slot = 0
+                                    let _ = self.wal_queue.skip_processed_sequence(seq);
                                     // CRITICAL: Advance in-memory cursor to prevent infinite retry loop
                                     self.next_read_seq = seq + 1;
                                 }
                                 Err(repair_err) => {
                                     log::error!("❌ Gap repair error for seq {}: {}, skipping", seq, repair_err);
-                                    // Mark the actual gap seq as processed, not last_flushed + 1
-                                    if let Some(slot) = self.wal_queue.get_slot_for_seq(seq) {
-                                        let _ = self.wal_queue.mark_processed(slot, seq);
-                                    } else {
-                                        log::warn!("No slot mapping for seq {}, using fallback", seq);
-                                        let _ = self.wal_queue.mark_processed(0, seq);
-                                    }
+                                    // CRITICAL: Use skip_processed_sequence to avoid corrupting slot checkpoint
+                                    // mark_processed(0, seq) would permanently set last_flushed_slot = 0
+                                    let _ = self.wal_queue.skip_processed_sequence(seq);
                                     // CRITICAL: Advance in-memory cursor to prevent infinite retry loop
                                     self.next_read_seq = seq + 1;
                                 }
                             }
                         } else {
                             log::warn!("No gap filler available, skipping gap");
-                            // Mark the actual gap seq as processed, not last_flushed + 1
-                            if let Some(slot) = self.wal_queue.get_slot_for_seq(seq) {
-                                let _ = self.wal_queue.mark_processed(slot, seq);
-                            } else {
-                                log::warn!("No slot mapping for seq {}, using fallback", seq);
-                                let _ = self.wal_queue.mark_processed(0, seq);
-                            }
+                            // CRITICAL: Use skip_processed_sequence to avoid corrupting slot checkpoint
+                            // mark_processed(0, seq) would permanently set last_flushed_slot = 0
+                            let _ = self.wal_queue.skip_processed_sequence(seq);
                             // CRITICAL: Advance in-memory cursor to prevent infinite retry loop
                             self.next_read_seq = seq + 1;
                         }
@@ -319,25 +307,34 @@ fn max_optional(left: Option<i64>, right: Option<i64>) -> Option<i64> {
 }
 
 fn latest_processed_slot(batch: &PersistedBatch) -> Option<i64> {
-    batch
-        .slot_rows
-        .iter()
-        .map(|row| row.slot)
-        .chain(batch.transaction_rows.iter().map(|row| row.slot))
-        .chain(batch.account_rows.iter().map(|row| row.slot))
-        .chain(batch.custom_rows.iter().map(|row| row.slot))
-        .max()
+    // Use tracked slot first (populated for all events including BlockMeta)
+    // Fall back to extracting from rows for backwards compatibility
+    batch.last_processed_slot
+        .or_else(|| {
+            batch.slot_rows
+                .iter()
+                .map(|row| row.slot)
+                .chain(batch.transaction_rows.iter().map(|row| row.slot))
+                .chain(batch.account_rows.iter().map(|row| row.slot))
+                .chain(batch.custom_rows.iter().map(|row| row.slot))
+                .max()
+        })
 }
 
 fn checkpoint_update_for_batch(batch: &PersistedBatch) -> Option<CheckpointUpdate> {
-    let last_processed_slot = batch
-        .slot_rows
-        .iter()
-        .map(|row| row.slot)
-        .chain(batch.transaction_rows.iter().map(|row| row.slot))
-        .chain(batch.account_rows.iter().map(|row| row.slot))
-        .chain(batch.custom_rows.iter().map(|row| row.slot))
-        .max();
+    // Use tracked slot/timestamp first (populated for all events including BlockMeta)
+    // Fall back to extracting from rows for backwards compatibility
+    let last_processed_slot = batch.last_processed_slot
+        .or_else(|| {
+            batch.slot_rows
+                .iter()
+                .map(|row| row.slot)
+                .chain(batch.transaction_rows.iter().map(|row| row.slot))
+                .chain(batch.account_rows.iter().map(|row| row.slot))
+                .chain(batch.custom_rows.iter().map(|row| row.slot))
+                .max()
+        });
+
     let last_observed_at_unix_ms = batch.latest_timestamp_unix_ms()?;
 
     Some(CheckpointUpdate {
@@ -466,7 +463,8 @@ impl RpcGapFiller {
     }
 
     fn block_to_subscribe_update(&self, block_data: &serde_json::Map<String, serde_json::Value>, slot: u64) -> Result<helius_laserstream::grpc::SubscribeUpdate, String> {
-        use helius_laserstream::grpc::{SubscribeUpdate, subscribe_update::UpdateOneof, SubscribeUpdateBlock};
+        use helius_laserstream::grpc::{SubscribeUpdate, subscribe_update::UpdateOneof, SubscribeUpdateBlockMeta};
+        use helius_laserstream::solana::storage::confirmed_block::{UnixTimestamp, BlockHeight};
 
         // Extract block metadata from RPC getBlock response
         let blockhash = block_data.get("blockhash")
@@ -481,38 +479,35 @@ impl RpcGapFiller {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing previousBlockhash in block data".to_string())?;
 
-        let _block_time = block_data.get("blockTime")
+        let block_time = block_data.get("blockTime")
             .and_then(|v| v.as_i64());
 
-        let _block_height = block_data.get("blockHeight")
+        let block_height = block_data.get("blockHeight")
             .and_then(|v| v.as_u64());
 
         // Extract transaction count if transactions are present
-        let transactions = block_data.get("transactions")
+        let executed_transaction_count = block_data.get("transactions")
             .and_then(|v| v.as_array())
             .map(|txs| txs.len() as u64)
             .unwrap_or(0);
 
-        // Create a comprehensive SubscribeUpdateBlock for gap repair
-        // This preserves all critical block metadata for reconstruction
-        let block_update = SubscribeUpdateBlock {
+        // Create SubscribeUpdateBlockMeta for gap repair
+        // This preserves critical block metadata and is already handled by decode_subscribe_update
+        // Note: Individual transactions from repaired slots are not included (trade-off for simplicity)
+        let block_meta = SubscribeUpdateBlockMeta {
             slot,
             blockhash: blockhash.to_string(),
-            rewards: None, // Optional rewards data
-            block_time: None, // Will be populated with correct type later
-            block_height: None, // Will be populated with correct type later
+            rewards: None,
+            block_time: block_time.map(|timestamp| UnixTimestamp { timestamp }),
+            block_height: block_height.map(|block_height| BlockHeight { block_height }),
             parent_slot,
             parent_blockhash: parent_blockhash.to_string(),
-            executed_transaction_count: transactions,
-            transactions: Vec::new(), // Full transaction reconstruction can be added later
-            updated_account_count: 0,
-            accounts: Vec::new(),
+            executed_transaction_count,
             entries_count: 0,
-            entries: Vec::new(),
         };
 
         Ok(SubscribeUpdate {
-            update_oneof: Some(UpdateOneof::Block(block_update)),
+            update_oneof: Some(UpdateOneof::BlockMeta(block_meta)),
             ..Default::default()
         })
     }

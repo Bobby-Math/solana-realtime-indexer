@@ -338,6 +338,24 @@ impl WalQueue {
         Ok(())
     }
 
+    /// Advance the sequence checkpoint WITHOUT updating the slot checkpoint.
+    ///
+    /// This is used when skipping unrecoverable gaps (e.g., RPC repair failed,
+    /// slot doesn't exist, etc.) where we don't have a valid slot number.
+    ///
+    /// CRITICAL: Do NOT use mark_processed(0, seq) for gap skips — that permanently
+    /// corrupts last_flushed_slot to 0. This method only advances the sequence,
+    /// preserving the existing slot checkpoint. The next successful batch will
+    /// update both correctly.
+    pub fn skip_processed_sequence(&self, seq: u64) -> Result<(), String> {
+        self.metadata
+            .insert(b"last_flushed_seq", (seq + 1).to_be_bytes())
+            .map_err(|e| format!("Failed to advance sequence checkpoint: {}", e))?;
+
+        log::warn!("Advanced seq checkpoint to {} (slot checkpoint preserved)", seq + 1);
+        Ok(())
+    }
+
     pub fn flush(&self) -> Result<(), String> {
         // Flush the fjall database to disk
         // This is safe to call in background - doesn't block the Geyser ingest thread
@@ -406,6 +424,13 @@ impl WalQueue {
         // Write the repaired entry to fill the hole
         self.events.insert(seq.to_be_bytes(), buffer)
             .map_err(|e| format!("Failed to repair hole at seq {}: {}", seq, e))?;
+
+        // CRITICAL: Also write seq→slot mapping for checkpoint recovery
+        // Without this, get_slot_for_seq() returns None for repaired entries,
+        // causing batch checkpoint failures and infinite re-processing
+        let seq_key = format!("seq2slot_{}", seq);
+        self.metadata.insert(seq_key.as_bytes(), slot.to_be_bytes())
+            .map_err(|e| format!("Failed to write seq→slot mapping for repaired hole: {}", e))?;
 
         log::info!("Repaired WAL hole at seq {} with slot {} data fetched from RPC", seq, slot);
 
@@ -973,5 +998,44 @@ mod tests {
         std::env::remove_var("WAL_DURABILITY_MODE");
 
         println!("✓ WAL durability mode correctly reads from env");
+    }
+
+    #[test]
+    fn test_skip_processed_sequence_preserves_slot_checkpoint() {
+        // This test verifies the fix for the critical bug where gap skip
+        // paths called mark_processed(0, seq), permanently corrupting
+        // last_flushed_slot to 0.
+        let temp_dir = tempdir().unwrap();
+        let wal_queue = WalQueue::new(temp_dir.path()).unwrap();
+
+        // Write some events and mark them as processed
+        for i in 0..5 {
+            let update = SubscribeUpdate { ..Default::default() };
+            wal_queue.push_update(100 + i, &update).unwrap();
+        }
+
+        // Mark seq 4 as processed (slot 104)
+        wal_queue.mark_processed(104, 4).unwrap();
+
+        // Verify both slot and seq are checkpointed
+        assert_eq!(wal_queue.get_last_processed_slot(), 104);
+        assert_eq!(wal_queue.get_last_processed_seq(), 5);
+
+        // Simulate a gap at seq 5 that we need to skip
+        // (e.g., RPC repair failed, slot doesn't exist)
+        wal_queue.skip_processed_sequence(5).unwrap();
+
+        // CRITICAL: Seq should advance, but slot should NOT be corrupted to 0
+        assert_eq!(wal_queue.get_last_processed_seq(), 6,
+                   "Seq checkpoint should advance to 6");
+        assert_eq!(wal_queue.get_last_processed_slot(), 104,
+                   "Slot checkpoint should remain at 104 (NOT corrupted to 0)");
+
+        // Next successful batch should update both correctly
+        wal_queue.mark_processed(110, 10).unwrap();
+        assert_eq!(wal_queue.get_last_processed_slot(), 110);
+        assert_eq!(wal_queue.get_last_processed_seq(), 11);
+
+        println!("✓ skip_processed_sequence advances seq without corrupting slot checkpoint");
     }
 }

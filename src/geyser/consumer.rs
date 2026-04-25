@@ -98,6 +98,7 @@ impl GeyserConsumer {
                 signature: tracked_signature,
                 fee: 5_000,
                 success: true,
+                accounts: vec![tracked_account.clone(), orca_program.clone(), token_program.clone()],
                 program_ids: vec![orca_program.clone(), token_program],
                 log_messages: vec!["swap".to_string(), "settled".to_string()],
             }),
@@ -144,6 +145,10 @@ impl SubscriptionFilter {
             (SubscriptionFilter::Account(account), GeyserEvent::AccountUpdate(update)) => {
                 let account_bytes = program_filter_bytes(account);
                 update.pubkey == account_bytes
+            }
+            (SubscriptionFilter::Account(account), GeyserEvent::Transaction(update)) => {
+                let account_bytes = program_filter_bytes(account);
+                update.accounts.iter().any(|acc| acc == &account_bytes)
             }
             (SubscriptionFilter::Slots, GeyserEvent::SlotUpdate(_)) => true,
             (SubscriptionFilter::Blocks, GeyserEvent::BlockMeta(_)) => true,
@@ -201,5 +206,35 @@ mod tests {
         // Should NOT forward: AccountUpdate (System program - not in filter)
         assert_eq!(forwarded, 4);
         assert_eq!(events.len(), 4);
+    }
+
+    #[test]
+    fn account_subscription_matches_transactions() {
+        // Verify that account-based subscriptions now match transactions involving that account
+        let tracked_account = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
+        let consumer = GeyserConsumer::new(GeyserConfig {
+            endpoint: "mock://geyser".to_string(),
+            channel_capacity: 4,
+            filters: vec![SubscriptionFilter::Account(tracked_account.to_string())],
+        });
+        let (sender, receiver) = sync_channel(4);
+
+        let fixture = GeyserConsumer::simulated_fixture();
+
+        let forwarded = consumer
+            .forward_events(&sender, fixture)
+            .expect("channel open");
+        drop(sender);
+
+        let events: Vec<GeyserEvent> = receiver.iter().collect();
+
+        // Should forward: AccountUpdate (tracked account), Transaction (involves tracked account)
+        // Should NOT forward: AccountUpdate (ignored account), SlotUpdates
+        assert_eq!(forwarded, 2, "Should forward account update and transaction");
+        assert_eq!(events.len(), 2);
+
+        // Verify we got both the account update and the transaction
+        assert!(matches!(events[0], GeyserEvent::AccountUpdate(_)));
+        assert!(matches!(events[1], GeyserEvent::Transaction(_)));
     }
 }

@@ -108,6 +108,7 @@ mod tests {
             signature: "sig-a".as_bytes().to_vec(),
             fee: 5_000,
             success: true,
+            accounts: vec![b"account-a".to_vec(), b"program-a".to_vec()],
             program_ids: vec![b"program-a".to_vec()],
             log_messages: vec!["ok".to_string()],
         }));

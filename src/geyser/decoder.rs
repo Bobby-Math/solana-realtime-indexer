@@ -27,6 +27,7 @@ pub struct TransactionUpdate {
     pub signature: Vec<u8>,
     pub fee: u64,
     pub success: bool,
+    pub accounts: Vec<Vec<u8>>,
     pub program_ids: Vec<Vec<u8>>,
     pub log_messages: Vec<String>,
 }
@@ -82,7 +83,7 @@ pub fn decode_subscribe_update(update: &SubscribeUpdate, timestamp_unix_ms: i64)
                     .unwrap_or_default();
 
                 // Extract program IDs from transaction instructions
-                let program_ids = if let Some(tx) = &tx_info.transaction {
+                let (program_ids, accounts) = if let Some(tx) = &tx_info.transaction {
                     if let Some(message) = &tx.message {
                         let mut invoked_programs = std::collections::HashSet::new();
                         for instruction in &message.instructions {
@@ -91,14 +92,16 @@ pub fn decode_subscribe_update(update: &SubscribeUpdate, timestamp_unix_ms: i64)
                                 invoked_programs.insert(message.account_keys[program_idx].clone());
                             }
                         }
-                        invoked_programs.into_iter().collect()
+                        let program_ids = invoked_programs.into_iter().collect();
+                        let accounts = message.account_keys.clone();
+                        (program_ids, accounts)
                     } else {
-                        log::debug!("No message field in transaction, program_ids will be empty");
-                        Vec::new()
+                        log::debug!("No message field in transaction, program_ids and accounts will be empty");
+                        (Vec::new(), Vec::new())
                     }
                 } else {
-                    log::debug!("No transaction field available, program_ids will be empty");
-                    Vec::new()
+                    log::debug!("No transaction field available, program_ids and accounts will be empty");
+                    (Vec::new(), Vec::new())
                 };
 
                 Some(GeyserEvent::Transaction(TransactionUpdate {
@@ -107,6 +110,7 @@ pub fn decode_subscribe_update(update: &SubscribeUpdate, timestamp_unix_ms: i64)
                     signature: tx_info.signature.clone(),
                     fee,
                     success,
+                    accounts,
                     program_ids,
                     log_messages,
                 }))

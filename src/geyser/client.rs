@@ -393,10 +393,9 @@ impl GeyserClient {
                 let pubkey_bytes = program_filter_bytes(pubkey);
                 update.pubkey == pubkey_bytes
             }
-            (SubscriptionFilter::Account(_pubkey), GeyserEvent::Transaction(_update)) => {
-                // For transactions, we'd need to check account keys - this is a simplified check
-                // In production, you'd parse the transaction's account list
-                false // Placeholder - requires full transaction parsing
+            (SubscriptionFilter::Account(pubkey), GeyserEvent::Transaction(update)) => {
+                let pubkey_bytes = program_filter_bytes(pubkey);
+                update.accounts.iter().any(|acc| acc == &pubkey_bytes)
             }
             (SubscriptionFilter::Slots, GeyserEvent::SlotUpdate(_)) => true,
             (SubscriptionFilter::Blocks, GeyserEvent::BlockMeta(_)) => true,

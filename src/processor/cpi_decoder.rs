@@ -187,6 +187,10 @@ mod tests {
             signature: vec![1, 2, 3, 4],
             fee: 5000,
             success: true,
+            accounts: vec![
+                vec![20, 21, 22, 23], // Account 1
+                vec![24, 25, 26, 27], // Account 2
+            ],
             program_ids: vec![
                 vec![5, 6, 7, 8],  // Root program
                 vec![9, 10, 11, 12], // CPI call 1

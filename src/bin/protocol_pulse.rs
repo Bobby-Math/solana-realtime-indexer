@@ -169,6 +169,7 @@ fn create_demo_event(num: i32) -> GeyserEvent {
         signature: format!("demo_signature_{}", num).as_bytes().to_vec(),
         fee: 50000 * num as u64, // Increasing fees
         success: true,
+        accounts: vec![format!("account_{}", num).as_bytes().to_vec()],
         program_ids: vec![b"token-program".to_vec()],
         log_messages: vec![],
     })

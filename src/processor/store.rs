@@ -16,6 +16,21 @@ impl Default for RetentionPolicy {
     }
 }
 
+impl RetentionPolicy {
+    /// Read retention policy from environment variable RETENTION_MAX_AGE_SECS
+    /// Defaults to 3600 seconds (1 hour) if not set or invalid
+    pub fn from_env() -> Self {
+        let max_age_secs = std::env::var("RETENTION_MAX_AGE_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(3600);
+
+        Self {
+            max_age: Duration::from_secs(max_age_secs),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StoreMetrics {
     pub account_rows_pruned: u64,
@@ -201,5 +216,26 @@ mod tests {
         assert_eq!(snapshot.slot_rows, 1);
         assert_eq!(snapshot.custom_rows, 1);
         assert_eq!(snapshot.metrics.account_rows_pruned, 1);
+    }
+
+    #[test]
+    fn retention_policy_from_env_reads_variable() {
+        // Test default behavior (no env var set)
+        std::env::remove_var("RETENTION_MAX_AGE_SECS");
+        let policy = RetentionPolicy::from_env();
+        assert_eq!(policy.max_age.as_secs(), 3600, "Should default to 3600 seconds");
+
+        // Test custom value
+        std::env::set_var("RETENTION_MAX_AGE_SECS", "7200");
+        let policy = RetentionPolicy::from_env();
+        assert_eq!(policy.max_age.as_secs(), 7200, "Should read custom value");
+
+        // Test invalid value (falls back to default)
+        std::env::set_var("RETENTION_MAX_AGE_SECS", "invalid");
+        let policy = RetentionPolicy::from_env();
+        assert_eq!(policy.max_age.as_secs(), 3600, "Should fallback to default on invalid input");
+
+        // Clean up
+        std::env::remove_var("RETENTION_MAX_AGE_SECS");
     }
 }

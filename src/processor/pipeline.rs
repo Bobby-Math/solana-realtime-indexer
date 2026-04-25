@@ -149,14 +149,18 @@ fn max_optional(left: Option<i64>, right: Option<i64>) -> Option<i64> {
 }
 
 fn latest_processed_slot(batch: &PersistedBatch) -> Option<i64> {
-    batch
-        .slot_rows
-        .iter()
-        .map(|row| row.slot)
-        .chain(batch.transaction_rows.iter().map(|row| row.slot))
-        .chain(batch.account_rows.iter().map(|row| row.slot))
-        .chain(batch.custom_rows.iter().map(|row| row.slot))
-        .max()
+    // Use tracked slot first (populated for all events including BlockMeta)
+    // Fall back to extracting from rows for backwards compatibility
+    batch.last_processed_slot
+        .or_else(|| {
+            batch.slot_rows
+                .iter()
+                .map(|row| row.slot)
+                .chain(batch.transaction_rows.iter().map(|row| row.slot))
+                .chain(batch.account_rows.iter().map(|row| row.slot))
+                .chain(batch.custom_rows.iter().map(|row| row.slot))
+                .max()
+        })
 }
 
 fn checkpoint_update_for_batch(batch: &PersistedBatch) -> Option<CheckpointUpdate> {

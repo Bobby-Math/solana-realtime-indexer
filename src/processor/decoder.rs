@@ -249,6 +249,7 @@ mod tests {
                     signature: "tracked-signature".as_bytes().to_vec(),
                     fee: 5_000,
                     success: true,
+                    accounts: vec!["tracked-account".as_bytes().to_vec(), "amm-program".as_bytes().to_vec()],
                     program_ids: vec!["amm-program".as_bytes().to_vec()],
                     log_messages: vec!["swap".to_string()],
                 }),

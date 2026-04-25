@@ -257,7 +257,6 @@ async fn execute_retention_deletes(
         "account_updates",
         "transactions",
         "custom_decoded_events",
-        "pipeline_metrics",
         "slots",
     ];
 
