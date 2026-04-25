@@ -171,6 +171,8 @@ impl WalPipelineRunner {
                                         log::warn!("No slot mapping for seq {}, using fallback", next_seq);
                                         let _ = self.wal_queue.mark_processed(0, next_seq);
                                     }
+                                    // CRITICAL: Advance in-memory cursor to prevent infinite retry loop
+                                    self.next_read_seq = seq + 1;
                                 }
                                 Err(repair_err) => {
                                     log::error!("❌ Gap repair error for seq {}: {}, skipping", seq, repair_err);
@@ -183,6 +185,8 @@ impl WalPipelineRunner {
                                         log::warn!("No slot mapping for seq {}, using fallback", next_seq);
                                         let _ = self.wal_queue.mark_processed(0, next_seq);
                                     }
+                                    // CRITICAL: Advance in-memory cursor to prevent infinite retry loop
+                                    self.next_read_seq = seq + 1;
                                 }
                             }
                         } else {
@@ -196,6 +200,8 @@ impl WalPipelineRunner {
                                 log::warn!("No slot mapping for seq {}, using fallback", next_seq);
                                 let _ = self.wal_queue.mark_processed(0, next_seq);
                             }
+                            // CRITICAL: Advance in-memory cursor to prevent infinite retry loop
+                            self.next_read_seq = seq + 1;
                         }
                     } else {
                         log::error!("Error reading from WAL: {}", e);
