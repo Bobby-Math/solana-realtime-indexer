@@ -157,8 +157,8 @@ async fn execute_transactions_insert(
             unnested.signature,
             unnested.fee,
             unnested.success,
-            unnested.program_ids::bytea[],
-            unnested.log_messages::text[]
+            ARRAY(SELECT e::bytea FROM jsonb_array_elements_text(unnested.program_ids) AS e),
+            ARRAY(SELECT e FROM jsonb_array_elements_text(unnested.log_messages) AS e)
          FROM UNNEST(
             $1::timestamptz[],
             $2::bigint[],
