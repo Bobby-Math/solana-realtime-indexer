@@ -264,24 +264,6 @@ impl WalQueue {
         Ok(seq)
     }
 
-    // Legacy method for compatibility - converts GeyserEvent to SubscribeUpdate
-    // This should be removed once the pipeline is fully converted to use SubscribeUpdate
-    #[allow(dead_code)]
-    pub fn push(&self, event: crate::geyser::decoder::GeyserEvent) -> Result<u64, String> {
-        // This is a temporary compatibility shim
-        // In the future, all callers should use push_update() directly with SubscribeUpdate
-        let _slot = match &event {
-            crate::geyser::decoder::GeyserEvent::AccountUpdate(acc) => acc.slot,
-            crate::geyser::decoder::GeyserEvent::Transaction(tx) => tx.slot,
-            crate::geyser::decoder::GeyserEvent::SlotUpdate(slot) => slot.slot,
-            crate::geyser::decoder::GeyserEvent::BlockMeta(bm) => bm.slot,
-        };
-
-        // For now, we'll store a placeholder - this method should be removed
-        log::warn!("Using legacy push() method - this should be replaced with push_update()");
-        let seq = self.slot_sequence.fetch_add(1, Ordering::Release);
-        Ok(seq)
-    }
 
     pub fn read_next(&self) -> Result<Option<WalEntry>, WalReadError> {
         let last_flushed_seq = self.get_last_processed_seq();
