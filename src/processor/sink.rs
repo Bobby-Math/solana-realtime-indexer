@@ -191,6 +191,8 @@ mod tests {
             transaction_rows: vec![],
             slot_rows: vec![],
             custom_rows: vec![],
+            last_processed_slot: Some(10),
+            last_observed_at_unix_ms: Some(1_710_000_000_000),
         };
 
         let result = sink

@@ -22,21 +22,29 @@ pub struct PersistedBatch {
     pub transaction_rows: Vec<TransactionRow>,
     pub slot_rows: Vec<SlotRow>,
     pub custom_rows: Vec<CustomDecodedRow>,
+    // Track slot and timestamp even for events that don't produce rows (e.g., BlockMeta)
+    // This ensures checkpoint updates happen even when batch has zero rows
+    pub last_processed_slot: Option<i64>,
+    pub last_observed_at_unix_ms: Option<i64>,
 }
 
 impl PersistedBatch {
     pub fn latest_timestamp_unix_ms(&self) -> Option<i64> {
-        self.account_rows
-            .iter()
-            .map(|row| row.timestamp_unix_ms)
-            .chain(
-                self.transaction_rows
+        // Use tracked timestamp first, fall back to extracting from rows
+        self.last_observed_at_unix_ms
+            .or_else(|| {
+                self.account_rows
                     .iter()
-                    .map(|row| row.timestamp_unix_ms),
-            )
-            .chain(self.slot_rows.iter().map(|row| row.timestamp_unix_ms))
-            .chain(self.custom_rows.iter().map(|row| row.timestamp_unix_ms))
-            .max()
+                    .map(|row| row.timestamp_unix_ms)
+                    .chain(
+                        self.transaction_rows
+                            .iter()
+                            .map(|row| row.timestamp_unix_ms),
+                    )
+                    .chain(self.slot_rows.iter().map(|row| row.timestamp_unix_ms))
+                    .chain(self.custom_rows.iter().map(|row| row.timestamp_unix_ms))
+                    .max()
+            })
     }
 }
 
@@ -57,9 +65,30 @@ impl Type1Decoder {
             transaction_rows: Vec::new(),
             slot_rows: Vec::new(),
             custom_rows: Vec::new(),
+            last_processed_slot: None,
+            last_observed_at_unix_ms: None,
         };
 
         for event in batch.events {
+            // Track slot and timestamp for ALL events (including those that don't produce rows)
+            // This ensures checkpoint updates happen even when batch has zero rows
+            let event_info = match &event {
+                GeyserEvent::AccountUpdate(u) => {
+                    Some((u.slot as i64, block_time_cache.get(u.slot).unwrap_or(u.timestamp_unix_ms)))
+                }
+                GeyserEvent::Transaction(u) => {
+                    Some((u.slot as i64, block_time_cache.get(u.slot).unwrap_or(u.timestamp_unix_ms)))
+                }
+                GeyserEvent::SlotUpdate(u) => Some((u.slot as i64, u.timestamp_unix_ms)),
+                GeyserEvent::BlockMeta(u) => Some((u.slot as i64, u.block_time_ms)),
+            };
+
+            // Update tracked slot/timestamp (use max to get latest)
+            if let Some((slot, timestamp)) = event_info {
+                persisted.last_processed_slot = persisted.last_processed_slot.max(Some(slot));
+                persisted.last_observed_at_unix_ms = persisted.last_observed_at_unix_ms.max(Some(timestamp));
+            }
+
             for decoder in custom_decoders.iter_mut() {
                 let rows = decoder.decode_multi(&event);
                 if !rows.is_empty() {

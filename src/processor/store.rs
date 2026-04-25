@@ -159,6 +159,8 @@ mod tests {
             transaction_rows: vec![],
             slot_rows: vec![],
             custom_rows: vec![],
+            last_processed_slot: Some(1),
+            last_observed_at_unix_ms: Some(100),
         };
         store.apply_batch(first_batch);
 
@@ -188,6 +190,8 @@ mod tests {
                 event_index: 0,
                 payload: "transaction".to_string(),
             }],
+            last_processed_slot: Some(2),
+            last_observed_at_unix_ms: Some(125),
         };
 
         let snapshot = store.apply_batch(second_batch);

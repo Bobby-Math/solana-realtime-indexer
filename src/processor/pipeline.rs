@@ -160,14 +160,19 @@ fn latest_processed_slot(batch: &PersistedBatch) -> Option<i64> {
 }
 
 fn checkpoint_update_for_batch(batch: &PersistedBatch) -> Option<CheckpointUpdate> {
-    let last_processed_slot = batch
-        .slot_rows
-        .iter()
-        .map(|row| row.slot)
-        .chain(batch.transaction_rows.iter().map(|row| row.slot))
-        .chain(batch.account_rows.iter().map(|row| row.slot))
-        .chain(batch.custom_rows.iter().map(|row| row.slot))
-        .max();
+    // Use tracked slot/timestamp first (populated for all events including BlockMeta)
+    // Fall back to extracting from rows for backwards compatibility
+    let last_processed_slot = batch.last_processed_slot
+        .or_else(|| {
+            batch.slot_rows
+                .iter()
+                .map(|row| row.slot)
+                .chain(batch.transaction_rows.iter().map(|row| row.slot))
+                .chain(batch.account_rows.iter().map(|row| row.slot))
+                .chain(batch.custom_rows.iter().map(|row| row.slot))
+                .max()
+        });
+
     let last_observed_at_unix_ms = batch.latest_timestamp_unix_ms()?;
 
     Some(CheckpointUpdate {
@@ -235,5 +240,48 @@ mod tests {
         assert_eq!(report.retained_account_rows, 1);
         assert_eq!(report.last_processed_slot, Some(10));
         assert_eq!(report.last_observed_at_unix_ms, Some(1_710_000_000_001));
+    }
+
+    #[tokio::test]
+    async fn blockmeta_only_batches_produce_checkpoint_updates() {
+        use crate::geyser::decoder::BlockMetaUpdate;
+        use crate::processor::batch_writer::FlushReason;
+
+        // Create a batch with only BlockMeta events (which don't produce rows)
+        let batch = crate::processor::batch_writer::BufferedBatch {
+            reason: FlushReason::Interval,
+            events: vec![
+                GeyserEvent::BlockMeta(BlockMetaUpdate {
+                    slot: 100,
+                    block_time_ms: 1_710_000_000_000,
+                    block_height: Some(1000),
+                }),
+                GeyserEvent::BlockMeta(BlockMetaUpdate {
+                    slot: 101,
+                    block_time_ms: 1_710_000_000_100,
+                    block_height: Some(1001),
+                }),
+            ],
+        };
+
+        let decoder = Type1Decoder::new();
+        let persisted = decoder.decode(batch, &mut [], &BlockTimeCache::new(1000));
+
+        // Verify no rows are produced (BlockMeta doesn't produce rows)
+        assert_eq!(persisted.account_rows.len(), 0);
+        assert_eq!(persisted.transaction_rows.len(), 0);
+        assert_eq!(persisted.slot_rows.len(), 0);
+
+        // Verify checkpoint information is tracked
+        assert_eq!(persisted.last_processed_slot, Some(101));
+        assert_eq!(persisted.last_observed_at_unix_ms, Some(1_710_000_000_100));
+
+        // Verify checkpoint_update_for_batch returns Some (not None)
+        let checkpoint = super::checkpoint_update_for_batch(&persisted);
+        assert!(checkpoint.is_some(), "Checkpoint should be updated even for BlockMeta-only batches");
+
+        let checkpoint = checkpoint.unwrap();
+        assert_eq!(checkpoint.last_processed_slot, Some(101));
+        assert_eq!(checkpoint.last_observed_at_unix_ms, 1_710_000_000_100);
     }
 }
