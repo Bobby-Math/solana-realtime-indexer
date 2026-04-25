@@ -2,7 +2,6 @@ pub mod api;
 pub mod config;
 pub mod geyser;
 pub mod processor;
-pub mod rpc_pool;
 
 pub use api::rest::ApiSnapshot;
 
