@@ -110,11 +110,10 @@ impl WalPipelineRunner {
                                 log::error!("🔴 CORRUPT WAL ENTRY at slot {} seq {}: {}. Skipping to prevent consumer block.",
                                           entry.slot, entry.seq, e);
 
-                                // Mark as processed to advance past corrupted entry
-                                if let Err(mark_err) = self.wal_queue.mark_processed(entry.slot, entry.seq) {
-                                    log::error!("Failed to mark corrupted entry slot {} seq {} as processed: {}",
-                                              entry.slot, entry.seq, mark_err);
-                                }
+                                // CRITICAL: Don't call mark_processed directly — add to pending so it
+                                // checkpoints with next batch in correct seq order after any buffered good events.
+                                // This prevents checkpoint from moving backward when max_seq < corrupted seq.
+                                self.pending_checkpoint_seqs.push(entry.seq);
 
                                 // Advance in-memory cursor past this entry
                                 self.next_read_seq = entry.seq + 1;
