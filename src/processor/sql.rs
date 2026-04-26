@@ -1,7 +1,7 @@
 use crate::processor::decoder::PersistedBatch;
 use crate::processor::schema::{AccountUpdateRow, CustomDecodedRow, SlotRow, TransactionRow};
 use crate::processor::store::RetentionPolicy;
-use sqlx::Transaction;
+use sqlx::{Postgres, QueryBuilder, Transaction};
 use chrono::{TimeZone, Utc};
 
 /// Safely convert Unix milliseconds to DateTime<Utc>, returning a sqlx::Error on out-of-range values.
@@ -102,83 +102,50 @@ pub async fn execute_transactions_insert(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     rows: &[TransactionRow],
 ) -> Result<(), sqlx::Error> {
-    // Collect scalar columns into parallel arrays for UNNEST bulk insert
-    let timestamps: Vec<chrono::DateTime<Utc>> = rows
+    struct PreparedTransactionRow {
+        timestamp: chrono::DateTime<Utc>,
+        slot: i64,
+        signature: Vec<u8>,
+        fee: i64,
+        success: bool,
+        program_ids: Vec<Vec<u8>>,
+        log_messages: Vec<String>,
+    }
+
+    let prepared_rows: Vec<PreparedTransactionRow> = rows
         .iter()
-        .map(|row| to_utc_timestamp(row.timestamp_unix_ms))
+        .map(|row| -> Result<PreparedTransactionRow, sqlx::Error> {
+            Ok(PreparedTransactionRow {
+                timestamp: to_utc_timestamp(row.timestamp_unix_ms)?,
+                slot: row.slot,
+                signature: row.signature.clone(),
+                fee: row.fee,
+                success: row.success,
+                program_ids: row.program_ids.clone(),
+                log_messages: row.log_messages.clone(),
+            })
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    let slots: Vec<i64> = rows.iter().map(|row| row.slot).collect();
-    let signatures: Vec<Vec<u8>> = rows.iter().map(|row| row.signature.clone()).collect();
-    let fees: Vec<i64> = rows.iter().map(|row| row.fee).collect();
-    let success: Vec<bool> = rows.iter().map(|row| row.success).collect();
 
-    // Encode array columns as JSON arrays for bulk insert (SQLX limitation: can't bind Vec<Vec<Vec<u8>>> or Vec<Vec<String>>)
-    // Vec<Vec<u8>> (program_ids) encoded as JSON array of hex-encoded bytea strings
-    // Vec<String> (log_messages) encoded as JSON array of escaped strings
-    let program_ids_json: Vec<String> = rows
-        .iter()
-        .map(|row| {
-            if row.program_ids.is_empty() {
-                return "[]".to_string();
-            }
-            let encoded: Vec<String> = row.program_ids.iter()
-                .map(|bytes| {
-                    let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-                    format!("\"\\\\x{}\"", hex)
-                })
-                .collect();
-            format!("[{}]", encoded.join(","))
-        })
-        .collect();
-    let log_messages_json: Vec<String> = rows
-        .iter()
-        .map(|row| {
-            if row.log_messages.is_empty() {
-                return "[]".to_string();
-            }
-            let encoded: Vec<String> = row.log_messages.iter()
-                .map(|msg| {
-                    // Escape backslashes and double quotes for JSON
-                    let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
-                    format!("\"{}\"", escaped)
-                })
-                .collect();
-            format!("[{}]", encoded.join(","))
-        })
-        .collect();
+    // Use a single multi-row INSERT so each transaction can bind its `program_ids`
+    // directly as `bytea[]` without round-tripping through JSON text.
+    let mut builder: QueryBuilder<'_, Postgres> = QueryBuilder::new(
+        "INSERT INTO transactions (timestamp, slot, signature, fee, success, program_ids, log_messages) ",
+    );
 
-    // Use UNNEST for bulk insert with JSON-to-array conversion in SELECT clause
-    // This reduces N round-trips to 1 round-trip for all rows
-    sqlx::query(
-        "INSERT INTO transactions (timestamp, slot, signature, fee, success, program_ids, log_messages)
-         SELECT
-            unnested.timestamp,
-            unnested.slot,
-            unnested.signature,
-            unnested.fee,
-            unnested.success,
-            ARRAY(SELECT e::bytea FROM jsonb_array_elements_text(unnested.program_ids) AS e),
-            ARRAY(SELECT e FROM jsonb_array_elements_text(unnested.log_messages) AS e)
-         FROM UNNEST(
-            $1::timestamptz[],
-            $2::bigint[],
-            $3::bytea[],
-            $4::bigint[],
-            $5::boolean[],
-            $6::jsonb[],
-            $7::jsonb[]
-         ) AS unnested(timestamp, slot, signature, fee, success, program_ids, log_messages)
-         ON CONFLICT (timestamp, signature) DO NOTHING"
-    )
-    .bind(&timestamps)
-    .bind(&slots)
-    .bind(&signatures)
-    .bind(&fees)
-    .bind(&success)
-    .bind(&program_ids_json)
-    .bind(&log_messages_json)
-    .execute(&mut **transaction)
-    .await?;
+    builder.push_values(prepared_rows.iter(), |mut separated, row| {
+        separated
+            .push_bind(row.timestamp)
+            .push_bind(row.slot)
+            .push_bind(&row.signature)
+            .push_bind(row.fee)
+            .push_bind(row.success)
+            .push_bind(&row.program_ids)
+            .push_bind(&row.log_messages);
+    });
+
+    builder.push(" ON CONFLICT (timestamp, signature) DO NOTHING");
+    builder.build().execute(&mut **transaction).await?;
 
     Ok(())
 }
