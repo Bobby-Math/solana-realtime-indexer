@@ -7,6 +7,33 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 
+/// Mock sink for testing
+struct MockSink;
+
+#[async_trait::async_trait]
+impl solana_realtime_indexer::processor::sink::StorageSink for MockSink {
+    async fn write_batch(
+        &mut self,
+        _batch: &solana_realtime_indexer::processor::decoder::PersistedBatch,
+        _checkpoint: Option<solana_realtime_indexer::processor::sql::CheckpointUpdate>,
+    ) -> Result<solana_realtime_indexer::processor::sink::StorageWriteResult, solana_realtime_indexer::processor::sink::StorageError> {
+        Ok(solana_realtime_indexer::processor::sink::StorageWriteResult {
+            snapshot: solana_realtime_indexer::processor::store::StoreSnapshot::default(),
+            sql_statements_planned: 0,
+        })
+    }
+
+    async fn write_gap_repaired_slot(
+        &mut self,
+        slot: u64,
+        _slot_row: solana_realtime_indexer::processor::schema::SlotRow,
+        transactions: Vec<solana_realtime_indexer::processor::schema::TransactionRow>,
+    ) -> Result<(), solana_realtime_indexer::processor::sink::StorageError> {
+        println!("   Mock sink: wrote {} transactions for slot {}", transactions.len(), slot);
+        Ok(())
+    }
+}
+
 /// Test configuration
 struct ChaosTestConfig {
     /// Known slot that exists on mainnet (update this periodically)
@@ -99,18 +126,21 @@ async fn test_chaos_grpc_loss_with_rpc_repair() {
         _ => panic!("Expected Gap error"),
     };
 
+    // Create mock sink for repair
+    let mut mock_sink = MockSink;
+
     // Try to repair the gap
-    let repair_result = gap_filler.repair_gap(seq).await;
+    let repair_result = gap_filler.repair_gap(seq, &mut mock_sink).await;
     println!("   Repair result: {:?}", repair_result);
 
     // Step 4: Verify repair succeeded
     println!("\n✅ Step 4: Verifying repair succeeded");
 
-    let repair_success = matches!(repair_result, Ok(true));
+    let repair_success = matches!(repair_result, Ok(ref events_written) if *events_written > 0);
 
-    match &repair_result {
-        Ok(true) => {
-            println!("   ✓ Gap repair succeeded");
+    match repair_result {
+        Ok(events_written) if events_written > 0 => {
+            println!("   ✓ Gap repair succeeded with {} events", events_written);
 
             // Verify the gap is now filled
             let filled_result = wal_queue.read_from(0, seq);
@@ -119,8 +149,8 @@ async fn test_chaos_grpc_loss_with_rpc_repair() {
             assert_eq!(entry.seq, seq, "Should read the repaired seq");
             println!("   ✓ Gap slot {} is now readable", seq);
         }
-        Ok(false) => {
-            println!("   ⚠️  Gap repair returned false (slot may not be available)");
+        Ok(_) => {
+            println!("   ⚠️  Gap repair returned 0 events (slot may not be available)");
             println!("   This is expected if test slot is too old or doesn't exist");
         }
         Err(e) => {
@@ -186,7 +216,8 @@ async fn test_chaos_repair_preserves_existing_data() {
         wal_queue.clone(),
     );
 
-    let _ = gap_filler.repair_gap(3).await;
+    let mut mock_sink = MockSink;
+    let _ = gap_filler.repair_gap(3, &mut mock_sink).await;
 
     // Verify checkpoint wasn't corrupted
     let checkpoint_after = wal_queue.get_last_processed_seq();

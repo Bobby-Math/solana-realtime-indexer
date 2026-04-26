@@ -40,6 +40,16 @@ pub trait StorageSink: Send {
         batch: &PersistedBatch,
         checkpoint: Option<CheckpointUpdate>,
     ) -> Result<StorageWriteResult, StorageError>;
+
+    /// Write gap-repaired transactions directly to the DB.
+    /// Called only by RpcGapFiller — skips WAL entirely.
+    /// Uses ON CONFLICT DO NOTHING to handle any potential live-stream duplicates.
+    async fn write_gap_repaired_slot(
+        &mut self,
+        slot: u64,
+        slot_row: crate::processor::schema::SlotRow,
+        transactions: Vec<crate::processor::schema::TransactionRow>,
+    ) -> Result<(), StorageError>;
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +93,20 @@ impl StorageSink for DryRunStorageSink {
             snapshot: self.store.apply_batch(batch.clone()),
             sql_statements_planned: statement_count,
         })
+    }
+
+    async fn write_gap_repaired_slot(
+        &mut self,
+        slot: u64,
+        slot_row: crate::processor::schema::SlotRow,
+        transactions: Vec<crate::processor::schema::TransactionRow>,
+    ) -> Result<(), StorageError> {
+        // Dry run: just log what would be written
+        log::info!(
+            "Gap repair (dry run): would write {} transactions for slot {} to DB",
+            transactions.len(), slot
+        );
+        Ok(())
     }
 }
 
@@ -158,6 +182,42 @@ impl StorageSink for TimescaleStorageSink {
             snapshot,
             sql_statements_planned: statement_count,
         })
+    }
+
+    async fn write_gap_repaired_slot(
+        &mut self,
+        slot: u64,
+        slot_row: crate::processor::schema::SlotRow,
+        transactions: Vec<crate::processor::schema::TransactionRow>,
+    ) -> Result<(), StorageError> {
+        use crate::processor::sql::{execute_slots_upsert, execute_transactions_insert};
+
+        let pool = self.pool.clone();
+
+        {
+            let mut tx = pool.begin().await
+                .map_err(|error| StorageError::Execute(error.to_string()))?;
+
+            // Write slot first (idempotent upsert)
+            execute_slots_upsert(&mut tx, &[slot_row]).await
+                .map_err(|error| StorageError::Execute(error.to_string()))?;
+
+            // Write transactions (ON CONFLICT DO NOTHING — safe even if live stream
+            // somehow also delivered these)
+            if !transactions.is_empty() {
+                execute_transactions_insert(&mut tx, &transactions).await
+                    .map_err(|error| StorageError::Execute(error.to_string()))?;
+            }
+
+            tx.commit().await
+                .map_err(|error| StorageError::Execute(error.to_string()))?;
+        }
+
+        log::info!(
+            "Gap repair: wrote {} transactions for slot {} directly to DB",
+            transactions.len(), slot
+        );
+        Ok(())
     }
 }
 

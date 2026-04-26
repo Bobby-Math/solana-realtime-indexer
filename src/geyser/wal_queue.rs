@@ -295,9 +295,14 @@ impl WalQueue {
 
     pub fn read_next(&self) -> Result<Option<WalEntry>, WalReadError> {
         // CRITICAL FIX: get_last_processed_seq() now returns the actual last processed seq,
-        // not the next seq to read. Add +1 to read the next unprocessed seq.
-        let last_flushed_seq = self.get_last_processed_seq();
-        self.read_from_seq(last_flushed_seq.saturating_add(1))
+        // not the next seq to read. We must also distinguish "no checkpoint yet"
+        // from "checkpoint exists at seq 0".
+        let next_seq = if self.has_checkpoint() {
+            self.get_last_processed_seq().saturating_add(1)
+        } else {
+            0
+        };
+        self.read_from_seq(next_seq)
     }
 
     pub fn read_from(&self, _slot: u64, seq: u64) -> Result<Option<WalEntry>, WalReadError> {
@@ -402,20 +407,12 @@ impl WalQueue {
 
     pub fn get_unprocessed_count(&self) -> u64 {
         let total = self.slot_sequence.load(Ordering::Relaxed);
-        let last_processed = self.get_last_processed_seq();
-
-        // CRITICAL FIX: get_last_processed_seq() now returns the actual last processed seq,
-        // not the next seq to read. So unprocessed count is total - (last_processed + 1).
-        //
-        // However, last_processed == 0 is ambiguous: it could mean "no checkpoint" or "seq 0 was processed".
-        // We distinguish by checking if last_flushed_slot == 0 (no checkpoint created yet).
-        let last_flushed_slot = self.get_last_processed_slot();
-        if last_flushed_slot == 0 && last_processed == 0 {
+        if !self.has_checkpoint() {
             // No checkpoint created yet, all events are unprocessed
             total
         } else {
             // Checkpoint exists, calculate unprocessed count normally
-            let next_unprocessed = last_processed.saturating_add(1);
+            let next_unprocessed = self.get_last_processed_seq().saturating_add(1);
             total.saturating_sub(next_unprocessed)
         }
     }
@@ -447,6 +444,16 @@ impl WalQueue {
         // The key fix is that we now store the actual last processed seq (not seq+1),
         // so get_last_processed_seq() returns the correct value after the first checkpoint.
         0
+    }
+
+    /// Check if a checkpoint exists in the metadata.
+    /// Returns true if the last_flushed_seq key exists (regardless of its value).
+    /// This distinguishes "no checkpoint yet" from "checkpoint at seq 0".
+    pub fn has_checkpoint(&self) -> bool {
+        self.metadata.get(b"last_flushed_seq")
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     /// Get the slot number for a given sequence number
@@ -1132,6 +1139,45 @@ mod tests {
         assert_eq!(wal_queue.get_last_processed_seq(), 10);
 
         println!("✓ skip_processed_sequence advances seq without corrupting slot checkpoint");
+    }
+
+    #[test]
+    fn test_read_next_starts_at_seq_zero_when_no_checkpoint_exists() {
+        let temp_dir = tempdir().unwrap();
+        let wal_queue = WalQueue::new(temp_dir.path()).unwrap();
+
+        let update = SubscribeUpdate { ..Default::default() };
+        wal_queue.push_update(100, &update).unwrap();
+
+        assert!(!wal_queue.has_checkpoint(), "fresh WAL should not have a checkpoint");
+
+        let entry = wal_queue
+            .read_next()
+            .expect("read_next should succeed on fresh WAL")
+            .expect("read_next should return the first entry");
+
+        assert_eq!(entry.seq, 0, "fresh WAL must start at seq 0");
+        assert_eq!(entry.slot, 100);
+    }
+
+    #[test]
+    fn test_unprocessed_count_uses_checkpoint_existence_not_slot_zero_proxy() {
+        let temp_dir = tempdir().unwrap();
+        let wal_queue = WalQueue::new(temp_dir.path()).unwrap();
+
+        for slot in 0..3 {
+            let update = SubscribeUpdate { ..Default::default() };
+            wal_queue.push_update(slot, &update).unwrap();
+        }
+
+        // A real checkpoint can exist at seq 0 and slot 0. This must not be
+        // misclassified as "no checkpoint yet".
+        wal_queue.mark_processed(0, 0).unwrap();
+
+        assert!(wal_queue.has_checkpoint(), "checkpoint metadata should exist");
+        assert_eq!(wal_queue.get_last_processed_seq(), 0);
+        assert_eq!(wal_queue.get_last_processed_slot(), 0);
+        assert_eq!(wal_queue.get_unprocessed_count(), 2);
     }
 
     #[test]

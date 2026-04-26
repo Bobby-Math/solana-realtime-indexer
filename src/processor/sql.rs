@@ -98,7 +98,7 @@ async fn execute_account_updates_insert(
     Ok(())
 }
 
-async fn execute_transactions_insert(
+pub async fn execute_transactions_insert(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     rows: &[TransactionRow],
 ) -> Result<(), sqlx::Error> {
@@ -183,7 +183,7 @@ async fn execute_transactions_insert(
     Ok(())
 }
 
-async fn execute_slots_upsert(
+pub async fn execute_slots_upsert(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     rows: &[SlotRow],
 ) -> Result<(), sqlx::Error> {
