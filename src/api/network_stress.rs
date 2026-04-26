@@ -27,7 +27,7 @@ pub struct SlotHealthBucket {
 pub async fn get_network_stress(State(state): State<SharedApiState>) -> Json<NetworkStressResponse> {
     // Extract pool clone under lock, then release immediately
     let pool = {
-        let snapshot = state.lock().await;
+        let snapshot = state.read().await;
         snapshot.pool.clone()
     }; // Lock released here
 

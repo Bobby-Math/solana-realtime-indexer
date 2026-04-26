@@ -53,6 +53,7 @@ pub struct ApiSnapshot {
     pub elapsed_secs: f64,
     pub last_processed_slot: Option<i64>,
     pub last_observed_at_unix_ms: Option<i64>,
+    pub last_on_chain_block_time_ms: Option<i64>,
     pub indexed_at_unix_ms: i64,
     pub report: PipelineReport,
     pub wal_unprocessed_count: u64,
@@ -84,6 +85,7 @@ impl ApiSnapshot {
             elapsed_secs: elapsed.as_secs_f64(),
             last_processed_slot: report.last_processed_slot,
             last_observed_at_unix_ms: report.last_observed_at_unix_ms,
+            last_on_chain_block_time_ms: report.last_on_chain_block_time_ms,
             indexed_at_unix_ms,
             report,
             wal_unprocessed_count: 0,
@@ -152,29 +154,29 @@ impl ApiSnapshot {
     }
 
     fn slot_to_indexed_lag_ms(&self) -> Option<i64> {
-        self.last_observed_at_unix_ms
-            .map(|observed_at| {
+        self.last_on_chain_block_time_ms
+            .map(|block_time_ms| {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as i64;
-                now.saturating_sub(observed_at).max(0)
+                now.saturating_sub(block_time_ms).max(0)
             })
     }
 }
 
 pub async fn health(State(state): State<SharedApiState>) -> Json<HealthResponse> {
-    let snapshot = state.lock().await;
+    let snapshot = state.read().await;
     Json(snapshot.health_response())
 }
 
 pub async fn metrics(State(state): State<SharedApiState>) -> Json<MetricsResponse> {
-    let snapshot = state.lock().await;
+    let snapshot = state.read().await;
     Json(snapshot.metrics_response())
 }
 
 fn per_second(count: u64, elapsed_secs: f64) -> f64 {
-    if elapsed_secs <= f64::EPSILON {
+    if elapsed_secs < 0.1 {
         0.0
     } else {
         count as f64 / elapsed_secs
@@ -197,6 +199,7 @@ mod tests {
             custom_rows_written: 20,
             last_processed_slot: Some(55),
             last_observed_at_unix_ms: Some(1_000),
+            last_on_chain_block_time_ms: Some(1_000),
             ..PipelineReport::default()
         };
 
@@ -233,6 +236,7 @@ mod tests {
     fn slot_to_indexed_lag_returns_none_when_no_events_processed() {
         let report = PipelineReport {
             last_observed_at_unix_ms: None,
+            last_on_chain_block_time_ms: None,
             ..PipelineReport::default()
         };
 
@@ -263,7 +267,8 @@ mod tests {
         let event_time = now - 5_000;
 
         let report = PipelineReport {
-            last_observed_at_unix_ms: Some(event_time),
+            last_observed_at_unix_ms: Some(now),
+            last_on_chain_block_time_ms: Some(event_time),
             ..PipelineReport::default()
         };
 
@@ -284,5 +289,10 @@ mod tests {
         // Lag should be approximately 5000ms (allowing for test execution time)
         assert!(lag >= 4_900 && lag <= 5_500,
                 "lag should be ~5000ms for event 5s ago, got {}ms", lag);
+    }
+
+    #[test]
+    fn per_second_returns_zero_for_startup_noise() {
+        assert_eq!(super::per_second(100, 0.05), 0.0);
     }
 }

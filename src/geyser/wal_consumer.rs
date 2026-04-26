@@ -10,7 +10,7 @@ use crate::processor::store::StoreSnapshot;
 use crate::processor::schema::{TransactionRow, SlotRow};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 pub struct WalPipelineConfig {
     pub wal_path: String,
@@ -23,7 +23,7 @@ pub struct WalPipelineRunner {
     wal_queue: Arc<WalQueue>,
     config: WalPipelineConfig,
     #[allow(dead_code)]
-    api_state: Arc<Mutex<crate::api::rest::ApiSnapshot>>,
+    api_state: Arc<RwLock<crate::api::rest::ApiSnapshot>>,
     writer: BatchWriter,
     decoder: Type1Decoder,
     custom_decoders: Vec<Box<dyn CustomDecoder>>,
@@ -38,7 +38,7 @@ impl WalPipelineRunner {
     pub fn new(
         wal_queue: Arc<WalQueue>,
         config: WalPipelineConfig,
-        api_state: Arc<Mutex<crate::api::rest::ApiSnapshot>>,
+        api_state: Arc<RwLock<crate::api::rest::ApiSnapshot>>,
         writer: BatchWriter,
         decoder: Type1Decoder,
         custom_decoders: Vec<Box<dyn CustomDecoder>>,
@@ -103,41 +103,54 @@ impl WalPipelineRunner {
                 self.process_batch(batch, &mut report).await?;
             }
 
-            // Check for new entries in WAL using in-memory read cursor
-            match self.wal_queue.read_from(0, self.next_read_seq) {
-                Ok(Some(entry)) => {
-                    // Process the event (just add to buffer, DON'T mark yet)
-                    match self.process_entry(&entry, &mut report).await {
-                        Ok(()) => {
-                            // Only advance read cursor after successful processing
-                            self.next_read_seq = entry.seq + 1;
-                        }
-                        Err(e) => {
-                            // Check if this is an unrecoverable decode error
-                            let is_decode_error = e.contains("Failed to decode protobuf") ||
-                                                 e.contains("Failed to decode SubscribeUpdate");
+            // Check for new entries in WAL using a contiguous range scan.
+            match self
+                .wal_queue
+                .read_batch_from(self.next_read_seq, self.config.batch_size)
+            {
+                Ok(entries) if entries.is_empty() => {
+                    // No new entries, sleep for poll interval
+                    tokio::time::sleep(self.config.poll_interval).await;
+                }
+                Ok(entries) => {
+                    let mut retry_current_seq = false;
 
-                            if is_decode_error {
-                                // Corrupted WAL entry - skip it to prevent permanent block
-                                log::error!("🔴 CORRUPT WAL ENTRY at slot {} seq {}: {}. Skipping to prevent consumer block.",
-                                          entry.slot, entry.seq, e);
-
-                                // CRITICAL: Don't call mark_processed directly — add to pending so it
-                                // checkpoints with next batch in correct seq order after any buffered good events.
-                                // This prevents checkpoint from moving backward when max_seq < corrupted seq.
-                                self.pending_checkpoint_seqs.push(entry.seq);
-
-                                // Advance in-memory cursor past this entry
+                    for entry in entries {
+                        match self.process_entry(&entry, &mut report).await {
+                            Ok(()) => {
                                 self.next_read_seq = entry.seq + 1;
-                            } else {
-                                // Other processing errors - log but don't skip (may be transient)
-                                log::error!("Error processing entry slot {} seq {}: {}", entry.slot, entry.seq, e);
-                                // Don't advance cursor - will retry on next iteration
                             }
+                            Err(e) => {
+                                let is_decode_error = e.contains("Failed to decode protobuf")
+                                    || e.contains("Failed to decode SubscribeUpdate");
+
+                                if is_decode_error {
+                                    log::error!("🔴 CORRUPT WAL ENTRY at slot {} seq {}: {}. Skipping to prevent consumer block.",
+                                              entry.slot, entry.seq, e);
+                                    self.pending_checkpoint_seqs.push(entry.seq);
+                                    self.next_read_seq = entry.seq + 1;
+                                } else {
+                                    log::error!(
+                                        "Error processing entry slot {} seq {}: {}",
+                                        entry.slot,
+                                        entry.seq,
+                                        e
+                                    );
+                                    retry_current_seq = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if let Some(batch) = self.writer.flush_if_needed(Instant::now()) {
+                            self.process_batch(batch, &mut report).await?;
                         }
                     }
 
-                    // Log progress every 5 seconds
+                    if retry_current_seq {
+                        tokio::time::sleep(self.config.poll_interval).await;
+                    }
+
                     if now.duration_since(last_log_time) >= log_interval {
                         let elapsed = now.duration_since(started_at);
                         let events_per_sec = report.received_events as f64 / elapsed.as_secs_f64();
@@ -146,10 +159,6 @@ impl WalPipelineRunner {
                                   elapsed.as_secs_f64(), report.received_events, events_per_sec, unprocessed_count);
                         last_log_time = now;
                     }
-                }
-                Ok(None) => {
-                    // No new entries, sleep for poll interval
-                    tokio::time::sleep(self.config.poll_interval).await;
                 }
                 Err(e) => {
                     // Check if this is a gap error
@@ -246,11 +255,7 @@ impl WalPipelineRunner {
 
         // CRITICAL FIX: Mark sequences as processed ONLY AFTER DB commit succeeds
         // This prevents data loss if crash occurs between buffering and DB flush
-        let checkpointed_seqs: Vec<_> = self.pending_checkpoint_seqs.drain(..).collect();
-
-        if !checkpointed_seqs.is_empty() {
-            // Find the maximum seq in this batch
-            let max_seq = *checkpointed_seqs.iter().max().unwrap_or(&0);
+        if let Some(max_seq) = self.pending_checkpoint_seqs.iter().copied().max() {
 
             // Look up which slot corresponds to this seq
             let slot = match self.wal_queue.get_slot_for_seq(max_seq) {
@@ -267,10 +272,13 @@ impl WalPipelineRunner {
                 log::error!("Failed to mark seq {} as processed after DB commit: {}", max_seq, e);
                 // Note: We don't return error here because the DB commit succeeded,
                 // and the seq will be retried on next startup
+                return Ok(());
             }
 
+            let checkpointed_count = self.pending_checkpoint_seqs.len();
+            self.pending_checkpoint_seqs.clear();
             log::debug!("Checkpointed {} sequences after DB commit (slot: {}, seq: {})",
-                       checkpointed_seqs.len(), slot, max_seq);
+                       checkpointed_count, slot, max_seq);
         }
 
         Ok(())
@@ -292,6 +300,10 @@ fn apply_batch_report(report: &mut PipelineReport, batch: PersistedBatch, result
     report.last_observed_at_unix_ms = max_optional(
         report.last_observed_at_unix_ms,
         batch.latest_timestamp_unix_ms(),
+    );
+    report.last_on_chain_block_time_ms = max_optional(
+        report.last_on_chain_block_time_ms,
+        batch.last_on_chain_block_time_ms,
     );
     report.account_rows_written += batch.account_rows.len() as u64;
     report.transaction_rows_written += batch.transaction_rows.len() as u64;
@@ -590,14 +602,14 @@ impl RpcGapFiller {
             .and_then(|m| m.get("instructions"))
             .and_then(|v| v.as_array())
             .map(|instructions| {
-                let mut seen = std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
                 instructions
                     .iter()
                     .filter_map(|ix| {
                         ix.get("programIdIndex")
                             .and_then(|idx| idx.as_u64())
                             .and_then(|idx| account_keys.get(idx as usize))
-                            .filter(|key| seen.insert(key.clone()))
+                            .filter(|key| seen.insert(key.as_slice()))
                             .cloned()
                     })
                     .collect()
@@ -766,7 +778,7 @@ mod tests {
                 batch_size: 1,
                 batch_flush_ms: 1,
             },
-            Arc::new(Mutex::new(crate::api::rest::ApiSnapshot::from_report(
+            Arc::new(RwLock::new(crate::api::rest::ApiSnapshot::from_report(
                 "test",
                 "dry-run",
                 "127.0.0.1:0",
@@ -811,7 +823,7 @@ mod tests {
                 batch_size: 1,
                 batch_flush_ms: 1,
             },
-            Arc::new(Mutex::new(crate::api::rest::ApiSnapshot::from_report(
+            Arc::new(RwLock::new(crate::api::rest::ApiSnapshot::from_report(
                 "test",
                 "dry-run",
                 "127.0.0.1:0",

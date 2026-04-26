@@ -39,6 +39,7 @@ impl std::error::Error for WalReadError {}
 const WAL_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 const WAL_GC_INTERVAL: Duration = Duration::from_secs(10);
 const WAL_GC_SAFETY_MARGIN_DEFAULT: u64 = 1000; // Keep 1000 entries as safety buffer
+const SEQ_TO_SLOT_PREFIX: [u8; 4] = *b"s2s_";
 
 /// WAL durability mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +92,93 @@ fn gc_safety_margin_from_env() -> u64 {
             WAL_GC_SAFETY_MARGIN_DEFAULT
         }
     }
+}
+
+fn seq_to_slot_key(seq: u64) -> [u8; 12] {
+    let mut key = [0u8; 12];
+    key[..4].copy_from_slice(&SEQ_TO_SLOT_PREFIX);
+    key[4..].copy_from_slice(&seq.to_be_bytes());
+    key
+}
+
+fn legacy_seq_to_slot_key(seq: u64) -> String {
+    format!("seq2slot_{}", seq)
+}
+
+fn decode_u64_be(bytes: &[u8], context: &str) -> Result<u64, String> {
+    let arr: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| format!("{context}: expected 8 bytes, got {}", bytes.len()))?;
+    Ok(u64::from_be_bytes(arr))
+}
+
+fn encode_entry(entry: &WalEntry) -> Vec<u8> {
+    let mut buffer = Vec::with_capacity(28 + entry.payload.len());
+    buffer.extend_from_slice(&entry.slot.to_be_bytes());
+    buffer.extend_from_slice(&entry.seq.to_be_bytes());
+    buffer.extend_from_slice(&entry.timestamp_unix_ms.to_be_bytes());
+    buffer.extend_from_slice(&(entry.payload.len() as u32).to_be_bytes());
+    buffer.extend_from_slice(&entry.payload);
+    buffer
+}
+
+fn decode_entry(expected_seq: u64, value_bytes: &[u8]) -> Result<WalEntry, WalReadError> {
+    if value_bytes.len() < 28 {
+        return Err(WalReadError::Io(format!(
+            "Corrupt WAL entry for seq {}: expected at least 28 bytes, got {}",
+            expected_seq,
+            value_bytes.len()
+        )));
+    }
+
+    let entry_slot = decode_u64_be(&value_bytes[0..8], "Corrupt WAL slot header")
+        .map_err(WalReadError::Io)?;
+    let entry_seq = decode_u64_be(&value_bytes[8..16], "Corrupt WAL seq header")
+        .map_err(WalReadError::Io)?;
+
+    let timestamp = i64::from_be_bytes(
+        value_bytes[16..24]
+            .try_into()
+            .map_err(|_| {
+                WalReadError::Io(format!(
+                    "Corrupt WAL timestamp header for seq {}",
+                    expected_seq
+                ))
+            })?,
+    );
+    let payload_len = u32::from_be_bytes(
+        value_bytes[24..28]
+            .try_into()
+            .map_err(|_| {
+                WalReadError::Io(format!(
+                    "Corrupt WAL payload length header for seq {}",
+                    expected_seq
+                ))
+            })?,
+    ) as usize;
+    let payload_end = 28usize.saturating_add(payload_len);
+    if value_bytes.len() < payload_end {
+        return Err(WalReadError::Io(format!(
+            "Corrupt WAL payload for seq {}: header says {} bytes, entry only has {}",
+            expected_seq,
+            payload_len,
+            value_bytes.len().saturating_sub(28)
+        )));
+    }
+
+    if entry_seq != expected_seq {
+        return Err(WalReadError::KeyMismatch {
+            requested: expected_seq,
+            found: entry_seq,
+        });
+    }
+
+    Ok(WalEntry {
+        slot: entry_slot,
+        seq: entry_seq,
+        payload: value_bytes[28..payload_end].to_vec(),
+        timestamp_unix_ms: timestamp,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -183,26 +271,47 @@ impl WalQueue {
         // The reverse scan result already encodes emptiness (None = empty, Some = non-empty).
         let (is_empty, max_existing_seq) = {
             let mut rev = events.range::<Vec<u8>, _>(..).rev();
-            match rev.next().and_then(|g| g.into_inner().ok()) {
-                None => (true, 0),
-                Some((k, _)) => {
-                    let key_bytes = k.to_vec();
-                    let seq = u64::from_be_bytes(key_bytes.try_into().unwrap());
-                    (false, seq)
+            let mut last_valid_seq = None;
+
+            while let Some(guard) = rev.next() {
+                let (k, _) = guard
+                    .into_inner()
+                    .map_err(|e| format!("Failed to scan WAL keys during startup: {}", e))?;
+                let key_bytes = k.to_vec();
+                match decode_u64_be(&key_bytes, "Corrupt WAL event key during startup scan") {
+                    Ok(seq) => {
+                        last_valid_seq = Some(seq);
+                        break;
+                    }
+                    Err(err) => {
+                        log::error!("{}", err);
+                    }
                 }
+            }
+
+            match last_valid_seq {
+                Some(seq) => (false, seq),
+                None => (true, 0),
             }
         };
 
         // Recover consumer checkpoint from metadata (for resuming consumption)
-        let consumer_checkpoint_seq = if let Ok(Some(last_seq_bytes)) = metadata.get(b"last_flushed_seq") {
-            if last_seq_bytes.len() == 8 {
-                let arr: [u8; 8] = last_seq_bytes.to_vec().try_into().unwrap();
-                Some(u64::from_be_bytes(arr))
-            } else {
+        let consumer_checkpoint_seq = match metadata.get(b"last_flushed_seq") {
+            Ok(Some(last_seq_bytes)) => match decode_u64_be(
+                last_seq_bytes.as_ref(),
+                "Corrupt last_flushed_seq metadata during startup",
+            ) {
+                Ok(seq) => Some(seq),
+                Err(err) => {
+                    log::error!("{}", err);
+                    None
+                }
+            },
+            Ok(None) => None,
+            Err(err) => {
+                log::error!("Failed to read last_flushed_seq metadata during startup: {}", err);
                 None
             }
-        } else {
-            None
         };
 
         // CRITICAL FIX: Distinguish empty WAL from WAL with one entry at seq=0
@@ -221,7 +330,12 @@ impl WalQueue {
 
         // Log recovery state
         if !is_empty {
-            let unprocessed_count = max_existing_seq.saturating_add(1).saturating_sub(consumer_checkpoint_seq.unwrap_or(0));
+            let next_unprocessed = consumer_checkpoint_seq
+                .map(|seq| seq.saturating_add(1))
+                .unwrap_or(0);
+            let unprocessed_count = max_existing_seq
+                .saturating_add(1)
+                .saturating_sub(next_unprocessed);
             log::info!(
                 "WAL recovered: max_seq={}, producer_cursor={}, consumer_checkpoint={:?}, unprocessed_events={}",
                 max_existing_seq,
@@ -247,9 +361,8 @@ impl WalQueue {
     /// Push a SubscribeUpdate to the WAL (legacy method - re-encodes the struct).
     /// Prefer push_raw_bytes() to avoid the unnecessary encode/decode round-trip.
     pub fn push_update(&self, slot: u64, update: &SubscribeUpdate) -> Result<u64, String> {
-        let seq = self.slot_sequence.fetch_add(1, Ordering::Release);
-        let entry = WalEntry::from_update(slot, seq, update);
-        self.write_entry(seq, slot, &entry)
+        let raw_protobuf_bytes = update.encode_to_vec();
+        self.push_raw_bytes(slot, &raw_protobuf_bytes)
     }
 
     /// Push pre-encoded protobuf bytes to the WAL, avoiding re-encode overhead.
@@ -263,13 +376,7 @@ impl WalQueue {
     /// Internal method to write a WAL entry to storage.
     /// Shared by push_update() and push_raw_bytes().
     fn write_entry(&self, seq: u64, slot: u64, entry: &WalEntry) -> Result<u64, String> {
-        // Serialize entry to bytes: slot(8) + seq(8) + timestamp(8) + payload_len(4) + payload
-        let mut buffer = Vec::with_capacity(28 + entry.payload.len());
-        buffer.extend_from_slice(&entry.slot.to_be_bytes());
-        buffer.extend_from_slice(&entry.seq.to_be_bytes());
-        buffer.extend_from_slice(&entry.timestamp_unix_ms.to_be_bytes());
-        buffer.extend_from_slice(&(entry.payload.len() as u32).to_be_bytes());
-        buffer.extend_from_slice(&entry.payload);
+        let buffer = encode_entry(entry);
 
         // Write to fjall events keyspace with seq as key (big-endian for correct sorting)
         // NOTE: This writes to fjall's memtable (in-memory LSM buffer)
@@ -278,9 +385,7 @@ impl WalQueue {
             .map_err(|e| format!("Failed to write to WAL: {}", e))?;
 
         // Also store seq→slot mapping for RPC repair
-        let seq_key = format!("seq2slot_{}", seq);
-        self.metadata.insert(seq_key.as_bytes(), slot.to_be_bytes())
-            .map_err(|e| format!("Failed to write seq→slot mapping: {}", e))?;
+        self.write_slot_mapping(seq, slot)?;
 
         // CRITICAL: In strict mode, fsync immediately to guarantee durability
         // In relaxed mode, background flush handles fsync every 100ms
@@ -309,31 +414,66 @@ impl WalQueue {
         self.read_from_seq(seq)
     }
 
+    pub fn read_batch_from(
+        &self,
+        seq: u64,
+        max_count: usize,
+    ) -> Result<Vec<WalEntry>, WalReadError> {
+        if max_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let start_key = seq.to_be_bytes();
+        let mut entries = Vec::with_capacity(max_count);
+        let mut expected_seq = seq;
+        let mut iter = self.events.range(start_key..);
+
+        while entries.len() < max_count {
+            let Some(guard) = iter.next() else {
+                break;
+            };
+
+            let (key, value) = guard
+                .into_inner()
+                .map_err(|e| WalReadError::Io(format!("Failed to range-read WAL batch: {}", e)))?;
+
+            let key_bytes = key.to_vec();
+            let entry_seq = match decode_u64_be(&key_bytes, "Corrupt WAL event key during batch read")
+            {
+                Ok(seq) => seq,
+                Err(err) => {
+                    log::error!("{}", err);
+                    continue;
+                }
+            };
+
+            if entries.is_empty() {
+                if entry_seq > expected_seq {
+                    return Err(WalReadError::Gap { seq: expected_seq });
+                }
+                if entry_seq < expected_seq {
+                    continue;
+                }
+            } else if entry_seq != expected_seq {
+                break;
+            }
+
+            let value_bytes = value.to_vec();
+            entries.push(decode_entry(entry_seq, &value_bytes)?);
+            expected_seq = expected_seq.saturating_add(1);
+        }
+
+        Ok(entries)
+    }
+
     fn read_from_seq(&self, seq: u64) -> Result<Option<WalEntry>, WalReadError> {
         // Direct lookup for exact seq (no more silent skipping!)
         let key = seq.to_be_bytes();
 
         match self.events.get(&key) {
             Ok(Some(value)) => {
-                // Decode the entry from the stored value
                 let value_bytes = value.to_vec();
-                let entry_slot = u64::from_be_bytes(value_bytes[0..8].try_into().unwrap());
-                let entry_seq = u64::from_be_bytes(value_bytes[8..16].try_into().unwrap());
-                let timestamp = i64::from_be_bytes(value_bytes[16..24].try_into().unwrap());
-                let payload_len = u32::from_be_bytes(value_bytes[24..28].try_into().unwrap()) as usize;
-                let payload = value_bytes[28..28 + payload_len].to_vec();
-
-                // Verify the key matches (sanity check)
-                if entry_seq != seq {
-                    return Err(WalReadError::KeyMismatch { requested: seq, found: entry_seq });
-                }
-
-                Ok(Some(WalEntry {
-                    slot: entry_slot,
-                    seq: entry_seq,
-                    payload,
-                    timestamp_unix_ms: timestamp,
-                }))
+                decode_entry(seq, &value_bytes).map(Some)
             }
             Ok(None) => {
                 // Seq not found - this could be:
@@ -341,14 +481,30 @@ impl WalQueue {
                 // 2. A hole/crash-created gap
                 // 3. Not yet written
 
-                // Check if this is truly EOF or a hole by looking ahead
-                let next_key = (seq + 1).to_be_bytes();
-                if let Ok(Some(_)) = self.events.get(&next_key) {
-                    // Next seq exists, so this seq is a hole/gap!
-                    return Err(WalReadError::Gap { seq });
+                // Scan forward for any valid future sequence before declaring EOF.
+                // This catches multi-sequence holes where seq+1 is also missing.
+                let start_key = seq.saturating_add(1).to_be_bytes();
+                let mut iter = self.events.range(start_key..);
+
+                while let Some(guard) = iter.next() {
+                    let (future_key, _) = guard
+                        .into_inner()
+                        .map_err(|e| WalReadError::Io(format!("Failed to scan WAL for future keys: {}", e)))?;
+                    let future_key_bytes = future_key.to_vec();
+
+                    match decode_u64_be(&future_key_bytes, "Corrupt WAL future key during gap scan")
+                    {
+                        Ok(future_seq) if future_seq > seq => {
+                            return Err(WalReadError::Gap { seq });
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            log::error!("{}", err);
+                        }
+                    }
                 }
 
-                // No next seq either - likely EOF
+                // No future seq found - this is true EOF for now
                 Ok(None)
             }
             Err(e) => Err(WalReadError::Io(format!("{}", e)))
@@ -422,20 +578,34 @@ impl WalQueue {
     }
 
     pub fn get_last_processed_slot(&self) -> u64 {
-        if let Ok(Some(slot_bytes)) = self.metadata.get(b"last_flushed_slot") {
-            if slot_bytes.len() == 8 {
-                let arr: [u8; 8] = slot_bytes.to_vec().try_into().unwrap();
-                return u64::from_be_bytes(arr);
+        match self.metadata.get(b"last_flushed_slot") {
+            Ok(Some(slot_bytes)) => match decode_u64_be(
+                slot_bytes.as_ref(),
+                "Corrupt last_flushed_slot metadata",
+            ) {
+                Ok(slot) => return slot,
+                Err(err) => log::error!("{}", err),
+            },
+            Ok(None) => {}
+            Err(err) => {
+                log::error!("Failed to read last_flushed_slot metadata: {}", err);
             }
         }
         0
     }
 
     pub fn get_last_processed_seq(&self) -> u64 {
-        if let Ok(Some(seq_bytes)) = self.metadata.get(b"last_flushed_seq") {
-            if seq_bytes.len() == 8 {
-                let arr: [u8; 8] = seq_bytes.to_vec().try_into().unwrap();
-                return u64::from_be_bytes(arr);
+        match self.metadata.get(b"last_flushed_seq") {
+            Ok(Some(seq_bytes)) => match decode_u64_be(
+                seq_bytes.as_ref(),
+                "Corrupt last_flushed_seq metadata",
+            ) {
+                Ok(seq) => return seq,
+                Err(err) => log::error!("{}", err),
+            },
+            Ok(None) => {}
+            Err(err) => {
+                log::error!("Failed to read last_flushed_seq metadata: {}", err);
             }
         }
         // CRITICAL: Return 0 to indicate "no checkpoint yet" (initial state).
@@ -459,71 +629,37 @@ impl WalQueue {
     /// Get the slot number for a given sequence number
     /// Returns None if the mapping doesn't exist (hole or never allocated)
     pub fn get_slot_for_seq(&self, seq: u64) -> Option<u64> {
-        let seq_key = format!("seq2slot_{}", seq);
-        self.metadata.get(seq_key.as_bytes()).ok().flatten().and_then(|bytes| {
-            if bytes.len() == 8 {
-                let arr: [u8; 8] = bytes.to_vec().try_into().ok()?;
-                Some(u64::from_be_bytes(arr))
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Repair a hole in the WAL by writing data fetched from RPC.
-    /// This is called when the consumer detects a gap and fetches the missing data from RPC.
-    ///
-    /// Prefer push_raw_bytes() for hot-path writes to avoid unnecessary re-encode.
-    pub fn repair_hole(&self, seq: u64, slot: u64, update: &SubscribeUpdate) -> Result<(), String> {
-        // Create WAL entry with the fetched data (legacy path - re-encodes)
-        let entry = WalEntry::from_update(slot, seq, update);
-
-        // Serialize entry to bytes
-        let mut buffer = Vec::with_capacity(28 + entry.payload.len());
-        buffer.extend_from_slice(&entry.slot.to_be_bytes());
-        buffer.extend_from_slice(&entry.seq.to_be_bytes());
-        buffer.extend_from_slice(&entry.timestamp_unix_ms.to_be_bytes());
-        buffer.extend_from_slice(&(entry.payload.len() as u32).to_be_bytes());
-        buffer.extend_from_slice(&entry.payload);
-
-        // Write the repaired entry to fill the hole
-        self.events.insert(seq.to_be_bytes(), buffer)
-            .map_err(|e| format!("Failed to repair hole at seq {}: {}", seq, e))?;
-
-        // CRITICAL: Also write seq→slot mapping for checkpoint recovery
-        // Without this, get_slot_for_seq() returns None for repaired entries,
-        // causing batch checkpoint failures and infinite re-processing
-        let seq_key = format!("seq2slot_{}", seq);
-        self.metadata.insert(seq_key.as_bytes(), slot.to_be_bytes())
-            .map_err(|e| format!("Failed to write seq→slot mapping for repaired hole: {}", e))?;
-
-        log::info!("Repaired WAL hole at seq {} with slot {} data fetched from RPC", seq, slot);
-
-        Ok(())
+        let seq_key = seq_to_slot_key(seq);
+        self.metadata
+            .get(&seq_key)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                let legacy = legacy_seq_to_slot_key(seq);
+                self.metadata.get(legacy.as_bytes()).ok().flatten()
+            })
+            .and_then(|bytes| match decode_u64_be(bytes.as_ref(), "Corrupt seq→slot metadata") {
+                Ok(slot) => Some(slot),
+                Err(err) => {
+                    log::error!("{}", err);
+                    None
+                }
+            })
     }
 
     /// Repair a hole in the WAL using pre-encoded protobuf bytes.
-    /// This avoids the unnecessary re-encode overhead of repair_hole().
     pub fn repair_hole_with_raw_bytes(&self, seq: u64, slot: u64, raw_protobuf_bytes: &[u8]) -> Result<(), String> {
         // Create WAL entry from raw bytes (no re-encode)
         let entry = WalEntry::from_raw_bytes(slot, seq, raw_protobuf_bytes);
 
-        // Serialize entry to bytes
-        let mut buffer = Vec::with_capacity(28 + entry.payload.len());
-        buffer.extend_from_slice(&entry.slot.to_be_bytes());
-        buffer.extend_from_slice(&entry.seq.to_be_bytes());
-        buffer.extend_from_slice(&entry.timestamp_unix_ms.to_be_bytes());
-        buffer.extend_from_slice(&(entry.payload.len() as u32).to_be_bytes());
-        buffer.extend_from_slice(&entry.payload);
+        let buffer = encode_entry(&entry);
 
         // Write the repaired entry to fill the hole
         self.events.insert(seq.to_be_bytes(), buffer)
             .map_err(|e| format!("Failed to repair hole at seq {}: {}", seq, e))?;
 
         // CRITICAL: Also write seq→slot mapping for checkpoint recovery
-        let seq_key = format!("seq2slot_{}", seq);
-        self.metadata.insert(seq_key.as_bytes(), slot.to_be_bytes())
-            .map_err(|e| format!("Failed to write seq→slot mapping for repaired hole: {}", e))?;
+        self.write_slot_mapping(seq, slot)?;
 
         log::info!("Repaired WAL hole at seq {} with slot {} data fetched from RPC (raw bytes)", seq, slot);
 
@@ -600,10 +736,10 @@ impl WalQueue {
 
             // CRITICAL: Also delete the seq→slot mapping from metadata to prevent unbounded growth
             // These mappings are only needed while the event is in the WAL
-            let seq = u64::from_be_bytes(key_bytes.try_into().unwrap());
-            let seq_key = format!("seq2slot_{}", seq);
-            self.metadata.remove(seq_key.as_bytes())
-                .map_err(|e| format!("Failed to delete seq→slot mapping during GC: {}", e))?;
+            match decode_u64_be(&key_bytes, "Corrupt WAL event key during GC") {
+                Ok(seq) => self.remove_slot_mapping(seq)?,
+                Err(err) => log::error!("{}", err),
+            }
 
             deleted_count += 1;
         }
@@ -649,6 +785,27 @@ impl WalQueue {
                 }
             }
         })
+    }
+
+    fn write_slot_mapping(&self, seq: u64, slot: u64) -> Result<(), String> {
+        let seq_key = seq_to_slot_key(seq);
+        self.metadata
+            .insert(&seq_key, slot.to_be_bytes())
+            .map_err(|e| format!("Failed to write seq→slot mapping: {}", e))
+    }
+
+    fn remove_slot_mapping(&self, seq: u64) -> Result<(), String> {
+        let seq_key = seq_to_slot_key(seq);
+        self.metadata
+            .remove(&seq_key)
+            .map_err(|e| format!("Failed to delete seq→slot mapping: {}", e))?;
+
+        let legacy_key = legacy_seq_to_slot_key(seq);
+        self.metadata
+            .remove(legacy_key.as_bytes())
+            .map_err(|e| format!("Failed to delete legacy seq→slot mapping: {}", e))?;
+
+        Ok(())
     }
 }
 
@@ -922,12 +1079,14 @@ mod tests {
         assert_eq!(slot_7, 7, "Seq 7 should map to slot 7");
         println!("✓ Seq 7 maps to slot 7: {}", slot_7);
 
-        // Phase 8: Test repair_hole
-        println!("\n=== Phase 8: Testing repair_hole() ===");
+        // Phase 8: Test repair_hole_with_raw_bytes
+        println!("\n=== Phase 8: Testing repair_hole_with_raw_bytes() ===");
         let repair_update = SubscribeUpdate {
             ..Default::default()
         };
-        wal_queue.repair_hole(6, 6, &repair_update).unwrap();
+        wal_queue
+            .repair_hole_with_raw_bytes(6, 6, &repair_update.encode_to_vec())
+            .unwrap();
         println!("✓ Repaired hole at seq 6");
 
         // Verify the repair worked
@@ -1036,6 +1195,60 @@ mod tests {
             }
             Err(other) => panic!("Expected Gap error, got: {}", other),
         }
+    }
+
+    #[test]
+    fn test_multi_sequence_gap_detects_future_entries() {
+        let temp_dir = tempdir().unwrap();
+        let wal_queue = WalQueue::new(temp_dir.path()).unwrap();
+
+        wal_queue.push_update(0, &SubscribeUpdate::default()).unwrap();
+        wal_queue
+            .repair_hole_with_raw_bytes(3, 3, &SubscribeUpdate::default().encode_to_vec())
+            .unwrap();
+
+        match wal_queue.read_from(0, 1) {
+            Err(WalReadError::Gap { seq }) => assert_eq!(seq, 1),
+            other => panic!("expected a gap at seq 1, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_corrupt_checkpoint_metadata_is_tolerated() {
+        let temp_dir = tempdir().unwrap();
+        let wal_queue = WalQueue::new(temp_dir.path()).unwrap();
+
+        wal_queue
+            .metadata
+            .insert(b"last_flushed_seq", b"bad")
+            .unwrap();
+        wal_queue
+            .metadata
+            .insert(b"last_flushed_slot", b"bad")
+            .unwrap();
+
+        assert_eq!(wal_queue.get_last_processed_seq(), 0);
+        assert_eq!(wal_queue.get_last_processed_slot(), 0);
+    }
+
+    #[test]
+    fn test_gc_tolerates_corrupt_event_keys() {
+        let temp_dir = tempdir().unwrap();
+        let wal_queue = WalQueue::with_config(
+            temp_dir.path(),
+            WalDurabilityMode::Relaxed,
+            100,
+        )
+        .unwrap();
+
+        for slot in 0..150 {
+            wal_queue.push_update(slot, &SubscribeUpdate::default()).unwrap();
+        }
+        wal_queue.mark_processed(149, 149).unwrap();
+        wal_queue.events.insert(b"bad-key", b"corrupt").unwrap();
+
+        let deleted = wal_queue.delete_processed_events().unwrap();
+        assert!(deleted > 0);
     }
 
     #[test]

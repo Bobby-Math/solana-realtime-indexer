@@ -26,6 +26,7 @@ pub struct PersistedBatch {
     // This ensures checkpoint updates happen even when batch has zero rows
     pub last_processed_slot: Option<i64>,
     pub last_observed_at_unix_ms: Option<i64>,
+    pub last_on_chain_block_time_ms: Option<i64>,
 }
 
 impl PersistedBatch {
@@ -67,26 +68,32 @@ impl Type1Decoder {
             custom_rows: Vec::new(),
             last_processed_slot: None,
             last_observed_at_unix_ms: None,
+            last_on_chain_block_time_ms: None,
         };
 
         for event in batch.events {
-            // Track slot and timestamp for ALL events (including those that don't produce rows)
-            // This ensures checkpoint updates happen even when batch has zero rows
+            // Track slot, arrival time, and on-chain block time separately.
             let event_info = match &event {
                 GeyserEvent::AccountUpdate(u) => {
-                    Some((u.slot as i64, block_time_cache.get(u.slot).unwrap_or(u.timestamp_unix_ms)))
+                    Some((u.slot as i64, u.timestamp_unix_ms, block_time_cache.get(u.slot)))
                 }
                 GeyserEvent::Transaction(u) => {
-                    Some((u.slot as i64, block_time_cache.get(u.slot).unwrap_or(u.timestamp_unix_ms)))
+                    Some((u.slot as i64, u.timestamp_unix_ms, block_time_cache.get(u.slot)))
                 }
-                GeyserEvent::SlotUpdate(u) => Some((u.slot as i64, u.timestamp_unix_ms)),
-                GeyserEvent::BlockMeta(u) => Some((u.slot as i64, u.block_time_ms)),
+                GeyserEvent::SlotUpdate(u) => Some((u.slot as i64, u.timestamp_unix_ms, None)),
+                GeyserEvent::BlockMeta(u) => {
+                    Some((u.slot as i64, u.observed_at_unix_ms, Some(u.block_time_ms)))
+                }
             };
 
-            // Update tracked slot/timestamp (use max to get latest)
-            if let Some((slot, timestamp)) = event_info {
+            if let Some((slot, observed_at, on_chain_block_time)) = event_info {
                 persisted.last_processed_slot = persisted.last_processed_slot.max(Some(slot));
-                persisted.last_observed_at_unix_ms = persisted.last_observed_at_unix_ms.max(Some(timestamp));
+                persisted.last_observed_at_unix_ms =
+                    persisted.last_observed_at_unix_ms.max(Some(observed_at));
+                persisted.last_on_chain_block_time_ms = max_optional(
+                    persisted.last_on_chain_block_time_ms,
+                    on_chain_block_time,
+                );
             }
 
             for decoder in custom_decoders.iter_mut() {
@@ -154,6 +161,14 @@ impl Type1Decoder {
 impl Default for Type1Decoder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn max_optional(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
     }
 }
 

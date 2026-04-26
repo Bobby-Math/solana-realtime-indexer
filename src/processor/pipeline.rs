@@ -18,6 +18,7 @@ pub struct PipelineReport {
     pub flush_count: u64,
     pub last_processed_slot: Option<i64>,
     pub last_observed_at_unix_ms: Option<i64>,
+    pub last_on_chain_block_time_ms: Option<i64>,
     pub account_rows_written: u64,
     pub transaction_rows_written: u64,
     pub slot_rows_written: u64,
@@ -125,6 +126,10 @@ fn apply_batch(report: &mut PipelineReport, batch: PersistedBatch, result: Stora
     report.last_observed_at_unix_ms = max_optional(
         report.last_observed_at_unix_ms,
         batch.latest_timestamp_unix_ms(),
+    );
+    report.last_on_chain_block_time_ms = max_optional(
+        report.last_on_chain_block_time_ms,
+        batch.last_on_chain_block_time_ms,
     );
     report.account_rows_written += batch.account_rows.len() as u64;
     report.transaction_rows_written += batch.transaction_rows.len() as u64;
@@ -259,11 +264,13 @@ mod tests {
             events: vec![
                 GeyserEvent::BlockMeta(BlockMetaUpdate {
                     slot: 100,
+                    observed_at_unix_ms: 1_710_000_000_010,
                     block_time_ms: 1_710_000_000_000,
                     block_height: Some(1000),
                 }),
                 GeyserEvent::BlockMeta(BlockMetaUpdate {
                     slot: 101,
+                    observed_at_unix_ms: 1_710_000_000_120,
                     block_time_ms: 1_710_000_000_100,
                     block_height: Some(1001),
                 }),
@@ -280,7 +287,8 @@ mod tests {
 
         // Verify checkpoint information is tracked
         assert_eq!(persisted.last_processed_slot, Some(101));
-        assert_eq!(persisted.last_observed_at_unix_ms, Some(1_710_000_000_100));
+        assert_eq!(persisted.last_observed_at_unix_ms, Some(1_710_000_000_120));
+        assert_eq!(persisted.last_on_chain_block_time_ms, Some(1_710_000_000_100));
 
         // Verify checkpoint_update_for_batch returns Some (not None)
         let checkpoint = super::checkpoint_update_for_batch(&persisted);
@@ -288,6 +296,6 @@ mod tests {
 
         let checkpoint = checkpoint.unwrap();
         assert_eq!(checkpoint.last_processed_slot, Some(101));
-        assert_eq!(checkpoint.last_observed_at_unix_ms, 1_710_000_000_100);
+        assert_eq!(checkpoint.last_observed_at_unix_ms, 1_710_000_000_120);
     }
 }

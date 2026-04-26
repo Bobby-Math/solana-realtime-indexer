@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use crate::processor::decoder::PersistedBatch;
@@ -17,17 +18,16 @@ impl Default for RetentionPolicy {
 }
 
 impl RetentionPolicy {
-    /// Read retention policy from environment variable RETENTION_MAX_AGE_SECS
-    /// Defaults to 3600 seconds (1 hour) if not set or invalid
-    pub fn from_env() -> Self {
-        let max_age_secs = std::env::var("RETENTION_MAX_AGE_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(3600);
-
+    pub fn from_max_age_secs(max_age_secs: u64) -> Self {
         Self {
             max_age: Duration::from_secs(max_age_secs),
         }
+    }
+
+    /// Read retention policy from environment variable RETENTION_MAX_AGE_SECS
+    /// Defaults to 3600 seconds (1 hour) if not set or invalid
+    pub fn from_env() -> Self {
+        Self::from_max_age_secs(parse_max_age_secs(std::env::var("RETENTION_MAX_AGE_SECS").ok().as_deref()))
     }
 }
 
@@ -51,10 +51,10 @@ pub struct StoreSnapshot {
 #[derive(Debug, Clone)]
 pub struct Type1Store {
     pub retention_policy: RetentionPolicy,
-    pub account_rows: Vec<AccountUpdateRow>,
-    pub transaction_rows: Vec<TransactionRow>,
-    pub slot_rows: Vec<SlotRow>,
-    pub custom_rows: Vec<CustomDecodedRow>,
+    pub account_rows: VecDeque<AccountUpdateRow>,
+    pub transaction_rows: VecDeque<TransactionRow>,
+    pub slot_rows: VecDeque<SlotRow>,
+    pub custom_rows: VecDeque<CustomDecodedRow>,
     pub metrics: StoreMetrics,
 }
 
@@ -62,10 +62,10 @@ impl Type1Store {
     pub fn new(retention_policy: RetentionPolicy) -> Self {
         Self {
             retention_policy,
-            account_rows: Vec::new(),
-            transaction_rows: Vec::new(),
-            slot_rows: Vec::new(),
-            custom_rows: Vec::new(),
+            account_rows: VecDeque::new(),
+            transaction_rows: VecDeque::new(),
+            slot_rows: VecDeque::new(),
+            custom_rows: VecDeque::new(),
             metrics: StoreMetrics::default(),
         }
     }
@@ -137,13 +137,22 @@ impl Type1Store {
     }
 }
 
-fn prune_with_metrics<T, F>(rows: &mut Vec<T>, cutoff: i64, metric: &mut u64, timestamp: F)
+fn parse_max_age_secs(value: Option<&str>) -> u64 {
+    value.and_then(|s| s.parse::<u64>().ok()).unwrap_or(3600)
+}
+
+fn prune_with_metrics<T, F>(rows: &mut VecDeque<T>, cutoff: i64, metric: &mut u64, timestamp: F)
 where
     F: Fn(&T) -> i64,
 {
-    let before = rows.len();
-    rows.retain(|row| timestamp(row) >= cutoff);
-    *metric += (before - rows.len()) as u64;
+    while rows
+        .front()
+        .map(|row| timestamp(row) < cutoff)
+        .unwrap_or(false)
+    {
+        rows.pop_front();
+        *metric += 1;
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +185,7 @@ mod tests {
             custom_rows: vec![],
             last_processed_slot: Some(1),
             last_observed_at_unix_ms: Some(100),
+            last_on_chain_block_time_ms: Some(100),
         };
         store.apply_batch(first_batch);
 
@@ -207,6 +217,7 @@ mod tests {
             }],
             last_processed_slot: Some(2),
             last_observed_at_unix_ms: Some(125),
+            last_on_chain_block_time_ms: Some(125),
         };
 
         let snapshot = store.apply_batch(second_batch);
@@ -219,23 +230,9 @@ mod tests {
     }
 
     #[test]
-    fn retention_policy_from_env_reads_variable() {
-        // Test default behavior (no env var set)
-        std::env::remove_var("RETENTION_MAX_AGE_SECS");
-        let policy = RetentionPolicy::from_env();
-        assert_eq!(policy.max_age.as_secs(), 3600, "Should default to 3600 seconds");
-
-        // Test custom value
-        std::env::set_var("RETENTION_MAX_AGE_SECS", "7200");
-        let policy = RetentionPolicy::from_env();
-        assert_eq!(policy.max_age.as_secs(), 7200, "Should read custom value");
-
-        // Test invalid value (falls back to default)
-        std::env::set_var("RETENTION_MAX_AGE_SECS", "invalid");
-        let policy = RetentionPolicy::from_env();
-        assert_eq!(policy.max_age.as_secs(), 3600, "Should fallback to default on invalid input");
-
-        // Clean up
-        std::env::remove_var("RETENTION_MAX_AGE_SECS");
+    fn retention_policy_parses_seconds_without_mutating_process_env() {
+        assert_eq!(super::parse_max_age_secs(None), 3600);
+        assert_eq!(super::parse_max_age_secs(Some("7200")), 7200);
+        assert_eq!(super::parse_max_age_secs(Some("invalid")), 3600);
     }
 }

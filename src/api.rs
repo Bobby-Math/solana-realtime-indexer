@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use axum::{routing::{get, post}, Router};
 
@@ -9,7 +9,7 @@ pub mod rest;
 pub mod self_service;
 pub mod websocket;
 
-pub type SharedApiState = Arc<Mutex<rest::ApiSnapshot>>;
+pub type SharedApiState = Arc<RwLock<rest::ApiSnapshot>>;
 
 pub fn router_with_state(state: SharedApiState) -> Router {
     Router::new()

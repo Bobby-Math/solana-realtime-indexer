@@ -43,6 +43,7 @@ pub struct SlotUpdate {
 #[derive(Debug, Clone)]
 pub struct BlockMetaUpdate {
     pub slot: u64,
+    pub observed_at_unix_ms: i64,
     pub block_time_ms: i64,
     pub block_height: Option<u64>,
 }
@@ -136,6 +137,7 @@ pub fn decode_subscribe_update(update: &SubscribeUpdate, timestamp_unix_ms: i64)
 
             Some(GeyserEvent::BlockMeta(BlockMetaUpdate {
                 slot: block_meta.slot,
+                observed_at_unix_ms: timestamp_unix_ms,
                 block_time_ms,
                 block_height: block_meta.block_height.map(|bh| bh.block_height),
             }))

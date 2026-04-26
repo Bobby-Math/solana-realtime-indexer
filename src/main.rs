@@ -19,9 +19,9 @@ use solana_realtime_indexer::processor::sink::{
 use solana_realtime_indexer::processor::store::{RetentionPolicy, Type1Store};
 use solana_realtime_indexer::PROJECT_NAME;
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
-type SharedSnapshot = Arc<Mutex<ApiSnapshot>>;
+type SharedSnapshot = Arc<RwLock<ApiSnapshot>>;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -55,15 +55,13 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
               merged_subscription.include_slots,
               merged_subscription.include_blocks_meta);
 
-    // Convert merged [u8; 32] pubkeys to base58 strings for SubscriptionFilter
+    // Reuse the already-decoded 32-byte pubkeys directly.
     let mut filters = Vec::new();
     for program_id in &merged_subscription.program_ids {
-        let program_id_str = bs58::encode(program_id).into_string();
-        filters.push(SubscriptionFilter::program(program_id_str).expect("valid base58"));
+        filters.push(SubscriptionFilter::program_bytes(*program_id));
     }
     for account in &merged_subscription.account_pubkeys {
-        let account_str = bs58::encode(account).into_string();
-        filters.push(SubscriptionFilter::account(account_str).expect("valid base58"));
+        filters.push(SubscriptionFilter::account_bytes(*account));
     }
     if merged_subscription.include_slots {
         filters.push(SubscriptionFilter::slots());
@@ -99,7 +97,7 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
             Ok(pool) => {
                 log::info!("✅ Shared database pool connected (max {} connections)", config.db_pool_max_connections);
                 // Attach pool to API state
-                let mut state = api_state.lock().await;
+                let mut state = api_state.write().await;
                 *state = state.clone().with_pool(pool.clone());
                 Some(Arc::new(pool))
             }
@@ -197,7 +195,7 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
                 let wal_unprocessed = wal_queue.get_unprocessed_count();
 
                 // Update API state with latest metrics
-                let mut state = api_state.lock().await;
+                let mut state = api_state.write().await;
                 state.wal_unprocessed_count = wal_unprocessed;
 
                 // Channel utilization is no longer relevant - WAL is the only buffer
@@ -285,7 +283,7 @@ async fn serve_api(
 }
 
 async fn initial_api_state(config: &Config, storage_mode: &str) -> SharedSnapshot {
-    Arc::new(Mutex::new(ApiSnapshot::from_report(
+    Arc::new(RwLock::new(ApiSnapshot::from_report(
         PROJECT_NAME,
         storage_mode,
         config.bind_address.clone(),

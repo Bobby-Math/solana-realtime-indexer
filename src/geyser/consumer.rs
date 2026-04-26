@@ -1,6 +1,8 @@
 use std::sync::mpsc::{SendError, SyncSender};
 
 use crate::geyser::decoder::{AccountUpdate, GeyserEvent, SlotUpdate, TransactionUpdate};
+use helius_laserstream::grpc::SubscribeUpdate;
+use helius_laserstream::grpc::subscribe_update::UpdateOneof;
 
 #[derive(Debug, Clone)]
 pub struct GeyserConfig {
@@ -23,8 +25,8 @@ impl GeyserConfig {
 /// The base58 string is parsed once at construction time, not on every event match.
 #[derive(Debug, Clone)]
 pub enum SubscriptionFilter {
-    Program(String, Vec<u8>),  // (base58_string, parsed_bytes)
-    Account(String, Vec<u8>),   // (base58_string, parsed_bytes)
+    Program([u8; 32]),
+    Account([u8; 32]),
     Slots,
     Blocks,
 }
@@ -34,20 +36,22 @@ impl SubscriptionFilter {
     /// Returns Err if the base58 string is invalid.
     pub fn program(program_id: String) -> Result<Self, String> {
         let trimmed = program_id.trim();
-        bs58::decode(trimmed)
-            .into_vec()
-            .map(|bytes| SubscriptionFilter::Program(program_id.clone(), bytes))
-            .map_err(|e| format!("Invalid base58 for program '{}': {}", trimmed, e))
+        decode_pubkey(trimmed, "program").map(SubscriptionFilter::Program)
     }
 
     /// Create a new Account filter, validating the base58 string at construction time.
     /// Returns Err if the base58 string is invalid.
     pub fn account(pubkey: String) -> Result<Self, String> {
         let trimmed = pubkey.trim();
-        bs58::decode(trimmed)
-            .into_vec()
-            .map(|bytes| SubscriptionFilter::Account(pubkey.clone(), bytes))
-            .map_err(|e| format!("Invalid base58 for account '{}': {}", trimmed, e))
+        decode_pubkey(trimmed, "account").map(SubscriptionFilter::Account)
+    }
+
+    pub fn program_bytes(program_id: [u8; 32]) -> Self {
+        SubscriptionFilter::Program(program_id)
+    }
+
+    pub fn account_bytes(pubkey: [u8; 32]) -> Self {
+        SubscriptionFilter::Account(pubkey)
     }
 
     /// Create a new Slots filter.
@@ -58,6 +62,59 @@ impl SubscriptionFilter {
     /// Create a new Blocks filter.
     pub fn blocks() -> Self {
         SubscriptionFilter::Blocks
+    }
+
+    pub fn matches_update(&self, update: &SubscribeUpdate) -> bool {
+        match (self, &update.update_oneof) {
+            (SubscriptionFilter::Program(program_bytes), Some(UpdateOneof::Account(account_update))) => {
+                account_update
+                    .account
+                    .as_ref()
+                    .map(|account| account.owner.as_slice() == program_bytes)
+                    .unwrap_or(false)
+            }
+            (SubscriptionFilter::Program(program_bytes), Some(UpdateOneof::Transaction(tx_update))) => {
+                tx_update
+                    .transaction
+                    .as_ref()
+                    .and_then(|tx_info| tx_info.transaction.as_ref())
+                    .and_then(|tx| tx.message.as_ref())
+                    .map(|message| {
+                        message.instructions.iter().any(|instruction| {
+                            message
+                                .account_keys
+                                .get(instruction.program_id_index as usize)
+                                .map(|key| key.as_slice() == program_bytes)
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            }
+            (SubscriptionFilter::Account(account_bytes), Some(UpdateOneof::Account(account_update))) => {
+                account_update
+                    .account
+                    .as_ref()
+                    .map(|account| account.pubkey.as_slice() == account_bytes)
+                    .unwrap_or(false)
+            }
+            (SubscriptionFilter::Account(account_bytes), Some(UpdateOneof::Transaction(tx_update))) => {
+                tx_update
+                    .transaction
+                    .as_ref()
+                    .and_then(|tx_info| tx_info.transaction.as_ref())
+                    .and_then(|tx| tx.message.as_ref())
+                    .map(|message| {
+                        message
+                            .account_keys
+                            .iter()
+                            .any(|key| key.as_slice() == account_bytes)
+                    })
+                    .unwrap_or(false)
+            }
+            (SubscriptionFilter::Slots, Some(UpdateOneof::Slot(_))) => true,
+            (SubscriptionFilter::Blocks, Some(UpdateOneof::BlockMeta(_))) => true,
+            _ => false,
+        }
     }
 }
 
@@ -165,20 +222,23 @@ impl GeyserConsumer {
 impl SubscriptionFilter {
     fn matches(&self, event: &GeyserEvent) -> bool {
         match (self, event) {
-            (SubscriptionFilter::Program(_program_str, program_bytes), GeyserEvent::AccountUpdate(update)) => {
-                update.owner == *program_bytes
+            (SubscriptionFilter::Program(program_bytes), GeyserEvent::AccountUpdate(update)) => {
+                update.owner.as_slice() == program_bytes
             }
-            (SubscriptionFilter::Program(_program_str, program_bytes), GeyserEvent::Transaction(update)) => {
+            (SubscriptionFilter::Program(program_bytes), GeyserEvent::Transaction(update)) => {
                 update
                     .program_ids
                     .iter()
-                    .any(|id_bytes| id_bytes == program_bytes)
+                    .any(|id_bytes| id_bytes.as_slice() == program_bytes)
             }
-            (SubscriptionFilter::Account(_account_str, account_bytes), GeyserEvent::AccountUpdate(update)) => {
-                update.pubkey == *account_bytes
+            (SubscriptionFilter::Account(account_bytes), GeyserEvent::AccountUpdate(update)) => {
+                update.pubkey.as_slice() == account_bytes
             }
-            (SubscriptionFilter::Account(_account_str, account_bytes), GeyserEvent::Transaction(update)) => {
-                update.accounts.iter().any(|acc| acc == account_bytes)
+            (SubscriptionFilter::Account(account_bytes), GeyserEvent::Transaction(update)) => {
+                update
+                    .accounts
+                    .iter()
+                    .any(|acc| acc.as_slice() == account_bytes)
             }
             (SubscriptionFilter::Slots, GeyserEvent::SlotUpdate(_)) => true,
             (SubscriptionFilter::Blocks, GeyserEvent::BlockMeta(_)) => true,
@@ -186,6 +246,16 @@ impl SubscriptionFilter {
             _ => false,
         }
     }
+}
+
+fn decode_pubkey(value: &str, kind: &str) -> Result<[u8; 32], String> {
+    let bytes = bs58::decode(value)
+        .into_vec()
+        .map_err(|e| format!("Invalid base58 for {} '{}': {}", kind, value, e))?;
+
+    bytes
+        .try_into()
+        .map_err(|_| format!("Invalid {} '{}': expected 32 decoded bytes", kind, value))
 }
 
 #[cfg(test)]

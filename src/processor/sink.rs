@@ -98,7 +98,7 @@ impl StorageSink for DryRunStorageSink {
     async fn write_gap_repaired_slot(
         &mut self,
         slot: u64,
-        slot_row: crate::processor::schema::SlotRow,
+        _slot_row: crate::processor::schema::SlotRow,
         transactions: Vec<crate::processor::schema::TransactionRow>,
     ) -> Result<(), StorageError> {
         // Dry run: just log what would be written
@@ -253,6 +253,7 @@ mod tests {
             custom_rows: vec![],
             last_processed_slot: Some(10),
             last_observed_at_unix_ms: Some(1_710_000_000_000),
+            last_on_chain_block_time_ms: Some(1_710_000_000_000),
         };
 
         let result = sink

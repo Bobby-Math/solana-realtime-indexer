@@ -6,7 +6,7 @@ use futures::pin_mut;
 use prost::Message;
 
 use crate::geyser::consumer::GeyserConfig;
-use crate::geyser::decoder::{GeyserEvent, decode_subscribe_update};
+use crate::geyser::consumer::SubscriptionFilter;
 use crate::geyser::wal_queue::WalQueue;
 use crate::geyser::reconnect::ReconnectPolicy;
 
@@ -161,33 +161,28 @@ impl GeyserClient {
 
                 match maybe_data {
                     Ok(Some(Ok(data))) => {
-                        // Extract slot for WAL ordering and convert to GeyserEvent for filtering
+                        // Extract slot for WAL ordering and filter directly on the decoded protobuf.
                         let slot = self.extract_slot(&data);
-                        let timestamp_unix_ms = chrono::Utc::now().timestamp_millis();
-                        if let Some(event) = decode_subscribe_update(&data, timestamp_unix_ms) {
-                            // Apply client-side filtering to ensure event matches configured filters
-                            if !self.event_matches_filters(&event) {
-                                log::trace!("Event filtered out by client-side filters: {:?}", event);
-                                continue;
-                            }
+                        if !self.update_matches_filters(&data) {
+                            log::trace!("Event filtered out by client-side filters");
+                            continue;
+                        }
 
-                            // Encode once and write raw bytes to WAL - eliminates re-encode overhead
-                            let raw_protobuf_bytes = data.encode_to_vec();
-                            if let Err(e) = wal_queue.push_raw_bytes(slot, &raw_protobuf_bytes) {
-                                log::error!("WAL write error: {}, stopping Geyser client", e);
-                                break;
-                            }
-                            events_processed += 1;
+                        let raw_protobuf_bytes = data.encode_to_vec();
+                        if let Err(e) = wal_queue.push_raw_bytes(slot, &raw_protobuf_bytes) {
+                            log::error!("WAL write error: {}, stopping Geyser client", e);
+                            break;
+                        }
+                        events_processed += 1;
 
-                            // Log progress every 5 seconds
-                            let now = std::time::Instant::now();
-                            if now.duration_since(last_log_time) >= log_interval {
-                                let elapsed = now.duration_since(start_time);
-                                let events_per_sec = events_processed as f64 / elapsed.as_secs_f64();
-                                log::info!("📊 Progress: {:.1}s elapsed, {} events processed ({:.1} events/sec)",
-                                          elapsed.as_secs_f64(), events_processed, events_per_sec);
-                                last_log_time = now;
-                            }
+                        // Log progress every 5 seconds
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_log_time) >= log_interval {
+                            let elapsed = now.duration_since(start_time);
+                            let events_per_sec = events_processed as f64 / elapsed.as_secs_f64();
+                            log::info!("📊 Progress: {:.1}s elapsed, {} events processed ({:.1} events/sec)",
+                                      elapsed.as_secs_f64(), events_processed, events_per_sec);
+                            last_log_time = now;
                         }
                     }
                     Ok(Some(Err(e))) => {
@@ -210,33 +205,28 @@ impl GeyserClient {
                 // No timeout - run forever
                 match stream.next().await {
                     Some(Ok(data)) => {
-                        // Extract slot for WAL ordering and convert to GeyserEvent for filtering
+                        // Extract slot for WAL ordering and filter directly on the decoded protobuf.
                         let slot = self.extract_slot(&data);
-                        let timestamp_unix_ms = chrono::Utc::now().timestamp_millis();
-                        if let Some(event) = decode_subscribe_update(&data, timestamp_unix_ms) {
-                            // Apply client-side filtering to ensure event matches configured filters
-                            if !self.event_matches_filters(&event) {
-                                log::trace!("Event filtered out by client-side filters: {:?}", event);
-                                continue;
-                            }
+                        if !self.update_matches_filters(&data) {
+                            log::trace!("Event filtered out by client-side filters");
+                            continue;
+                        }
 
-                            // Encode once and write raw bytes to WAL - eliminates re-encode overhead
-                            let raw_protobuf_bytes = data.encode_to_vec();
-                            if let Err(e) = wal_queue.push_raw_bytes(slot, &raw_protobuf_bytes) {
-                                log::error!("WAL write error: {}, stopping Geyser client", e);
-                                break;
-                            }
-                            events_processed += 1;
+                        let raw_protobuf_bytes = data.encode_to_vec();
+                        if let Err(e) = wal_queue.push_raw_bytes(slot, &raw_protobuf_bytes) {
+                            log::error!("WAL write error: {}, stopping Geyser client", e);
+                            break;
+                        }
+                        events_processed += 1;
 
-                            // Log progress every 5 seconds
-                            let now = std::time::Instant::now();
-                            if now.duration_since(last_log_time) >= log_interval {
-                                let elapsed = now.duration_since(start_time);
-                                let events_per_sec = events_processed as f64 / elapsed.as_secs_f64();
-                                log::info!("📊 Progress: {:.1}s elapsed, {} events processed ({:.1} events/sec)",
-                                          elapsed.as_secs_f64(), events_processed, events_per_sec);
-                                last_log_time = now;
-                            }
+                        // Log progress every 5 seconds
+                        let now = std::time::Instant::now();
+                        if now.duration_since(last_log_time) >= log_interval {
+                            let elapsed = now.duration_since(start_time);
+                            let events_per_sec = events_processed as f64 / elapsed.as_secs_f64();
+                            log::info!("📊 Progress: {:.1}s elapsed, {} events processed ({:.1} events/sec)",
+                                      elapsed.as_secs_f64(), events_processed, events_per_sec);
+                            last_log_time = now;
                         }
                     }
                     Some(Err(e)) => {
@@ -268,7 +258,6 @@ impl GeyserClient {
     }
 
     fn build_subscription_request(&self) -> Result<SubscribeRequest, GeyserClientError> {
-        use crate::geyser::consumer::SubscriptionFilter;
         use helius_laserstream::grpc::{SubscribeRequestFilterAccounts, SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions};
         use std::collections::HashMap;
 
@@ -285,11 +274,11 @@ impl GeyserClient {
 
         for filter in &self.config.filters {
             match filter {
-                SubscriptionFilter::Account(pubkey, _bytes) => {
-                    account_pubkeys.push(pubkey.clone());
+                SubscriptionFilter::Account(bytes) => {
+                    account_pubkeys.push(bs58::encode(bytes).into_string());
                 }
-                SubscriptionFilter::Program(program_id, _bytes) => {
-                    program_ids.push(program_id.clone());
+                SubscriptionFilter::Program(bytes) => {
+                    program_ids.push(bs58::encode(bytes).into_string());
                 }
                 SubscriptionFilter::Slots => {
                     has_slot_filters = true;
@@ -371,37 +360,21 @@ impl GeyserClient {
         Ok(request)
     }
 
-    fn event_matches_filters(&self, event: &GeyserEvent) -> bool {
-        use crate::geyser::consumer::SubscriptionFilter;
-
-        // If no filters configured, accept all events
+    fn update_matches_filters(&self, update: &SubscribeUpdate) -> bool {
         if self.config.filters.is_empty() {
-            return true;
+            return matches!(
+                update.update_oneof,
+                Some(UpdateOneof::Account(_))
+                    | Some(UpdateOneof::Transaction(_))
+                    | Some(UpdateOneof::Slot(_))
+                    | Some(UpdateOneof::BlockMeta(_))
+            );
         }
 
-        // Check if any filter matches this event
-        // Note: Filters are pre-validated and contain parsed bytes, no parsing needed here
-        self.config.filters.iter().any(|filter| match (filter, event) {
-            (SubscriptionFilter::Program(_program_str, program_bytes), GeyserEvent::AccountUpdate(update)) => {
-                update.owner == *program_bytes
-            }
-            (SubscriptionFilter::Program(_program_str, program_bytes), GeyserEvent::Transaction(update)) => {
-                update
-                    .program_ids
-                    .iter()
-                    .any(|id_bytes| id_bytes == program_bytes)
-            }
-            (SubscriptionFilter::Account(_account_str, account_bytes), GeyserEvent::AccountUpdate(update)) => {
-                update.pubkey == *account_bytes
-            }
-            (SubscriptionFilter::Account(_account_str, account_bytes), GeyserEvent::Transaction(update)) => {
-                update.accounts.iter().any(|acc| acc == account_bytes)
-            }
-            (SubscriptionFilter::Slots, GeyserEvent::SlotUpdate(_)) => true,
-            (SubscriptionFilter::Blocks, GeyserEvent::BlockMeta(_)) => true,
-            (SubscriptionFilter::Blocks, GeyserEvent::SlotUpdate(_)) => false,
-            _ => false,
-        })
+        self.config
+            .filters
+            .iter()
+            .any(|filter| filter.matches_update(update))
     }
 
     fn extract_slot(&self, data: &SubscribeUpdate) -> u64 {
@@ -417,4 +390,3 @@ impl GeyserClient {
     }
 
 }
-
