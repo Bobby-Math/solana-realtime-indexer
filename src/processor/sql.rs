@@ -1,7 +1,6 @@
 use crate::processor::decoder::PersistedBatch;
 use crate::processor::schema::{AccountUpdateRow, CustomDecodedRow, SlotRow, TransactionRow};
 use crate::processor::store::RetentionPolicy;
-use base64::Engine;
 use sqlx::Transaction;
 use chrono::{TimeZone, Utc};
 
@@ -103,6 +102,7 @@ pub async fn execute_transactions_insert(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     rows: &[TransactionRow],
 ) -> Result<(), sqlx::Error> {
+    // ── Part 1: flat transaction rows (no program_ids) ─────────────────────────
     let timestamps: Vec<chrono::DateTime<Utc>> = rows
         .iter()
         .map(|row| to_utc_timestamp(row.timestamp_unix_ms))
@@ -111,21 +111,6 @@ pub async fn execute_transactions_insert(
     let signatures: Vec<Vec<u8>> = rows.iter().map(|row| row.signature.clone()).collect();
     let fees: Vec<i64> = rows.iter().map(|row| row.fee).collect();
     let successes: Vec<bool> = rows.iter().map(|row| row.success).collect();
-    let program_ids_json: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|row| {
-            serde_json::Value::Array(
-                row.program_ids
-                    .iter()
-                    .map(|program_id| {
-                        serde_json::Value::String(
-                            base64::engine::general_purpose::STANDARD.encode(program_id),
-                        )
-                    })
-                    .collect(),
-            )
-        })
-        .collect();
     let log_messages_json: Vec<serde_json::Value> = rows
         .iter()
         .map(|row| {
@@ -140,22 +125,11 @@ pub async fn execute_transactions_insert(
         .collect();
 
     sqlx::query(
-        "INSERT INTO transactions (timestamp, slot, signature, fee, success, program_ids, log_messages)
-         SELECT
-             $1[idx],
-             $2[idx],
-             $3[idx],
-             $4[idx],
-             $5[idx],
-             ARRAY(
-                 SELECT decode(program_id_b64, 'base64')
-                 FROM jsonb_array_elements_text($6[idx]) AS program_id(program_id_b64)
-             ),
-             ARRAY(
-                 SELECT log_message
-                 FROM jsonb_array_elements_text($7[idx]) AS log_message(log_message)
-             )
-         FROM generate_subscripts($1::timestamptz[], 1) AS subs(idx)
+        "INSERT INTO transactions (timestamp, slot, signature, fee, success, log_messages)
+         SELECT * FROM UNNEST(
+             $1::timestamptz[], $2::bigint[], $3::bytea[],
+             $4::bigint[],      $5::bool[],   $6::jsonb[]
+         )
          ON CONFLICT (timestamp, signature) DO NOTHING"
     )
     .bind(&timestamps)
@@ -163,10 +137,41 @@ pub async fn execute_transactions_insert(
     .bind(&signatures)
     .bind(&fees)
     .bind(&successes)
-    .bind(&program_ids_json)
     .bind(&log_messages_json)
     .execute(&mut **transaction)
     .await?;
+
+    // ── Part 2: exploded program_id rows (one per program_id) ───────────────────
+    let mut pid_timestamps: Vec<chrono::DateTime<Utc>> = Vec::new();
+    let mut pid_signatures: Vec<Vec<u8>> = Vec::new();
+    let mut pid_program_ids: Vec<Vec<u8>> = Vec::new();
+    let mut pid_positions: Vec<i16> = Vec::new();
+
+    for row in rows {
+        let ts = to_utc_timestamp(row.timestamp_unix_ms)?;
+        for (pos, program_id) in row.program_ids.iter().enumerate() {
+            pid_timestamps.push(ts);
+            pid_signatures.push(row.signature.clone());
+            pid_program_ids.push(program_id.clone());
+            pid_positions.push(pos as i16);
+        }
+    }
+
+    if !pid_program_ids.is_empty() {
+        sqlx::query(
+            "INSERT INTO transaction_program_ids (timestamp, signature, program_id, position)
+             SELECT * FROM UNNEST(
+                 $1::timestamptz[], $2::bytea[], $3::bytea[], $4::smallint[]
+             )
+             ON CONFLICT DO NOTHING"
+        )
+        .bind(&pid_timestamps)
+        .bind(&pid_signatures)
+        .bind(&pid_program_ids)
+        .bind(&pid_positions)
+        .execute(&mut **transaction)
+        .await?;
+    }
 
     Ok(())
 }
@@ -251,6 +256,10 @@ async fn execute_retention_deletes(
         .bind(cutoff)
         .execute(&mut **transaction)
         .await?;
+    sqlx::query("DELETE FROM transaction_program_ids WHERE timestamp < $1")
+        .bind(cutoff)
+        .execute(&mut **transaction)
+        .await?;
     sqlx::query("DELETE FROM custom_decoded_events WHERE timestamp < $1")
         .bind(cutoff)
         .execute(&mut **transaction)
@@ -260,7 +269,7 @@ async fn execute_retention_deletes(
         .execute(&mut **transaction)
         .await?;
 
-    Ok(4)
+    Ok(5)
 }
 
 async fn execute_checkpoint_upsert(
