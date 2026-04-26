@@ -94,17 +94,15 @@ impl Type1Store {
     }
 
     fn latest_timestamp_unix_ms(&self) -> Option<i64> {
-        self.account_rows
-            .iter()
-            .map(|row| row.timestamp_unix_ms)
-            .chain(
-                self.transaction_rows
-                    .iter()
-                    .map(|row| row.timestamp_unix_ms),
-            )
-            .chain(self.slot_rows.iter().map(|row| row.timestamp_unix_ms))
-            .chain(self.custom_rows.iter().map(|row| row.timestamp_unix_ms))
-            .max()
+        [
+            self.account_rows.back().map(|r| r.timestamp_unix_ms),
+            self.transaction_rows.back().map(|r| r.timestamp_unix_ms),
+            self.slot_rows.back().map(|r| r.timestamp_unix_ms),
+            self.custom_rows.back().map(|r| r.timestamp_unix_ms),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
     }
 
     fn prune_stale(&mut self, latest_timestamp_unix_ms: i64) {
@@ -234,5 +232,101 @@ mod tests {
         assert_eq!(super::parse_max_age_secs(None), 3600);
         assert_eq!(super::parse_max_age_secs(Some("7200")), 7200);
         assert_eq!(super::parse_max_age_secs(Some("invalid")), 3600);
+    }
+
+    #[test]
+    fn latest_timestamp_uses_back_of_deques_for_constant_time_lookup() {
+        let mut store = Type1Store::new(RetentionPolicy::default());
+
+        // Add rows with increasing timestamps across different deques
+        let batch1 = PersistedBatch {
+            reason: FlushReason::Size,
+            account_rows: vec![AccountUpdateRow {
+                slot: 1,
+                timestamp_unix_ms: 100,
+                pubkey: vec![1],
+                owner: vec![2],
+                lamports: 1,
+                data: vec![3],
+                write_version: 1,
+            }],
+            transaction_rows: vec![TransactionRow {
+                slot: 1,
+                timestamp_unix_ms: 150,
+                signature: vec![4],
+                fee: 5,
+                success: true,
+                program_ids: vec![vec![9]],
+                log_messages: vec!["ok".to_string()],
+            }],
+            slot_rows: vec![SlotRow {
+                slot: 1,
+                timestamp_unix_ms: 200,
+                parent_slot: None,
+                status: "processed".to_string(),
+            }],
+            custom_rows: vec![CustomDecodedRow {
+                decoder_name: "test".to_string(),
+                record_key: "key1".to_string(),
+                slot: 1,
+                timestamp_unix_ms: 250,
+                event_index: 0,
+                payload: serde_json::json!("test"),
+            }],
+            last_processed_slot: Some(1),
+            last_observed_at_unix_ms: Some(250),
+            last_on_chain_block_time_ms: Some(250),
+        };
+
+        store.apply_batch(batch1);
+
+        // Add more rows with later timestamps
+        let batch2 = PersistedBatch {
+            reason: FlushReason::Interval,
+            account_rows: vec![AccountUpdateRow {
+                slot: 2,
+                timestamp_unix_ms: 300,
+                pubkey: vec![5],
+                owner: vec![6],
+                lamports: 2,
+                data: vec![7],
+                write_version: 2,
+            }],
+            transaction_rows: vec![],
+            slot_rows: vec![],
+            custom_rows: vec![],
+            last_processed_slot: Some(2),
+            last_observed_at_unix_ms: Some(300),
+            last_on_chain_block_time_ms: Some(300),
+        };
+
+        store.apply_batch(batch2);
+
+        // Verify latest_timestamp returns the maximum (should be 300 from account_rows back)
+        assert_eq!(store.latest_timestamp_unix_ms(), Some(300));
+
+        // Add even later timestamp in a different deque
+        let batch3 = PersistedBatch {
+            reason: FlushReason::Interval,
+            account_rows: vec![],
+            transaction_rows: vec![],
+            slot_rows: vec![],
+            custom_rows: vec![CustomDecodedRow {
+                decoder_name: "test".to_string(),
+                record_key: "key2".to_string(),
+                slot: 3,
+                timestamp_unix_ms: 400,
+                event_index: 0,
+                payload: serde_json::json!("test"),
+            }],
+            last_processed_slot: Some(3),
+            last_observed_at_unix_ms: Some(400),
+            last_on_chain_block_time_ms: Some(400),
+        };
+
+        store.apply_batch(batch3);
+
+        // Latest should now be 400 from custom_rows back
+        assert_eq!(store.latest_timestamp_unix_ms(), Some(400));
     }
 }
