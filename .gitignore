@@ -2,6 +2,7 @@ docs/
 target/
 .env
 .codex
+gcp/
 
 # Runtime artifacts
 data/
