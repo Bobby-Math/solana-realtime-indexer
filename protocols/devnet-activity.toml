@@ -1,0 +1,16 @@
+# Devnet activity monitoring
+# Monitors high-activity programs on devnet for CPI edges and network stress
+
+name = "Devnet Activity"
+
+# Core programs that are always active on devnet
+programs = [
+    "11111111111111111111111111111111",  # System Program
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # Token Program
+    "ComputeBudget111111111111111111111111111111",  # Compute Budget Program
+    "Config1111111111111111111111111111111111111",  # Config Program
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",  # Associated Token Program
+]
+
+accounts = []
+include_slots = true  # Enable slot updates for network stress

@@ -29,6 +29,7 @@
             border-bottom: 1px solid #1e293b;
             padding-bottom: 20px;
             margin-bottom: 30px;
+            position: relative;
         }
 
         h1 {
@@ -37,10 +38,34 @@
             color: #f8fafc;
         }
 
+        .contact-info {
+            position: absolute;
+            top: 0;
+            right: 0;
+            text-align: right;
+            font-size: 12px;
+        }
+
+        .contact-info a {
+            color: #f78166;
+            text-decoration: none;
+            transition: color 0.2s;
+        }
+
+        .contact-info a:hover {
+            color: #f9735a;
+            text-decoration: underline;
+        }
+
         .subtitle {
             font-size: 14px;
             color: #64748b;
             margin-top: 5px;
+        }
+
+        .subtitle .brand-accent {
+            color: #f78166;
+            font-weight: 500;
         }
 
         .grid {
@@ -55,6 +80,18 @@
             border: 1px solid #1e293b;
             border-radius: 4px;
             padding: 20px;
+            position: relative;
+        }
+
+        .panel::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 2px;
+            height: 100%;
+            background: linear-gradient(to bottom, #f78166, rgba(247, 129, 102, 0.1));
+            border-radius: 4px 0 0 4px;
         }
 
         .panel-header {
@@ -82,6 +119,10 @@
             font-weight: 600;
             color: #22d3ee;
             margin-bottom: 5px;
+        }
+
+        .stat-value.accent-orange {
+            color: #f78166;
         }
 
         .stat-label {
@@ -131,6 +172,10 @@
         .tps-value {
             color: #22d3ee;
             font-weight: 600;
+        }
+
+        .tps-value.top-program {
+            color: #f78166;
         }
 
         .failure-rate {
@@ -189,7 +234,11 @@
     <div class="container">
         <header>
             <h1>Solana Realtime Indexer</h1>
-            <div class="subtitle">Live network telemetry • Powered by Helius Geyser</div>
+            <div class="subtitle">Live network telemetry • Powered by <span class="brand-accent">Helius Geyser</span></div>
+            <div class="contact-info">
+                <div><a href="https://bobby-math.dev" target="_blank">bobby-math.dev</a></div>
+                <div><a href="mailto:bobby@bobby-math.dev">bobby@bobby-math.dev</a></div>
+            </div>
         </header>
 
         <div class="grid">

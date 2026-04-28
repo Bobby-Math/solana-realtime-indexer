@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+#[derive(Clone)]
 pub struct WalPipelineConfig {
     pub wal_path: String,
     pub poll_interval: Duration,

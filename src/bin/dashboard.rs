@@ -221,10 +221,10 @@ async fn query_program_tps(pool: &PgPool) -> Result<ProgramTpsResponse, sqlx::Er
             tp.program_id,
             COUNT(*) AS tx_count,
             COUNT(*) FILTER (WHERE NOT t.success) AS failure_count,
-            EXTRACT(EPOCH FROM MAX(t.timestamp) - MIN(t.timestamp)) AS time_span_seconds
+            CAST(EXTRACT(EPOCH FROM MAX(tp.timestamp) - MIN(tp.timestamp)) AS DOUBLE PRECISION) AS time_span_seconds
         FROM transaction_program_ids tp
-        JOIN transactions t ON t.timestamp = tp.timestamp AND t.signature = t.signature
-        WHERE t.timestamp > NOW() - INTERVAL '5 minutes'
+        JOIN transactions t ON t.signature = tp.signature
+        WHERE tp.timestamp > NOW() - INTERVAL '5 minutes'
         GROUP BY tp.program_id
         ORDER BY tx_count DESC
         LIMIT 10

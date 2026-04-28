@@ -1,4 +1,5 @@
 use crate::processor::decoder::PersistedBatch;
+use crate::processor::sanitize::sanitize_log_messages;
 use crate::processor::schema::{AccountUpdateRow, CustomDecodedRow, SlotRow, TransactionRow};
 use crate::processor::store::RetentionPolicy;
 use sqlx::Transaction;
@@ -114,11 +115,11 @@ pub async fn execute_transactions_insert(
     let log_messages_json: Vec<serde_json::Value> = rows
         .iter()
         .map(|row| {
+            let sanitized = sanitize_log_messages(&row.log_messages);
             serde_json::Value::Array(
-                row.log_messages
+                sanitized
                     .iter()
-                    .cloned()
-                    .map(serde_json::Value::String)
+                    .map(|msg| serde_json::Value::String(msg.clone()))
                     .collect(),
             )
         })

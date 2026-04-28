@@ -131,9 +131,6 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
         batch_flush_ms: config.batch_flush_ms,
     };
 
-    // Create RPC gap filler for event-driven repair
-    let gap_filler = RpcGapFiller::new(config.rpc_endpoints.clone(), wal_queue.clone());
-
     // Start Geyser client writing to WAL
     let geyser_client = GeyserClient::new(
         geyser_config,
@@ -153,33 +150,56 @@ async fn run_with_real_geyser(config: Config) -> Result<(), Box<dyn std::error::
         }
     });
 
-    // Build database sink and batch writer
-    let sink = build_sink(&config, shared_pool.clone()).await?;
-    let writer = BatchWriter::new(
-        config.batch_size,
-        Duration::from_millis(config.batch_flush_ms),
-    );
+    // Start WAL pipeline with auto-restart on failure
+    let wal_queue_for_restart = wal_queue.clone();
+    let api_state_for_restart = api_state.clone();
+    let rpc_endpoints_for_restart = config.rpc_endpoints.clone();
+    let wal_config = wal_pipeline_config.clone();
+    let shared_pool_for_restart = shared_pool.clone();
+    let config_for_restart = config.clone();
 
-    // Create custom decoders (protocol-specific decoders will be registered here)
-    let custom_decoders: Vec<Box<dyn CustomDecoder>> = vec![
-        Box::new(CpiLogDecoder::new()),
-    ];
-    let decoder = Type1Decoder::new();
+    let _wal_pipeline_handle = tokio::spawn(async move {
+        loop {
+            // Recreate non-cloneable resources on each restart
+            let gap_filler = RpcGapFiller::new(rpc_endpoints_for_restart.clone(), wal_queue_for_restart.clone());
+            let writer = BatchWriter::new(wal_config.batch_size, Duration::from_millis(wal_config.batch_flush_ms));
+            let decoder = Type1Decoder::new();
+            let custom_decoders: Vec<Box<dyn CustomDecoder>> = vec![
+                Box::new(CpiLogDecoder::new()),
+            ];
+            let sink = build_sink(&config_for_restart, shared_pool_for_restart.clone()).await.expect("Failed to create sink");
 
-    // Start WAL pipeline consumer with event-driven gap repair
-    let wal_runner = WalPipelineRunner::new(
-        wal_queue.clone(),
-        wal_pipeline_config,
-        api_state.clone(),
-        writer,
-        decoder,
-        custom_decoders,
-        sink,
-    )
-    .with_gap_filler(gap_filler);
-    let wal_pipeline_handle = wal_runner.start_background_processor();
+            let wal_runner = WalPipelineRunner::new(
+                wal_queue_for_restart.clone(),
+                wal_config.clone(),
+                api_state_for_restart.clone(),
+                writer,
+                decoder,
+                custom_decoders,
+                sink,
+            ).with_gap_filler(gap_filler);
 
-    log_background_wal_pipeline(wal_pipeline_handle);
+            match wal_runner.start_background_processor().await {
+                Ok(Ok(report)) => {
+                    log::info!("✅ WAL Pipeline completed successfully: {:?}", report);
+                    break; // Normal completion, exit loop
+                }
+                Ok(Err(error)) => {
+                    log::error!("❌ WAL Pipeline failed: {}", error);
+                    log::warn!("🔄 Restarting WAL pipeline in 5 seconds...");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    // Continue loop to restart
+                }
+                Err(error) => {
+                    log::error!("❌ WAL Pipeline task crashed: {}", error);
+                    log::warn!("🔄 Restarting WAL pipeline in 5 seconds...");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    // Continue loop to restart
+                }
+            }
+        }
+    });
+
     log_background_geyser(geyser_handle);
 
     // Start WAL metrics reporter
