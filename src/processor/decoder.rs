@@ -32,20 +32,19 @@ pub struct PersistedBatch {
 impl PersistedBatch {
     pub fn latest_timestamp_unix_ms(&self) -> Option<i64> {
         // Use tracked timestamp first, fall back to extracting from rows
-        self.last_observed_at_unix_ms
-            .or_else(|| {
-                self.account_rows
-                    .iter()
-                    .map(|row| row.timestamp_unix_ms)
-                    .chain(
-                        self.transaction_rows
-                            .iter()
-                            .map(|row| row.timestamp_unix_ms),
-                    )
-                    .chain(self.slot_rows.iter().map(|row| row.timestamp_unix_ms))
-                    .chain(self.custom_rows.iter().map(|row| row.timestamp_unix_ms))
-                    .max()
-            })
+        self.last_observed_at_unix_ms.or_else(|| {
+            self.account_rows
+                .iter()
+                .map(|row| row.timestamp_unix_ms)
+                .chain(
+                    self.transaction_rows
+                        .iter()
+                        .map(|row| row.timestamp_unix_ms),
+                )
+                .chain(self.slot_rows.iter().map(|row| row.timestamp_unix_ms))
+                .chain(self.custom_rows.iter().map(|row| row.timestamp_unix_ms))
+                .max()
+        })
     }
 }
 
@@ -74,12 +73,16 @@ impl Type1Decoder {
         for event in batch.events {
             // Track slot, arrival time, and on-chain block time separately.
             let event_info = match &event {
-                GeyserEvent::AccountUpdate(u) => {
-                    Some((u.slot as i64, u.timestamp_unix_ms, block_time_cache.get(u.slot)))
-                }
-                GeyserEvent::Transaction(u) => {
-                    Some((u.slot as i64, u.timestamp_unix_ms, block_time_cache.get(u.slot)))
-                }
+                GeyserEvent::AccountUpdate(u) => Some((
+                    u.slot as i64,
+                    u.timestamp_unix_ms,
+                    block_time_cache.get(u.slot),
+                )),
+                GeyserEvent::Transaction(u) => Some((
+                    u.slot as i64,
+                    u.timestamp_unix_ms,
+                    block_time_cache.get(u.slot),
+                )),
                 GeyserEvent::SlotUpdate(u) => Some((u.slot as i64, u.timestamp_unix_ms, None)),
                 GeyserEvent::BlockMeta(u) => {
                     Some((u.slot as i64, u.observed_at_unix_ms, Some(u.block_time_ms)))
@@ -90,16 +93,18 @@ impl Type1Decoder {
                 persisted.last_processed_slot = persisted.last_processed_slot.max(Some(slot));
                 persisted.last_observed_at_unix_ms =
                     persisted.last_observed_at_unix_ms.max(Some(observed_at));
-                persisted.last_on_chain_block_time_ms = max_optional(
-                    persisted.last_on_chain_block_time_ms,
-                    on_chain_block_time,
-                );
+                persisted.last_on_chain_block_time_ms =
+                    max_optional(persisted.last_on_chain_block_time_ms, on_chain_block_time);
             }
 
             for decoder in custom_decoders.iter_mut() {
                 let rows = decoder.decode_multi(&event);
                 if !rows.is_empty() {
-                    log::debug!("Decoder {} produced {} rows for event", decoder.name(), rows.len());
+                    log::debug!(
+                        "Decoder {} produced {} rows for event",
+                        decoder.name(),
+                        rows.len()
+                    );
                 }
                 persisted.custom_rows.extend(rows);
             }
@@ -127,12 +132,17 @@ impl Type1Decoder {
                         .get(update.slot)
                         .unwrap_or(update.timestamp_unix_ms);
 
-                    log::debug!("Processing transaction: signature={:?}, program_ids count={}",
-                              update.signature, update.program_ids.len());
+                    let signature = TransactionRow::signature_from_slice(&update.signature);
+
+                    log::debug!(
+                        "Processing transaction: slot={} program_ids={}",
+                        update.slot,
+                        update.program_ids.len()
+                    );
                     persisted.transaction_rows.push(TransactionRow {
                         slot: update.slot as i64,
                         timestamp_unix_ms: timestamp_ms,
-                        signature: update.signature.clone(),
+                        signature,
                         fee: update.fee as i64,
                         success: update.success,
                         program_ids: update.program_ids,
@@ -232,13 +242,17 @@ fn transaction_mentions_program(update: &TransactionUpdate, program_id: &[u8]) -
         .program_ids
         .iter()
         .any(|candidate_bytes| candidate_bytes == program_id)
+        || update
+            .accounts
+            .iter()
+            .any(|candidate_bytes| candidate_bytes == program_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{CustomDecoder, ProgramActivityDecoder, Type1Decoder};
-    use crate::geyser::BlockTimeCache;
     use crate::geyser::decoder::{AccountUpdate, GeyserEvent, TransactionUpdate};
+    use crate::geyser::BlockTimeCache;
     use crate::processor::batch_writer::{BufferedBatch, FlushReason};
 
     #[test]
@@ -264,7 +278,10 @@ mod tests {
                     signature: "tracked-signature".as_bytes().to_vec(),
                     fee: 5_000,
                     success: true,
-                    accounts: vec!["tracked-account".as_bytes().to_vec(), "amm-program".as_bytes().to_vec()],
+                    accounts: vec![
+                        "tracked-account".as_bytes().to_vec(),
+                        "amm-program".as_bytes().to_vec(),
+                    ],
                     program_ids: vec!["amm-program".as_bytes().to_vec()],
                     log_messages: vec!["swap".to_string()],
                 }),

@@ -1,13 +1,13 @@
-use crate::geyser::wal_queue::{WalQueue, WalEntry};
 use crate::geyser::decoder::decode_subscribe_update;
+use crate::geyser::wal_queue::{WalEntry, WalQueue};
 use crate::geyser::BlockTimeCache;
-use crate::processor::pipeline::PipelineReport;
 use crate::processor::batch_writer::{BatchWriter, BufferedBatch};
-use crate::processor::decoder::{CustomDecoder, Type1Decoder, PersistedBatch};
+use crate::processor::decoder::{CustomDecoder, PersistedBatch, Type1Decoder};
+use crate::processor::pipeline::PipelineReport;
+use crate::processor::schema::{SlotRow, TransactionRow};
 use crate::processor::sink::{StorageSink, StorageWriteResult};
 use crate::processor::sql::CheckpointUpdate;
 use crate::processor::store::StoreSnapshot;
-use crate::processor::schema::{TransactionRow, SlotRow};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -30,9 +30,9 @@ pub struct WalPipelineRunner {
     custom_decoders: Vec<Box<dyn CustomDecoder>>,
     sink: Box<dyn StorageSink>,
     pending_checkpoint_seqs: Vec<u64>, // Track seqs to checkpoint after DB commit
-    gap_filler: Option<RpcGapFiller>, // Event-driven gap repair
+    gap_filler: Option<RpcGapFiller>,  // Event-driven gap repair
     block_time_cache: Arc<BlockTimeCache>, // Cache slot → block_time mapping
-    next_read_seq: u64, // In-memory read cursor, advances after each process_entry
+    next_read_seq: u64,                // In-memory read cursor, advances after each process_entry
 }
 
 impl WalPipelineRunner {
@@ -57,9 +57,9 @@ impl WalPipelineRunner {
         // We use has_checkpoint() to check if the checkpoint key exists in metadata.
         let last_processed = wal_queue.get_last_processed_seq();
         let next_read_seq = if wal_queue.has_checkpoint() {
-            last_processed + 1  // Resume from next unprocessed seq
+            last_processed + 1 // Resume from next unprocessed seq
         } else {
-            0  // No checkpoint yet: start from seq 0
+            0 // No checkpoint yet: start from seq 0
         };
 
         Self {
@@ -93,7 +93,10 @@ impl WalPipelineRunner {
         let mut last_log_time = started_at;
         let log_interval = Duration::from_secs(5);
 
-        log::info!("Starting WAL pipeline consumer from: {}", self.config.wal_path);
+        log::info!(
+            "Starting WAL pipeline consumer from: {}",
+            self.config.wal_path
+        );
 
         // Main polling loop
         loop {
@@ -179,7 +182,10 @@ impl WalPipelineRunner {
                                 Ok(0) => {
                                     // Slot genuinely unavailable (skipped on chain or pruned from RPC)
                                     // No point retrying — advance past it
-                                    log::warn!("⚠️  Slot for seq {} is permanently unavailable, skipping", seq);
+                                    log::warn!(
+                                        "⚠️  Slot for seq {} is permanently unavailable, skipping",
+                                        seq
+                                    );
                                     let _ = self.wal_queue.skip_processed_sequence(seq);
                                     self.next_read_seq = seq + 1;
                                 }
@@ -189,7 +195,11 @@ impl WalPipelineRunner {
                                     continue;
                                 }
                                 Err(repair_err) => {
-                                    log::error!("❌ Gap repair error for seq {}: {}, skipping", seq, repair_err);
+                                    log::error!(
+                                        "❌ Gap repair error for seq {}: {}, skipping",
+                                        seq,
+                                        repair_err
+                                    );
                                     // CRITICAL: Use skip_processed_sequence to avoid corrupting slot checkpoint
                                     // mark_processed(0, seq) would permanently set last_flushed_slot = 0
                                     let _ = self.wal_queue.skip_processed_sequence(seq);
@@ -216,9 +226,14 @@ impl WalPipelineRunner {
         }
     }
 
-    async fn process_entry(&mut self, entry: &WalEntry, report: &mut PipelineReport) -> Result<(), String> {
+    async fn process_entry(
+        &mut self,
+        entry: &WalEntry,
+        report: &mut PipelineReport,
+    ) -> Result<(), String> {
         // Decode the protobuf bytes back to SubscribeUpdate
-        let update = entry.decode_update()
+        let update = entry
+            .decode_update()
             .map_err(|e| format!("Failed to decode protobuf: {}", e))?;
 
         // Convert SubscribeUpdate to GeyserEvent using shared decoder
@@ -228,7 +243,11 @@ impl WalPipelineRunner {
         // BlockMeta events populate the cache, not the batch
         if let crate::geyser::decoder::GeyserEvent::BlockMeta(bm) = &geyser_event {
             self.block_time_cache.insert(bm.slot, bm.block_time_ms);
-            log::debug!("Cached block_time {}ms for slot {}", bm.block_time_ms, bm.slot);
+            log::debug!(
+                "Cached block_time {}ms for slot {}",
+                bm.block_time_ms,
+                bm.slot
+            );
 
             // CRITICAL FIX: Add BlockMeta to pending_checkpoint_seqs instead of marking processed immediately
             // This prevents checkpoint from advancing before DB commit, avoiding data loss on crash
@@ -246,10 +265,19 @@ impl WalPipelineRunner {
         Ok(())
     }
 
-    async fn process_batch(&mut self, batch: BufferedBatch, report: &mut PipelineReport) -> Result<(), String> {
-        let persisted = self.decoder.decode(batch, &mut self.custom_decoders, &self.block_time_cache);
+    async fn process_batch(
+        &mut self,
+        batch: BufferedBatch,
+        report: &mut PipelineReport,
+    ) -> Result<(), String> {
+        let persisted =
+            self.decoder
+                .decode(batch, &mut self.custom_decoders, &self.block_time_cache);
         let checkpoint = checkpoint_update_for_batch(&persisted);
-        let result = self.sink.write_batch(&persisted, checkpoint).await
+        let result = self
+            .sink
+            .write_batch(&persisted, checkpoint)
+            .await
             .map_err(|e| format!("Storage error: {}", e))?;
 
         apply_batch_report(report, persisted, result);
@@ -257,12 +285,14 @@ impl WalPipelineRunner {
         // CRITICAL FIX: Mark sequences as processed ONLY AFTER DB commit succeeds
         // This prevents data loss if crash occurs between buffering and DB flush
         if let Some(max_seq) = self.pending_checkpoint_seqs.iter().copied().max() {
-
             // Look up which slot corresponds to this seq
             let slot = match self.wal_queue.get_slot_for_seq(max_seq) {
                 Some(s) => s,
                 None => {
-                    log::error!("Failed to get slot for seq {} - skipping checkpoint", max_seq);
+                    log::error!(
+                        "Failed to get slot for seq {} - skipping checkpoint",
+                        max_seq
+                    );
                     return Ok(());
                 }
             };
@@ -270,7 +300,11 @@ impl WalPipelineRunner {
             // CRITICAL: Mark processed ONCE with the correct slot and max seq
             // This prevents corrupting last_flushed_slot and avoids N batch commits
             if let Err(e) = self.wal_queue.mark_processed(slot, max_seq) {
-                log::error!("Failed to mark seq {} as processed after DB commit: {}", max_seq, e);
+                log::error!(
+                    "Failed to mark seq {} as processed after DB commit: {}",
+                    max_seq,
+                    e
+                );
                 // Note: We don't return error here because the DB commit succeeded,
                 // and the seq will be retried on next startup
                 return Ok(());
@@ -278,26 +312,35 @@ impl WalPipelineRunner {
 
             let checkpointed_count = self.pending_checkpoint_seqs.len();
             self.pending_checkpoint_seqs.clear();
-            log::debug!("Checkpointed {} sequences after DB commit (slot: {}, seq: {})",
-                       checkpointed_count, slot, max_seq);
+            log::debug!(
+                "Checkpointed {} sequences after DB commit (slot: {}, seq: {})",
+                checkpointed_count,
+                slot,
+                max_seq
+            );
         }
 
         Ok(())
     }
 
-    pub fn start_background_processor(mut self) -> tokio::task::JoinHandle<Result<PipelineReport, String>>
+    pub fn start_background_processor(
+        mut self,
+    ) -> tokio::task::JoinHandle<Result<PipelineReport, String>>
     where
         Self: Send + 'static,
     {
-        tokio::spawn(async move {
-            self.run().await
-        })
+        tokio::spawn(async move { self.run().await })
     }
 }
 
-fn apply_batch_report(report: &mut PipelineReport, batch: PersistedBatch, result: StorageWriteResult) {
+fn apply_batch_report(
+    report: &mut PipelineReport,
+    batch: PersistedBatch,
+    result: StorageWriteResult,
+) {
     report.flush_count += 1;
-    report.last_processed_slot = max_optional(report.last_processed_slot, latest_processed_slot(&batch));
+    report.last_processed_slot =
+        max_optional(report.last_processed_slot, latest_processed_slot(&batch));
     report.last_observed_at_unix_ms = max_optional(
         report.last_observed_at_unix_ms,
         batch.latest_timestamp_unix_ms(),
@@ -333,31 +376,31 @@ fn max_optional(left: Option<i64>, right: Option<i64>) -> Option<i64> {
 fn latest_processed_slot(batch: &PersistedBatch) -> Option<i64> {
     // Use tracked slot first (populated for all events including BlockMeta)
     // Fall back to extracting from rows for backwards compatibility
-    batch.last_processed_slot
-        .or_else(|| {
-            batch.slot_rows
-                .iter()
-                .map(|row| row.slot)
-                .chain(batch.transaction_rows.iter().map(|row| row.slot))
-                .chain(batch.account_rows.iter().map(|row| row.slot))
-                .chain(batch.custom_rows.iter().map(|row| row.slot))
-                .max()
-        })
+    batch.last_processed_slot.or_else(|| {
+        batch
+            .slot_rows
+            .iter()
+            .map(|row| row.slot)
+            .chain(batch.transaction_rows.iter().map(|row| row.slot))
+            .chain(batch.account_rows.iter().map(|row| row.slot))
+            .chain(batch.custom_rows.iter().map(|row| row.slot))
+            .max()
+    })
 }
 
 fn checkpoint_update_for_batch(batch: &PersistedBatch) -> Option<CheckpointUpdate> {
     // Use tracked slot/timestamp first (populated for all events including BlockMeta)
     // Fall back to extracting from rows for backwards compatibility
-    let last_processed_slot = batch.last_processed_slot
-        .or_else(|| {
-            batch.slot_rows
-                .iter()
-                .map(|row| row.slot)
-                .chain(batch.transaction_rows.iter().map(|row| row.slot))
-                .chain(batch.account_rows.iter().map(|row| row.slot))
-                .chain(batch.custom_rows.iter().map(|row| row.slot))
-                .max()
-        });
+    let last_processed_slot = batch.last_processed_slot.or_else(|| {
+        batch
+            .slot_rows
+            .iter()
+            .map(|row| row.slot)
+            .chain(batch.transaction_rows.iter().map(|row| row.slot))
+            .chain(batch.account_rows.iter().map(|row| row.slot))
+            .chain(batch.custom_rows.iter().map(|row| row.slot))
+            .max()
+    });
 
     let last_observed_at_unix_ms = batch.latest_timestamp_unix_ms()?;
 
@@ -407,7 +450,10 @@ impl RpcGapFiller {
                 s
             }
             None => {
-                return Err(format!("No slot mapping found for seq {} — cannot repair", seq));
+                return Err(format!(
+                    "No slot mapping found for seq {} — cannot repair",
+                    seq
+                ));
             }
         };
 
@@ -416,11 +462,18 @@ impl RpcGapFiller {
             match self.fetch_and_repair_slot(endpoint, slot, seq, sink).await {
                 Ok(events_written) => {
                     if events_written > 0 {
-                        log::info!("✅ Successfully repaired seq {} (slot {}) with {} events",
-                                  seq, slot, events_written);
+                        log::info!(
+                            "✅ Successfully repaired seq {} (slot {}) with {} events",
+                            seq,
+                            slot,
+                            events_written
+                        );
                         return Ok(events_written);
                     } else {
-                        log::warn!("Slot {} not found or unavailable, trying next endpoint", slot);
+                        log::warn!(
+                            "Slot {} not found or unavailable, trying next endpoint",
+                            slot
+                        );
                         continue;
                     }
                 }
@@ -431,7 +484,11 @@ impl RpcGapFiller {
             }
         }
 
-        log::error!("❌ Failed to repair seq {} (slot {}) from all endpoints", seq, slot);
+        log::error!(
+            "❌ Failed to repair seq {} (slot {}) from all endpoints",
+            seq,
+            slot
+        );
         Ok(0)
     }
 
@@ -446,7 +503,8 @@ impl RpcGapFiller {
 
         // Fetch block from Solana RPC with JSON encoding for easier transaction parsing
         let url = format!("{}/", endpoint.trim_end_matches('/'));
-        let response = self.client
+        let response = self
+            .client
             .post(&url)
             .json(&serde_json::json!({
                 "jsonrpc": "2.0",
@@ -477,48 +535,60 @@ impl RpcGapFiller {
 
         // Check if slot was found
         if let Some(error) = json.get("error") {
-            if error["code"] == -32007 || error["message"].as_str().map_or(false, |m| m.contains("skipped")) {
+            if error["code"] == -32007
+                || error["message"]
+                    .as_str()
+                    .map_or(false, |m| m.contains("skipped"))
+            {
                 // Slot was skipped or not finalized
                 return Ok(0);
             }
             return Err(format!("RPC error: {}", error));
         }
 
-        let block_data = json.get("result")
+        let block_data = json
+            .get("result")
             .and_then(|v| v.as_object())
             .ok_or_else(|| "No result in RPC response".to_string())?;
 
         // Extract block time
-        let block_time_ms = block_data.get("blockTime")
+        let block_time_ms = block_data
+            .get("blockTime")
             .and_then(|v| v.as_i64())
             .map(|t| t * 1000)
             .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
         // Parse transactions from RPC JSON
-        let transaction_rows = self.parse_transaction_rows_from_rpc(block_data, slot, block_time_ms)?;
+        let transaction_rows =
+            self.parse_transaction_rows_from_rpc(block_data, slot, block_time_ms)?;
 
         // Create slot row
         let slot_row = SlotRow {
             slot: slot as i64,
             timestamp_unix_ms: block_time_ms,
-            parent_slot: block_data.get("parentSlot")
+            parent_slot: block_data
+                .get("parentSlot")
                 .and_then(|v| v.as_u64())
                 .map(|s| s as i64),
             status: "confirmed".to_string(), // RPC only returns finalized/confirmed blocks
         };
 
         // Write transactions and slot directly to DB (bypass WAL)
-        sink.write_gap_repaired_slot(slot, slot_row, transaction_rows.clone()).await
+        sink.write_gap_repaired_slot(slot, slot_row, transaction_rows.clone())
+            .await
             .map_err(|e| format!("DB write failed for repaired slot {}: {}", slot, e))?;
 
         // Repair the WAL hole with just BlockMeta (for checkpoint advancement)
         let block_meta_update = self.block_to_subscribe_update(block_data, slot)?;
-        self.wal_queue.repair_hole_with_raw_bytes(seq, slot, &block_meta_update.encode_to_vec())
+        self.wal_queue
+            .repair_hole_with_raw_bytes(seq, slot, &block_meta_update.encode_to_vec())
             .map_err(|e| format!("WAL repair failed: {}", e))?;
 
         log::info!(
             "Gap repair complete: slot {} — {} transactions written to DB, WAL seq {} advanced",
-            slot, transaction_rows.len(), seq
+            slot,
+            transaction_rows.len(),
+            seq
         );
 
         // Return total count: transactions written + 1 WAL entry (BlockMeta)
@@ -532,7 +602,8 @@ impl RpcGapFiller {
         slot: u64,
         block_time_ms: i64,
     ) -> Result<Vec<TransactionRow>, String> {
-        let txs = block_data.get("transactions")
+        let txs = block_data
+            .get("transactions")
             .and_then(|v| v.as_array())
             .map(|arr| arr.as_slice())
             .unwrap_or(&[]);
@@ -559,46 +630,65 @@ impl RpcGapFiller {
         block_time_ms: i64,
     ) -> Result<TransactionRow, String> {
         // Extract signature from transaction.signatures array
-        let sig_b58 = tx.get("transaction")
+        let sig_b58 = tx
+            .get("transaction")
             .and_then(|t| t.get("signatures"))
             .and_then(|s| s.as_array())
             .and_then(|arr| arr.first())
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing signature".to_string())?;
-        let signature = bs58::decode(sig_b58)
+        let sig_bytes = bs58::decode(sig_b58)
             .into_vec()
             .map_err(|e| format!("Invalid signature encoding: {}", e))?;
+        let signature = TransactionRow::signature_from_slice(&sig_bytes);
 
-        let meta = tx.get("meta")
-            .ok_or_else(|| "Missing meta".to_string())?;
+        let meta = tx.get("meta").ok_or_else(|| "Missing meta".to_string())?;
 
         // success: err field is null on success
         let success = meta.get("err").map_or(true, |e| e.is_null());
 
-        let fee = meta.get("fee")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as i64;
+        let fee = meta.get("fee").and_then(|v| v.as_u64()).unwrap_or(0) as i64;
 
-        let log_messages: Vec<String> = meta.get("logMessages")
+        let log_messages: Vec<String> = meta
+            .get("logMessages")
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
-        // Extract account_keys from transaction.message.accountKeys
-        let account_keys: Vec<Vec<u8>> = tx.get("transaction")
+        // Extract account_keys from transaction.message.accountKeys and any loaded
+        // address lookup table entries from meta.loadedAddresses.
+        let mut account_keys: Vec<Vec<u8>> = tx
+            .get("transaction")
             .and_then(|t| t.get("message"))
             .and_then(|m| m.get("accountKeys"))
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter()
-                .filter_map(|k| k.as_str())
-                .filter_map(|s| bs58::decode(s).into_vec().ok())
-                .collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|k| k.as_str())
+                    .filter_map(|s| bs58::decode(s).into_vec().ok())
+                    .collect()
+            })
             .unwrap_or_default();
+        if let Some(loaded) = meta.get("loadedAddresses") {
+            for field in ["writable", "readonly"] {
+                if let Some(entries) = loaded.get(field).and_then(|value| value.as_array()) {
+                    account_keys.extend(
+                        entries
+                            .iter()
+                            .filter_map(|entry| entry.as_str())
+                            .filter_map(|value| bs58::decode(value).into_vec().ok()),
+                    );
+                }
+            }
+        }
 
         // Extract program_ids from transaction.message.instructions
-        let program_ids: Vec<Vec<u8>> = tx.get("transaction")
+        let program_ids: Vec<Vec<u8>> = tx
+            .get("transaction")
             .and_then(|t| t.get("message"))
             .and_then(|m| m.get("instructions"))
             .and_then(|v| v.as_array())
@@ -628,31 +718,39 @@ impl RpcGapFiller {
         })
     }
 
-    fn block_to_subscribe_update(&self, block_data: &serde_json::Map<String, serde_json::Value>, slot: u64) -> Result<helius_laserstream::grpc::SubscribeUpdate, String> {
-        use helius_laserstream::grpc::{SubscribeUpdate, subscribe_update::UpdateOneof, SubscribeUpdateBlockMeta};
-        use helius_laserstream::solana::storage::confirmed_block::{UnixTimestamp, BlockHeight};
+    fn block_to_subscribe_update(
+        &self,
+        block_data: &serde_json::Map<String, serde_json::Value>,
+        slot: u64,
+    ) -> Result<helius_laserstream::grpc::SubscribeUpdate, String> {
+        use helius_laserstream::grpc::{
+            subscribe_update::UpdateOneof, SubscribeUpdate, SubscribeUpdateBlockMeta,
+        };
+        use helius_laserstream::solana::storage::confirmed_block::{BlockHeight, UnixTimestamp};
 
         // Extract block metadata from RPC getBlock response
-        let blockhash = block_data.get("blockhash")
+        let blockhash = block_data
+            .get("blockhash")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing blockhash in block data".to_string())?;
 
-        let parent_slot = block_data.get("parentSlot")
+        let parent_slot = block_data
+            .get("parentSlot")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| "Missing parentSlot in block data".to_string())?;
 
-        let parent_blockhash = block_data.get("previousBlockhash")
+        let parent_blockhash = block_data
+            .get("previousBlockhash")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing previousBlockhash in block data".to_string())?;
 
-        let block_time = block_data.get("blockTime")
-            .and_then(|v| v.as_i64());
+        let block_time = block_data.get("blockTime").and_then(|v| v.as_i64());
 
-        let block_height = block_data.get("blockHeight")
-            .and_then(|v| v.as_u64());
+        let block_height = block_data.get("blockHeight").and_then(|v| v.as_u64());
 
         // Extract transaction count if transactions are present
-        let executed_transaction_count = block_data.get("transactions")
+        let executed_transaction_count = block_data
+            .get("transactions")
             .and_then(|v| v.as_array())
             .map(|txs| txs.len() as u64)
             .unwrap_or(0);
@@ -684,9 +782,9 @@ mod tests {
     use super::*;
     use crate::processor::sink::DryRunStorageSink;
     use crate::processor::store::{RetentionPolicy, Type1Store};
-    use tempfile::tempdir;
     use helius_laserstream::grpc::SubscribeUpdate;
     use std::time::Duration;
+    use tempfile::tempdir;
 
     #[test]
     fn wal_pipeline_processes_protobuf_entries() {
@@ -734,7 +832,10 @@ mod tests {
 
         // Third iteration: should read seq=2, NOT seq=0 or seq=1 again
         let entry3 = wal_queue.read_from(0, next_read_seq).unwrap().unwrap();
-        assert_eq!(entry3.seq, 2, "Third read should return seq=2, not seq=0 or seq=1");
+        assert_eq!(
+            entry3.seq, 2,
+            "Third read should return seq=2, not seq=0 or seq=1"
+        );
         next_read_seq = entry3.seq + 1; // Advance cursor to 3
 
         // Fourth iteration: should return None (no more entries)
@@ -742,8 +843,11 @@ mod tests {
         assert!(entry4.is_none(), "Fourth read should return None");
 
         // Verify persisted checkpoint hasn't advanced (no flush yet)
-        assert_eq!(wal_queue.get_last_processed_seq(), 0,
-                   "Persisted checkpoint should still be 0 since no flush occurred");
+        assert_eq!(
+            wal_queue.get_last_processed_seq(),
+            0,
+            "Persisted checkpoint should still be 0 since no flush occurred"
+        );
     }
 
     #[test]
@@ -757,7 +861,10 @@ mod tests {
             .parse_transaction_rows_from_rpc(&block_data, 123, 456)
             .expect("missing transactions field should be treated as an empty slot");
 
-        assert!(rows.is_empty(), "empty slots should yield zero transaction rows");
+        assert!(
+            rows.is_empty(),
+            "empty slots should yield zero transaction rows"
+        );
     }
 
     #[tokio::test]
@@ -769,7 +876,10 @@ mod tests {
         wal_queue.push_update(100, &update).unwrap();
 
         assert_eq!(wal_queue.get_total_written(), 1);
-        assert!(!wal_queue.has_checkpoint(), "test precondition: no checkpoint must exist");
+        assert!(
+            !wal_queue.has_checkpoint(),
+            "test precondition: no checkpoint must exist"
+        );
 
         let runner = WalPipelineRunner::new(
             wal_queue,
@@ -809,11 +919,16 @@ mod tests {
         let wal_queue = Arc::new(WalQueue::new(temp_dir.path()).unwrap());
 
         for slot in 100..=101 {
-            wal_queue.push_update(slot, &SubscribeUpdate::default()).unwrap();
+            wal_queue
+                .push_update(slot, &SubscribeUpdate::default())
+                .unwrap();
         }
         wal_queue.mark_processed(100, 0).unwrap();
 
-        assert!(wal_queue.has_checkpoint(), "test precondition: checkpoint must exist");
+        assert!(
+            wal_queue.has_checkpoint(),
+            "test precondition: checkpoint must exist"
+        );
         assert_eq!(wal_queue.get_last_processed_seq(), 0);
 
         let runner = WalPipelineRunner::new(

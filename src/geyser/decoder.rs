@@ -1,5 +1,5 @@
-use helius_laserstream::grpc::SubscribeUpdate;
 use helius_laserstream::grpc::subscribe_update::UpdateOneof;
+use helius_laserstream::grpc::SubscribeUpdate;
 
 #[derive(Debug, Clone)]
 pub enum GeyserEvent {
@@ -51,7 +51,10 @@ pub struct BlockMetaUpdate {
 /// Decodes a SubscribeUpdate protobuf into a GeyserEvent.
 /// This is a shared function used by both the Geyser client (for filtering)
 /// and the WAL consumer (for processing), eliminating code duplication.
-pub fn decode_subscribe_update(update: &SubscribeUpdate, timestamp_unix_ms: i64) -> Option<GeyserEvent> {
+pub fn decode_subscribe_update(
+    update: &SubscribeUpdate,
+    timestamp_unix_ms: i64,
+) -> Option<GeyserEvent> {
     match &update.update_oneof {
         Some(UpdateOneof::Account(account_update)) => {
             if let Some(account_info) = &account_update.account {
@@ -65,45 +68,63 @@ pub fn decode_subscribe_update(update: &SubscribeUpdate, timestamp_unix_ms: i64)
                     data: account_info.data.clone(),
                 }))
             } else {
-                log::warn!("Account update missing account info for slot {}", account_update.slot);
+                log::warn!(
+                    "Account update missing account info for slot {}",
+                    account_update.slot
+                );
                 None
             }
         }
         Some(UpdateOneof::Transaction(tx_update)) => {
             if let Some(tx_info) = &tx_update.transaction {
-                let success = tx_info.meta.as_ref()
+                let success = tx_info
+                    .meta
+                    .as_ref()
                     .map(|meta| meta.err.is_none())
                     .unwrap_or(false);
 
-                let fee = tx_info.meta.as_ref()
-                    .map(|meta| meta.fee)
-                    .unwrap_or(0);
+                let fee = tx_info.meta.as_ref().map(|meta| meta.fee).unwrap_or(0);
 
-                let log_messages = tx_info.meta.as_ref()
+                let log_messages = tx_info
+                    .meta
+                    .as_ref()
                     .map(|meta| meta.log_messages.clone())
                     .unwrap_or_default();
 
                 // Extract program IDs from transaction instructions (order-preserving dedup)
                 let (program_ids, accounts) = if let Some(tx) = &tx_info.transaction {
                     if let Some(message) = &tx.message {
+                        let accounts = message
+                            .account_keys
+                            .iter()
+                            .cloned()
+                            .chain(tx_info.meta.iter().flat_map(|meta| {
+                                meta.loaded_writable_addresses
+                                    .iter()
+                                    .cloned()
+                                    .chain(meta.loaded_readonly_addresses.iter().cloned())
+                            }))
+                            .collect::<Vec<_>>();
                         let mut seen = std::collections::HashSet::new();
-                        let program_ids: Vec<Vec<u8>> = message.instructions
+                        let program_ids: Vec<Vec<u8>> = message
+                            .instructions
                             .iter()
                             .filter_map(|instruction| {
                                 let program_idx = instruction.program_id_index as usize;
-                                message.account_keys.get(program_idx)
+                                accounts.get(program_idx)
                             })
                             .filter(|key| seen.insert(key.as_slice()))
                             .cloned()
                             .collect();
-                        let accounts = message.account_keys.clone();
                         (program_ids, accounts)
                     } else {
                         log::debug!("No message field in transaction, program_ids and accounts will be empty");
                         (Vec::new(), Vec::new())
                     }
                 } else {
-                    log::debug!("No transaction field available, program_ids and accounts will be empty");
+                    log::debug!(
+                        "No transaction field available, program_ids and accounts will be empty"
+                    );
                     (Vec::new(), Vec::new())
                 };
 
@@ -118,20 +139,22 @@ pub fn decode_subscribe_update(update: &SubscribeUpdate, timestamp_unix_ms: i64)
                     log_messages,
                 }))
             } else {
-                log::warn!("Transaction update missing transaction info for slot {}", tx_update.slot);
+                log::warn!(
+                    "Transaction update missing transaction info for slot {}",
+                    tx_update.slot
+                );
                 None
             }
         }
-        Some(UpdateOneof::Slot(slot_update)) => {
-            Some(GeyserEvent::SlotUpdate(SlotUpdate {
-                timestamp_unix_ms,
-                slot: slot_update.slot,
-                parent_slot: slot_update.parent,
-                status: map_slot_status(slot_update.status),
-            }))
-        }
+        Some(UpdateOneof::Slot(slot_update)) => Some(GeyserEvent::SlotUpdate(SlotUpdate {
+            timestamp_unix_ms,
+            slot: slot_update.slot,
+            parent_slot: slot_update.parent,
+            status: map_slot_status(slot_update.status),
+        })),
         Some(UpdateOneof::BlockMeta(block_meta)) => {
-            let block_time_ms = block_meta.block_time
+            let block_time_ms = block_meta
+                .block_time
                 .map(|unix_ts| unix_ts.timestamp * 1000)
                 .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 

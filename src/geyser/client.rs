@@ -1,14 +1,14 @@
-use futures::StreamExt;
-use helius_laserstream::{subscribe, LaserstreamConfig, ChannelOptions};
-use helius_laserstream::grpc::{SubscribeRequest, SubscribeUpdate};
-use helius_laserstream::grpc::subscribe_update::UpdateOneof;
 use futures::pin_mut;
+use futures::StreamExt;
+use helius_laserstream::grpc::subscribe_update::UpdateOneof;
+use helius_laserstream::grpc::{SubscribeRequest, SubscribeUpdate};
+use helius_laserstream::{subscribe, ChannelOptions, LaserstreamConfig};
 use prost::Message;
 
 use crate::geyser::consumer::GeyserConfig;
 use crate::geyser::consumer::SubscriptionFilter;
-use crate::geyser::wal_queue::WalQueue;
 use crate::geyser::reconnect::ReconnectPolicy;
+use crate::geyser::wal_queue::WalQueue;
 
 #[derive(Debug)]
 pub enum GeyserClientError {
@@ -84,13 +84,19 @@ impl GeyserClient {
                     log::error!("Geyser connection error: {}", e);
 
                     // Calculate backoff delay with exponential increase
-                    let backoff_ms = self.reconnect_policy.initial_backoff_ms
+                    let backoff_ms = self
+                        .reconnect_policy
+                        .initial_backoff_ms
                         .saturating_mul(2u64.pow(reconnect_count.min(8) as u32))
                         .min(self.reconnect_policy.max_backoff_ms);
 
                     reconnect_count += 1;
-                    log::info!("Waiting {}ms before reconnect attempt {} (max: {}ms)",
-                              backoff_ms, reconnect_count, self.reconnect_policy.max_backoff_ms);
+                    log::info!(
+                        "Waiting {}ms before reconnect attempt {} (max: {}ms)",
+                        backoff_ms,
+                        reconnect_count,
+                        self.reconnect_policy.max_backoff_ms
+                    );
 
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
 
@@ -100,15 +106,13 @@ impl GeyserClient {
         }
     }
 
-    async fn run_single_session(
-        &self,
-        wal_queue: &WalQueue,
-    ) -> Result<u64, GeyserClientError> {
+    async fn run_single_session(&self, wal_queue: &WalQueue) -> Result<u64, GeyserClientError> {
         let endpoint = self.config.endpoint.clone();
 
         // Set timeout if configured (0 means run indefinitely)
-        let timeout_duration = self.run_duration_seconds
-            .filter(|&secs| secs > 0)  // 0 means run indefinitely
+        let timeout_duration = self
+            .run_duration_seconds
+            .filter(|&secs| secs > 0) // 0 means run indefinitely
             .map(std::time::Duration::from_secs);
         let start_time = std::time::Instant::now();
 
@@ -124,11 +128,17 @@ impl GeyserClient {
         // Build subscription request from filters
         let subscribe_request = self.build_subscription_request()?;
 
-        log::info!("Connected to Helius Laserstream at {}, subscribing...", endpoint);
+        log::info!(
+            "Connected to Helius Laserstream at {}, subscribing...",
+            endpoint
+        );
 
         // Log timeout configuration
         if let Some(timeout_duration) = timeout_duration {
-            log::info!("Run duration limit: {:?} - will stop after this time to conserve credits", timeout_duration);
+            log::info!(
+                "Run duration limit: {:?} - will stop after this time to conserve credits",
+                timeout_duration
+            );
         } else {
             log::info!("No run duration limit - will run continuously (consuming Helius credits)");
         }
@@ -252,13 +262,19 @@ impl GeyserClient {
         } else {
             log::info!("   Note: No events received - this is normal on devnet or with restrictive filters");
         }
-        log::info!("   Credits consumed: ~{:.1}s connection time", total_elapsed.as_secs_f64());
+        log::info!(
+            "   Credits consumed: ~{:.1}s connection time",
+            total_elapsed.as_secs_f64()
+        );
 
         Ok(events_processed)
     }
 
     fn build_subscription_request(&self) -> Result<SubscribeRequest, GeyserClientError> {
-        use helius_laserstream::grpc::{SubscribeRequestFilterAccounts, SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions};
+        use helius_laserstream::grpc::{
+            SubscribeRequestFilterAccounts, SubscribeRequestFilterSlots,
+            SubscribeRequestFilterTransactions,
+        };
         use std::collections::HashMap;
 
         let mut request = SubscribeRequest {
@@ -290,56 +306,89 @@ impl GeyserClient {
             }
         }
 
+        account_pubkeys.sort_unstable();
+        account_pubkeys.dedup();
+        program_ids.sort_unstable();
+        program_ids.dedup();
+
         // Build accounts subscription with server-side filtering
         let has_account_filters = !account_pubkeys.is_empty() || !program_ids.is_empty();
 
         if has_account_filters {
             let mut accounts_map = HashMap::new();
-            accounts_map.insert("filtered_accounts".to_string(), SubscribeRequestFilterAccounts {
-                account: account_pubkeys.clone(),
-                owner: program_ids.clone(),
-                filters: vec![],
-                nonempty_txn_signature: Some(false),
-            });
+            accounts_map.insert(
+                "filtered_accounts".to_string(),
+                SubscribeRequestFilterAccounts {
+                    account: account_pubkeys.clone(),
+                    owner: program_ids.clone(),
+                    filters: vec![],
+                    nonempty_txn_signature: Some(false),
+                },
+            );
             request.accounts = accounts_map;
-            log::info!("Subscribed to filtered account updates: {} specific accounts, {} program owners",
-                      request.accounts.get("filtered_accounts").map(|f| f.account.len()).unwrap_or(0),
-                      request.accounts.get("filtered_accounts").map(|f| f.owner.len()).unwrap_or(0));
+            log::info!(
+                "Subscribed to filtered account updates: {} specific accounts, {} program owners",
+                request
+                    .accounts
+                    .get("filtered_accounts")
+                    .map(|f| f.account.len())
+                    .unwrap_or(0),
+                request
+                    .accounts
+                    .get("filtered_accounts")
+                    .map(|f| f.owner.len())
+                    .unwrap_or(0)
+            );
         } else {
-            // No account filters configured - subscribe to all accounts (expensive!)
-            let mut accounts_map = HashMap::new();
-            accounts_map.insert("all_accounts".to_string(), SubscribeRequestFilterAccounts {
-                account: vec![],
-                owner: vec![],
-                filters: vec![],
-                nonempty_txn_signature: Some(false),
-            });
-            request.accounts = accounts_map;
-            log::warn!("No account filters configured - subscribing to ALL account updates (expensive!)");
+            log::info!("No account or program filters configured - skipping account subscription");
         }
 
-        // Build transactions subscription with server-side filtering
-        // Note: Helius transaction filtering is more limited, so we may need client-side filtering too
-        let mut transactions_map = HashMap::new();
-        transactions_map.insert("filtered_transactions".to_string(), SubscribeRequestFilterTransactions {
-            vote: Some(false),
-            failed: Some(false),
-            signature: None,
-            account_include: account_pubkeys.clone(), // Include transactions mentioning filtered accounts
-            account_exclude: vec![],
-            account_required: vec![],
-        });
-        request.transactions = transactions_map;
-        log::info!("Subscribed to transaction updates with {} account filters",
-                  request.transactions.get("filtered_transactions").map(|f| f.account_include.len()).unwrap_or(0));
+        // Helius transaction filters are account-key based. Include both explicitly
+        // tracked accounts and tracked program IDs so program-only protocols do not
+        // silently miss transaction traffic at the server boundary.
+        let mut transaction_mentions = account_pubkeys.clone();
+        transaction_mentions.extend(program_ids.iter().cloned());
+        transaction_mentions.sort_unstable();
+        transaction_mentions.dedup();
+
+        if !transaction_mentions.is_empty() {
+            let mut transactions_map = HashMap::new();
+            transactions_map.insert(
+                "filtered_transactions".to_string(),
+                SubscribeRequestFilterTransactions {
+                    vote: Some(false),
+                    failed: Some(false),
+                    signature: None,
+                    account_include: transaction_mentions,
+                    account_exclude: vec![],
+                    account_required: vec![],
+                },
+            );
+            request.transactions = transactions_map;
+            log::info!(
+                "Subscribed to transaction updates with {} account-key filters",
+                request
+                    .transactions
+                    .get("filtered_transactions")
+                    .map(|f| f.account_include.len())
+                    .unwrap_or(0)
+            );
+        } else {
+            log::info!(
+                "No account or program filters configured - skipping transaction subscription"
+            );
+        }
 
         // Subscribe to slots if slot filters are configured
         if has_slot_filters {
             let mut slots_map = HashMap::new();
-            slots_map.insert("all_slots".to_string(), SubscribeRequestFilterSlots {
-                filter_by_commitment: Some(true),
-                interslot_updates: Some(false),
-            });
+            slots_map.insert(
+                "all_slots".to_string(),
+                SubscribeRequestFilterSlots {
+                    filter_by_commitment: Some(true),
+                    interslot_updates: Some(false),
+                },
+            );
             request.slots = slots_map;
             log::info!("Subscribed to slot updates");
         }
@@ -347,9 +396,12 @@ impl GeyserClient {
         // Subscribe to blocks_meta to get block_time for accurate latency measurements
         if has_blocks_meta_filters {
             let mut blocks_meta_map = HashMap::new();
-            blocks_meta_map.insert("all_blocks_meta".to_string(), helius_laserstream::grpc::SubscribeRequestFilterBlocksMeta {
-                ..Default::default()
-            });
+            blocks_meta_map.insert(
+                "all_blocks_meta".to_string(),
+                helius_laserstream::grpc::SubscribeRequestFilterBlocksMeta {
+                    ..Default::default()
+                },
+            );
             request.blocks_meta = blocks_meta_map;
             log::info!("Subscribed to blocks_meta updates for block_time extraction");
         }
@@ -384,9 +436,66 @@ impl GeyserClient {
             Some(UpdateOneof::Slot(slot)) => slot.slot,
             Some(UpdateOneof::BlockMeta(bm)) => bm.slot,
             Some(UpdateOneof::Ping(_)) | Some(UpdateOneof::Pong(_)) => 0,
-            Some(UpdateOneof::Block(_)) | Some(UpdateOneof::TransactionStatus(_)) | Some(UpdateOneof::Entry(_)) => 0,
+            Some(UpdateOneof::Block(_))
+            | Some(UpdateOneof::TransactionStatus(_))
+            | Some(UpdateOneof::Entry(_)) => 0,
             None => 0,
         }
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::GeyserClient;
+    use crate::geyser::consumer::{GeyserConfig, SubscriptionFilter};
+
+    #[test]
+    fn build_subscription_request_includes_program_ids_in_transaction_filters() {
+        let program = [7u8; 32];
+        let account = [8u8; 32];
+        let client = GeyserClient::new(
+            GeyserConfig::new(
+                "http://localhost:1000".to_string(),
+                1_000,
+                vec![
+                    SubscriptionFilter::program_bytes(program),
+                    SubscriptionFilter::account_bytes(account),
+                ],
+            ),
+            "test-key".to_string(),
+            None,
+        );
+
+        let request = client.build_subscription_request().expect("request");
+        let tx_filter = request
+            .transactions
+            .get("filtered_transactions")
+            .expect("transaction filter");
+
+        let program_b58 = bs58::encode(program).into_string();
+        let account_b58 = bs58::encode(account).into_string();
+
+        assert!(tx_filter.account_include.contains(&program_b58));
+        assert!(tx_filter.account_include.contains(&account_b58));
+    }
+
+    #[test]
+    fn build_subscription_request_skips_data_streams_for_slots_only_configs() {
+        let client = GeyserClient::new(
+            GeyserConfig::new(
+                "http://localhost:1000".to_string(),
+                1_000,
+                vec![SubscriptionFilter::slots(), SubscriptionFilter::blocks()],
+            ),
+            "test-key".to_string(),
+            None,
+        );
+
+        let request = client.build_subscription_request().expect("request");
+
+        assert!(request.accounts.is_empty());
+        assert!(request.transactions.is_empty());
+        assert_eq!(request.slots.len(), 1);
+        assert_eq!(request.blocks_meta.len(), 1);
+    }
 }

@@ -1,8 +1,8 @@
 // LEGACY: Channel-based pipeline (pre-WAL). Not used in production (WalPipelineRunner is used instead).
 // Retained for testing core pipeline behaviors (draining, checkpoint tracking, batch processing).
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Instant;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::geyser::decoder::GeyserEvent;
 use crate::geyser::BlockTimeCache;
@@ -66,7 +66,10 @@ impl ProcessorPipeline {
         self.run_with_reporter(|_| {}).await
     }
 
-    pub async fn run_with_reporter<F>(&mut self, mut report_progress: F) -> Result<PipelineReport, StorageError>
+    pub async fn run_with_reporter<F>(
+        &mut self,
+        mut report_progress: F,
+    ) -> Result<PipelineReport, StorageError>
     where
         F: FnMut(&PipelineReport),
     {
@@ -110,10 +113,13 @@ impl ProcessorPipeline {
         batch: crate::processor::batch_writer::BufferedBatch,
         report: &mut PipelineReport,
     ) -> Result<(), StorageError> {
-        let persisted = self.decoder.decode(batch, &mut self.custom_decoders, &self.block_time_cache);
+        let persisted =
+            self.decoder
+                .decode(batch, &mut self.custom_decoders, &self.block_time_cache);
         let result = self
             .sink
-            .write_batch(&persisted, checkpoint_update_for_batch(&persisted)).await?;
+            .write_batch(&persisted, checkpoint_update_for_batch(&persisted))
+            .await?;
         apply_batch(report, persisted, result);
         Ok(())
     }
@@ -158,31 +164,31 @@ fn max_optional(left: Option<i64>, right: Option<i64>) -> Option<i64> {
 fn latest_processed_slot(batch: &PersistedBatch) -> Option<i64> {
     // Use tracked slot first (populated for all events including BlockMeta)
     // Fall back to extracting from rows for backwards compatibility
-    batch.last_processed_slot
-        .or_else(|| {
-            batch.slot_rows
-                .iter()
-                .map(|row| row.slot)
-                .chain(batch.transaction_rows.iter().map(|row| row.slot))
-                .chain(batch.account_rows.iter().map(|row| row.slot))
-                .chain(batch.custom_rows.iter().map(|row| row.slot))
-                .max()
-        })
+    batch.last_processed_slot.or_else(|| {
+        batch
+            .slot_rows
+            .iter()
+            .map(|row| row.slot)
+            .chain(batch.transaction_rows.iter().map(|row| row.slot))
+            .chain(batch.account_rows.iter().map(|row| row.slot))
+            .chain(batch.custom_rows.iter().map(|row| row.slot))
+            .max()
+    })
 }
 
 fn checkpoint_update_for_batch(batch: &PersistedBatch) -> Option<CheckpointUpdate> {
     // Use tracked slot/timestamp first (populated for all events including BlockMeta)
     // Fall back to extracting from rows for backwards compatibility
-    let last_processed_slot = batch.last_processed_slot
-        .or_else(|| {
-            batch.slot_rows
-                .iter()
-                .map(|row| row.slot)
-                .chain(batch.transaction_rows.iter().map(|row| row.slot))
-                .chain(batch.account_rows.iter().map(|row| row.slot))
-                .chain(batch.custom_rows.iter().map(|row| row.slot))
-                .max()
-        });
+    let last_processed_slot = batch.last_processed_slot.or_else(|| {
+        batch
+            .slot_rows
+            .iter()
+            .map(|row| row.slot)
+            .chain(batch.transaction_rows.iter().map(|row| row.slot))
+            .chain(batch.account_rows.iter().map(|row| row.slot))
+            .chain(batch.custom_rows.iter().map(|row| row.slot))
+            .max()
+    });
 
     let last_observed_at_unix_ms = batch.latest_timestamp_unix_ms()?;
 
@@ -247,7 +253,7 @@ mod tests {
         assert_eq!(report.account_rows_written, 1);
         assert_eq!(report.slot_rows_written, 1);
         assert_eq!(report.custom_rows_written, 1);
-        assert_eq!(report.sql_statements_planned, 8);
+        assert_eq!(report.sql_statements_planned, 4);
         assert_eq!(report.retained_account_rows, 1);
         assert_eq!(report.last_processed_slot, Some(10));
         assert_eq!(report.last_observed_at_unix_ms, Some(1_710_000_000_001));
@@ -288,11 +294,17 @@ mod tests {
         // Verify checkpoint information is tracked
         assert_eq!(persisted.last_processed_slot, Some(101));
         assert_eq!(persisted.last_observed_at_unix_ms, Some(1_710_000_000_120));
-        assert_eq!(persisted.last_on_chain_block_time_ms, Some(1_710_000_000_100));
+        assert_eq!(
+            persisted.last_on_chain_block_time_ms,
+            Some(1_710_000_000_100)
+        );
 
         // Verify checkpoint_update_for_batch returns Some (not None)
         let checkpoint = super::checkpoint_update_for_batch(&persisted);
-        assert!(checkpoint.is_some(), "Checkpoint should be updated even for BlockMeta-only batches");
+        assert!(
+            checkpoint.is_some(),
+            "Checkpoint should be updated even for BlockMeta-only batches"
+        );
 
         let checkpoint = checkpoint.unwrap();
         assert_eq!(checkpoint.last_processed_slot, Some(101));

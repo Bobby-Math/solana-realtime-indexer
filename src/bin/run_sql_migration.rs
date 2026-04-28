@@ -1,7 +1,7 @@
 // SQL Migration Runner
 // Usage: cargo run --bin run_sql_migration -- <migration_number>
 
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use std::env;
 use std::path::Path;
 
@@ -18,15 +18,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let migration_number = &args[1];
-    let migration_file = format!("migrations/{}_{}.sql",
+    let migration_file = format!(
+        "migrations/{}_{}.sql",
         migration_number,
         match migration_number.as_str() {
             "005" => "normalize_program_ids",
             "006" => "fix_log_messages_type",
             "007" => "dashboard_reader_user",
+            "008" => "timescaledb_retention_compression",
             _ => {
                 eprintln!("Unknown migration number: {}", migration_number);
-                eprintln!("Supported: 005, 006, 007");
+                eprintln!("Supported: 005, 006, 007, 008");
                 std::process::exit(1);
             }
         }
@@ -37,8 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
-    let database_url = env::var("DATABASE_URL")
-        .expect("DATABASE_URL must be set");
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     println!("🔧 Connecting to database...");
 
@@ -73,20 +74,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match sqlx::query(statement).execute(&pool).await {
             Ok(result) => {
-                println!("       ✅ Success (rows affected: {})", result.rows_affected());
+                println!(
+                    "       ✅ Success (rows affected: {})",
+                    result.rows_affected()
+                );
             }
             Err(e) => {
                 // Check if it's an "already exists" error
                 let error_msg = e.to_string().to_lowercase();
-                if error_msg.contains("already exists") ||
-                   error_msg.contains("duplicate") ||
-                   error_msg.contains("does not exist") && error_msg.contains("drop") {
-                    println!("       ⚠️  Skipped (already applied or safe to ignore): {}", e);
+                if error_msg.contains("already exists")
+                    || error_msg.contains("duplicate")
+                    || error_msg.contains("does not exist") && error_msg.contains("drop")
+                {
+                    println!(
+                        "       ⚠️  Skipped (already applied or safe to ignore): {}",
+                        e
+                    );
                 } else if force {
                     println!("       ⚠️  Forced continuation despite error: {}", e);
                 } else {
                     eprintln!("       ❌ Error: {}", e);
-                    eprintln!("       Statement: {}", &statement[..200.min(statement.len())]);
+                    eprintln!(
+                        "       Statement: {}",
+                        &statement[..200.min(statement.len())]
+                    );
                     eprintln!("       Use --force to continue on errors");
                     return Err(e.into());
                 }

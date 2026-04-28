@@ -27,7 +27,9 @@ impl RetentionPolicy {
     /// Read retention policy from environment variable RETENTION_MAX_AGE_SECS
     /// Defaults to 3600 seconds (1 hour) if not set or invalid
     pub fn from_env() -> Self {
-        Self::from_max_age_secs(parse_max_age_secs(std::env::var("RETENTION_MAX_AGE_SECS").ok().as_deref()))
+        Self::from_max_age_secs(parse_max_age_secs(
+            std::env::var("RETENTION_MAX_AGE_SECS").ok().as_deref(),
+        ))
     }
 }
 
@@ -158,7 +160,9 @@ mod tests {
     use super::{RetentionPolicy, Type1Store};
     use crate::processor::batch_writer::FlushReason;
     use crate::processor::decoder::PersistedBatch;
-    use crate::processor::schema::{AccountUpdateRow, CustomDecodedRow, SlotRow, TransactionRow};
+    use crate::processor::schema::{
+        test_helpers::test_signature, AccountUpdateRow, CustomDecodedRow, SlotRow, TransactionRow,
+    };
     use std::time::Duration;
 
     #[test]
@@ -193,7 +197,7 @@ mod tests {
             transaction_rows: vec![TransactionRow {
                 slot: 2,
                 timestamp_unix_ms: 125,
-                signature: vec![4],
+                signature: test_signature(4),
                 fee: 5,
                 success: true,
                 program_ids: vec![vec![9]],
@@ -253,7 +257,7 @@ mod tests {
             transaction_rows: vec![TransactionRow {
                 slot: 1,
                 timestamp_unix_ms: 150,
-                signature: vec![4],
+                signature: test_signature(4),
                 fee: 5,
                 success: true,
                 program_ids: vec![vec![9]],

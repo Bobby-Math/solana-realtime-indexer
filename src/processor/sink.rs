@@ -1,10 +1,10 @@
 use crate::processor::decoder::PersistedBatch;
 use crate::processor::sql::{execute_batch, CheckpointUpdate};
 use crate::processor::store::{StoreSnapshot, Type1Store};
+use async_trait::async_trait;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use async_trait::async_trait;
 
 #[derive(Debug, Clone, Default)]
 pub struct StorageWriteResult {
@@ -78,14 +78,32 @@ impl StorageSink for DryRunStorageSink {
         batch: &PersistedBatch,
         checkpoint: Option<CheckpointUpdate>,
     ) -> Result<StorageWriteResult, StorageError> {
-        // Estimate statement count (same logic as execute_batch)
+        // Mirror execute_batch exactly so dry-run mode surfaces the same write
+        // planning behavior as the production sink.
         let mut statement_count = 0u64;
-        if !batch.account_rows.is_empty() { statement_count += 1; }
-        if !batch.transaction_rows.is_empty() { statement_count += 1; }
-        if !batch.slot_rows.is_empty() { statement_count += 1; }
-        if !batch.custom_rows.is_empty() { statement_count += 1; }
-        if batch.latest_timestamp_unix_ms().is_some() { statement_count += 4; } // retention deletes for 4 tables
-        if checkpoint.is_some() { statement_count += 1; }
+
+        if !batch.account_rows.is_empty() {
+            statement_count += 1;
+        }
+        if !batch.transaction_rows.is_empty() {
+            statement_count += 1;
+            if batch
+                .transaction_rows
+                .iter()
+                .any(|row| !row.program_ids.is_empty())
+            {
+                statement_count += 1;
+            }
+        }
+        if !batch.slot_rows.is_empty() {
+            statement_count += 1;
+        }
+        if !batch.custom_rows.is_empty() {
+            statement_count += 1;
+        }
+        if checkpoint.is_some() {
+            statement_count += 1;
+        }
 
         self.last_statement_count = statement_count;
 
@@ -104,7 +122,8 @@ impl StorageSink for DryRunStorageSink {
         // Dry run: just log what would be written
         log::info!(
             "Gap repair (dry run): would write {} transactions for slot {} to DB",
-            transactions.len(), slot
+            transactions.len(),
+            slot
         );
         Ok(())
     }
@@ -121,7 +140,11 @@ impl TimescaleStorageSink {
         Self::connect_with_pool_size(database_url, store, 20).await
     }
 
-    pub async fn connect_with_pool_size(database_url: &str, store: Type1Store, max_connections: u32) -> Result<Self, StorageError> {
+    pub async fn connect_with_pool_size(
+        database_url: &str,
+        store: Type1Store,
+        max_connections: u32,
+    ) -> Result<Self, StorageError> {
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .min_connections(2)
@@ -166,11 +189,21 @@ impl StorageSink for TimescaleStorageSink {
             let retention_policy = self.store.retention_policy.clone();
             let checkpoint = checkpoint.clone();
 
-            let mut transaction = pool.begin().await
+            let mut transaction = pool
+                .begin()
+                .await
                 .map_err(|error| StorageError::Execute(error.to_string()))?;
-            let count = execute_batch(&mut transaction, &batch, &retention_policy, checkpoint.as_ref()).await
-                .map_err(|error| StorageError::Execute(error.to_string()))?;
-            transaction.commit().await
+            let count = execute_batch(
+                &mut transaction,
+                &batch,
+                &retention_policy,
+                checkpoint.as_ref(),
+            )
+            .await
+            .map_err(|error| StorageError::Execute(error.to_string()))?;
+            transaction
+                .commit()
+                .await
                 .map_err(|error| StorageError::Execute(error.to_string()))?;
             count
         };
@@ -195,45 +228,50 @@ impl StorageSink for TimescaleStorageSink {
         let pool = self.pool.clone();
 
         {
-            let mut tx = pool.begin().await
+            let mut tx = pool
+                .begin()
+                .await
                 .map_err(|error| StorageError::Execute(error.to_string()))?;
 
             // Write slot first (idempotent upsert)
-            execute_slots_upsert(&mut tx, &[slot_row]).await
+            execute_slots_upsert(&mut tx, &[slot_row])
+                .await
                 .map_err(|error| StorageError::Execute(error.to_string()))?;
 
             // Write transactions (ON CONFLICT DO NOTHING — safe even if live stream
             // somehow also delivered these)
             if !transactions.is_empty() {
-                execute_transactions_insert(&mut tx, &transactions).await
+                execute_transactions_insert(&mut tx, &transactions)
+                    .await
                     .map_err(|error| StorageError::Execute(error.to_string()))?;
             }
 
-            tx.commit().await
+            tx.commit()
+                .await
                 .map_err(|error| StorageError::Execute(error.to_string()))?;
         }
 
         log::info!(
             "Gap repair: wrote {} transactions for slot {} directly to DB",
-            transactions.len(), slot
+            transactions.len(),
+            slot
         );
         Ok(())
     }
 }
-
 
 #[cfg(test)]
 mod tests {
     use super::{DryRunStorageSink, StorageSink};
     use crate::processor::batch_writer::FlushReason;
     use crate::processor::decoder::PersistedBatch;
-    use crate::processor::schema::AccountUpdateRow;
+    use crate::processor::schema::{test_helpers::make_transaction_row, AccountUpdateRow};
     use crate::processor::sql::CheckpointUpdate;
     use crate::processor::store::{RetentionPolicy, Type1Store};
     use std::time::Duration;
 
     #[tokio::test]
-    async fn dry_run_sink_estimates_statement_count_and_updates_store_snapshot() {
+    async fn dry_run_sink_estimates_statement_count_account_only() {
         let mut sink = DryRunStorageSink::new(Type1Store::new(RetentionPolicy {
             max_age: Duration::from_secs(60),
         }));
@@ -270,7 +308,39 @@ mod tests {
             .expect("dry-run write");
 
         assert_eq!(result.snapshot.account_rows, 1);
-        assert_eq!(result.sql_statements_planned, 6); // 1 account + 1 checkpoint + 4 retention deletes
-        assert_eq!(sink.last_statement_count(), 6);
+        assert_eq!(result.sql_statements_planned, 2);
+        assert_eq!(sink.last_statement_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn dry_run_sink_counts_program_id_statement_separately() {
+        let mut sink = DryRunStorageSink::new(Type1Store::new(RetentionPolicy {
+            max_age: Duration::from_secs(60),
+        }));
+        let batch = PersistedBatch {
+            reason: FlushReason::Size,
+            account_rows: vec![],
+            transaction_rows: vec![make_transaction_row(10, 1_710_000_000_000, 1)],
+            slot_rows: vec![],
+            custom_rows: vec![],
+            last_processed_slot: Some(10),
+            last_observed_at_unix_ms: Some(1_710_000_000_000),
+            last_on_chain_block_time_ms: Some(1_710_000_000_000),
+        };
+
+        let result = sink
+            .write_batch(
+                &batch,
+                Some(CheckpointUpdate {
+                    stream_name: "geyser-main".to_string(),
+                    last_processed_slot: Some(10),
+                    last_observed_at_unix_ms: 1_710_000_000_000,
+                    notes: None,
+                }),
+            )
+            .await
+            .expect("dry-run write");
+
+        assert_eq!(result.sql_statements_planned, 3);
     }
 }

@@ -44,10 +44,14 @@ cargo run
 - **REST API**: Health and metrics endpoints
 - **Dual Mode**: Safe development mode + production Geyser mode
 
-## 📖 Documentation
+## 🗄️ Migrations
 
-- **[Geyser Client Guide](GEYSER_CLIENT_README.md)**: Complete Helius integration documentation
-- **[Architecture](ARCHITECTURE.md)**: System design and module breakdown
+The current production schema expects the full migration set in `migrations/`,
+including:
+
+- `006_fix_log_messages_type.sql` to store `transactions.log_messages` as `JSONB`
+- `008_timescaledb_retention_compression.sql` to move retention/compression to
+  TimescaleDB background policies instead of inline deletes on the ingest path
 
 ## 🔧 Configuration
 

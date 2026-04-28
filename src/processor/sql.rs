@@ -1,9 +1,9 @@
 use crate::processor::decoder::PersistedBatch;
-use crate::processor::sanitize::sanitize_log_messages;
+use crate::processor::sanitize::sanitize_log_message;
 use crate::processor::schema::{AccountUpdateRow, CustomDecodedRow, SlotRow, TransactionRow};
 use crate::processor::store::RetentionPolicy;
-use sqlx::Transaction;
 use chrono::{TimeZone, Utc};
+use sqlx::Transaction;
 
 /// Safely convert Unix milliseconds to DateTime<Utc>, returning a sqlx::Error on out-of-range values.
 /// This prevents silent panics from `.unwrap()` in async contexts.
@@ -29,7 +29,7 @@ pub struct CheckpointUpdate {
 pub async fn execute_batch(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     batch: &PersistedBatch,
-    retention_policy: &RetentionPolicy,
+    _retention_policy: &RetentionPolicy,
     checkpoint: Option<&CheckpointUpdate>,
 ) -> Result<u64, sqlx::Error> {
     let mut statement_count = 0u64;
@@ -40,8 +40,11 @@ pub async fn execute_batch(
     }
 
     if !batch.transaction_rows.is_empty() {
-        execute_transactions_insert(transaction, &batch.transaction_rows).await?;
+        let pid_count = execute_transactions_insert(transaction, &batch.transaction_rows).await?;
         statement_count += 1;
+        if pid_count > 0 {
+            statement_count += 1;
+        }
     }
 
     if !batch.slot_rows.is_empty() {
@@ -52,10 +55,6 @@ pub async fn execute_batch(
     if !batch.custom_rows.is_empty() {
         execute_custom_decoded_insert(transaction, &batch.custom_rows).await?;
         statement_count += 1;
-    }
-
-    if let Some(latest_timestamp_unix_ms) = batch.latest_timestamp_unix_ms() {
-        statement_count += execute_retention_deletes(transaction, latest_timestamp_unix_ms, retention_policy).await?;
     }
 
     if let Some(checkpoint) = checkpoint {
@@ -75,10 +74,10 @@ async fn execute_account_updates_insert(
         .map(|row| to_utc_timestamp(row.timestamp_unix_ms))
         .collect::<Result<Vec<_>, _>>()?;
     let slots: Vec<i64> = rows.iter().map(|row| row.slot).collect();
-    let pubkeys: Vec<Vec<u8>> = rows.iter().map(|row| row.pubkey.clone()).collect();
-    let owners: Vec<Vec<u8>> = rows.iter().map(|row| row.owner.clone()).collect();
+    let pubkeys: Vec<&[u8]> = rows.iter().map(|row| row.pubkey.as_ref()).collect();
+    let owners: Vec<&[u8]> = rows.iter().map(|row| row.owner.as_ref()).collect();
     let lamports: Vec<i64> = rows.iter().map(|row| row.lamports).collect();
-    let data: Vec<Vec<u8>> = rows.iter().map(|row| row.data.clone()).collect();
+    let data: Vec<&[u8]> = rows.iter().map(|row| row.data.as_ref()).collect();
     let write_versions: Vec<i64> = rows.iter().map(|row| row.write_version).collect();
 
     sqlx::query(
@@ -102,24 +101,23 @@ async fn execute_account_updates_insert(
 pub async fn execute_transactions_insert(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     rows: &[TransactionRow],
-) -> Result<(), sqlx::Error> {
+) -> Result<usize, sqlx::Error> {
     // ── Part 1: flat transaction rows (no program_ids) ─────────────────────────
     let timestamps: Vec<chrono::DateTime<Utc>> = rows
         .iter()
         .map(|row| to_utc_timestamp(row.timestamp_unix_ms))
         .collect::<Result<Vec<_>, _>>()?;
     let slots: Vec<i64> = rows.iter().map(|row| row.slot).collect();
-    let signatures: Vec<Vec<u8>> = rows.iter().map(|row| row.signature.clone()).collect();
+    let signatures: Vec<&[u8]> = rows.iter().map(|row| row.signature.as_ref()).collect();
     let fees: Vec<i64> = rows.iter().map(|row| row.fee).collect();
     let successes: Vec<bool> = rows.iter().map(|row| row.success).collect();
     let log_messages_json: Vec<serde_json::Value> = rows
         .iter()
         .map(|row| {
-            let sanitized = sanitize_log_messages(&row.log_messages);
             serde_json::Value::Array(
-                sanitized
+                row.log_messages
                     .iter()
-                    .map(|msg| serde_json::Value::String(msg.clone()))
+                    .map(|msg| serde_json::Value::String(sanitize_log_message(msg)))
                     .collect(),
             )
         })
@@ -131,7 +129,7 @@ pub async fn execute_transactions_insert(
              $1::timestamptz[], $2::bigint[], $3::bytea[],
              $4::bigint[],      $5::bool[],   $6::jsonb[]
          )
-         ON CONFLICT (timestamp, signature) DO NOTHING"
+         ON CONFLICT (timestamp, signature) DO NOTHING",
     )
     .bind(&timestamps)
     .bind(&slots)
@@ -143,38 +141,46 @@ pub async fn execute_transactions_insert(
     .await?;
 
     // ── Part 2: exploded program_id rows (one per program_id) ───────────────────
-    let mut pid_timestamps: Vec<chrono::DateTime<Utc>> = Vec::new();
-    let mut pid_signatures: Vec<Vec<u8>> = Vec::new();
-    let mut pid_program_ids: Vec<Vec<u8>> = Vec::new();
-    let mut pid_positions: Vec<i16> = Vec::new();
+    let total_pids: usize = rows.iter().map(|row| row.program_ids.len()).sum();
+    if total_pids == 0 {
+        return Ok(0);
+    }
+
+    let mut pid_timestamps: Vec<chrono::DateTime<Utc>> = Vec::with_capacity(total_pids);
+    let mut pid_signatures: Vec<[u8; 64]> = Vec::with_capacity(total_pids);
+    let mut pid_program_ids: Vec<&[u8]> = Vec::with_capacity(total_pids);
+    let mut pid_positions: Vec<i16> = Vec::with_capacity(total_pids);
 
     for row in rows {
         let ts = to_utc_timestamp(row.timestamp_unix_ms)?;
         for (pos, program_id) in row.program_ids.iter().enumerate() {
             pid_timestamps.push(ts);
-            pid_signatures.push(row.signature.clone());
-            pid_program_ids.push(program_id.clone());
+            pid_signatures.push(row.signature);
+            pid_program_ids.push(program_id.as_ref());
             pid_positions.push(pos as i16);
         }
     }
 
-    if !pid_program_ids.is_empty() {
-        sqlx::query(
-            "INSERT INTO transaction_program_ids (timestamp, signature, program_id, position)
-             SELECT * FROM UNNEST(
-                 $1::timestamptz[], $2::bytea[], $3::bytea[], $4::smallint[]
-             )
-             ON CONFLICT DO NOTHING"
-        )
-        .bind(&pid_timestamps)
-        .bind(&pid_signatures)
-        .bind(&pid_program_ids)
-        .bind(&pid_positions)
-        .execute(&mut **transaction)
-        .await?;
-    }
+    let pid_signature_slices: Vec<&[u8]> = pid_signatures
+        .iter()
+        .map(|signature| signature.as_ref())
+        .collect();
 
-    Ok(())
+    sqlx::query(
+        "INSERT INTO transaction_program_ids (timestamp, signature, program_id, position)
+         SELECT * FROM UNNEST(
+             $1::timestamptz[], $2::bytea[], $3::bytea[], $4::smallint[]
+         )
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(&pid_timestamps)
+    .bind(&pid_signature_slices)
+    .bind(&pid_program_ids)
+    .bind(&pid_positions)
+    .execute(&mut **transaction)
+    .await?;
+
+    Ok(total_pids)
 }
 
 pub async fn execute_slots_upsert(
@@ -194,7 +200,7 @@ pub async fn execute_slots_upsert(
          SELECT * FROM UNNEST($1::bigint[], $2::bigint[], $3::timestamptz[], $4::text[])
          ON CONFLICT (timestamp, slot) DO UPDATE SET
            parent_slot = EXCLUDED.parent_slot,
-           status = EXCLUDED.status"
+           status = EXCLUDED.status",
     )
     .bind(&slots)
     .bind(&parent_slots)
@@ -239,40 +245,6 @@ async fn execute_custom_decoded_insert(
     Ok(())
 }
 
-async fn execute_retention_deletes(
-    transaction: &mut Transaction<'_, sqlx::Postgres>,
-    latest_timestamp_unix_ms: i64,
-    retention_policy: &RetentionPolicy,
-) -> Result<u64, sqlx::Error> {
-    let max_age_ms = i64::try_from(retention_policy.max_age.as_millis())
-        .unwrap_or(i64::MAX);
-    let cutoff_ms = latest_timestamp_unix_ms.saturating_sub(max_age_ms);
-    let cutoff = to_utc_timestamp(cutoff_ms)?;
-
-    sqlx::query("DELETE FROM account_updates WHERE timestamp < $1")
-        .bind(cutoff)
-        .execute(&mut **transaction)
-        .await?;
-    sqlx::query("DELETE FROM transactions WHERE timestamp < $1")
-        .bind(cutoff)
-        .execute(&mut **transaction)
-        .await?;
-    sqlx::query("DELETE FROM transaction_program_ids WHERE timestamp < $1")
-        .bind(cutoff)
-        .execute(&mut **transaction)
-        .await?;
-    sqlx::query("DELETE FROM custom_decoded_events WHERE timestamp < $1")
-        .bind(cutoff)
-        .execute(&mut **transaction)
-        .await?;
-    sqlx::query("DELETE FROM slots WHERE timestamp < $1")
-        .bind(cutoff)
-        .execute(&mut **transaction)
-        .await?;
-
-    Ok(5)
-}
-
 async fn execute_checkpoint_upsert(
     transaction: &mut Transaction<'_, sqlx::Postgres>,
     checkpoint: &CheckpointUpdate,
@@ -296,8 +268,6 @@ async fn execute_checkpoint_upsert(
 
     Ok(())
 }
-
-
 
 #[cfg(test)]
 mod tests {
