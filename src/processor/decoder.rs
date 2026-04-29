@@ -111,42 +111,76 @@ impl Type1Decoder {
 
             match event {
                 GeyserEvent::AccountUpdate(update) => {
+                    let crate::geyser::decoder::AccountUpdate {
+                        timestamp_unix_ms,
+                        slot,
+                        pubkey,
+                        owner,
+                        lamports,
+                        write_version,
+                        data,
+                    } = update;
+
                     // Use block_time if available, fall back to wall-clock timestamp
-                    let timestamp_ms = block_time_cache
-                        .get(update.slot)
-                        .unwrap_or(update.timestamp_unix_ms);
+                    let timestamp_ms = block_time_cache.get(slot).unwrap_or(timestamp_unix_ms);
 
                     persisted.account_rows.push(AccountUpdateRow {
-                        slot: update.slot as i64,
+                        slot: slot as i64,
                         timestamp_unix_ms: timestamp_ms,
-                        pubkey: update.pubkey.clone(),
-                        owner: update.owner.clone(),
-                        lamports: update.lamports as i64,
-                        data: update.data,
-                        write_version: update.write_version as i64,
+                        pubkey,
+                        owner,
+                        lamports: lamports as i64,
+                        data,
+                        write_version: write_version as i64,
                     });
                 }
                 GeyserEvent::Transaction(update) => {
-                    // Use block_time if available, fall back to wall-clock timestamp
-                    let timestamp_ms = block_time_cache
-                        .get(update.slot)
-                        .unwrap_or(update.timestamp_unix_ms);
+                    let crate::geyser::decoder::TransactionUpdate {
+                        timestamp_unix_ms,
+                        slot,
+                        signature: raw_signature,
+                        fee,
+                        success,
+                        accounts: _,
+                        program_ids: raw_program_ids,
+                        log_messages,
+                    } = update;
 
-                    let signature = TransactionRow::signature_from_slice(&update.signature);
+                    // Use block_time if available, fall back to wall-clock timestamp
+                    let timestamp_ms = block_time_cache.get(slot).unwrap_or(timestamp_unix_ms);
+
+                    let signature = TransactionRow::signature_from_slice(&raw_signature);
+                    let mut program_ids = Vec::with_capacity(raw_program_ids.len());
+                    let mut invalid_program_ids = 0usize;
+
+                    for program_id in raw_program_ids {
+                        match TransactionRow::program_id_from_slice(&program_id) {
+                            Some(program_id) => program_ids.push(program_id),
+                            None => invalid_program_ids += 1,
+                        }
+                    }
+
+                    if invalid_program_ids > 0 {
+                        log::warn!(
+                            "Dropped {} malformed program_ids while decoding transaction at slot {}",
+                            invalid_program_ids,
+                            slot
+                        );
+                    }
 
                     log::debug!(
                         "Processing transaction: slot={} program_ids={}",
-                        update.slot,
-                        update.program_ids.len()
+                        slot,
+                        program_ids.len()
                     );
                     persisted.transaction_rows.push(TransactionRow {
-                        slot: update.slot as i64,
+                        slot: slot as i64,
                         timestamp_unix_ms: timestamp_ms,
                         signature,
-                        fee: update.fee as i64,
-                        success: update.success,
-                        program_ids: update.program_ids,
-                        log_messages: update.log_messages,
+                        fee: fee as i64,
+                        success,
+                        program_ids,
+                        log_messages,
                     });
                 }
                 GeyserEvent::SlotUpdate(update) => {
@@ -295,5 +329,31 @@ mod tests {
         assert_eq!(persisted.transaction_rows.len(), 1);
         assert_eq!(persisted.custom_rows.len(), 2);
         assert_eq!(persisted.transaction_rows[0].log_messages.len(), 1);
+    }
+
+    #[test]
+    fn type1_decoder_drops_malformed_program_ids() {
+        let decoder = Type1Decoder::new();
+        let mut custom_decoders: Vec<Box<dyn CustomDecoder>> = Vec::new();
+        let batch = BufferedBatch {
+            reason: FlushReason::Size,
+            events: vec![GeyserEvent::Transaction(TransactionUpdate {
+                timestamp_unix_ms: 1_710_000_000_001,
+                slot: 50,
+                signature: vec![7; 64],
+                fee: 5_000,
+                success: true,
+                accounts: vec![],
+                program_ids: vec![vec![1; 32], vec![2; 31], vec![3; 33]],
+                log_messages: vec![],
+            })],
+        };
+
+        let block_time_cache = BlockTimeCache::new(1000);
+        let persisted = decoder.decode(batch, &mut custom_decoders, &block_time_cache);
+
+        assert_eq!(persisted.transaction_rows.len(), 1);
+        assert_eq!(persisted.transaction_rows[0].program_ids.len(), 1);
+        assert_eq!(persisted.transaction_rows[0].program_ids[0], [1; 32]);
     }
 }

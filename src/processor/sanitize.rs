@@ -4,13 +4,13 @@
 /// - Replaces invalid UTF-8 sequences with the Unicode replacement character (U+FFFD)
 /// - Removes null bytes
 /// - Truncates excessively long strings
-pub fn sanitize_string(input: &str, max_length: usize) -> String {
+pub fn sanitize_string(input: &str, max_length_chars: usize) -> String {
     // Remove null bytes (can cause issues with PostgreSQL text types)
     let without_nulls: String = input.chars().filter(|c| *c != '\0').collect();
 
-    // Truncate if too long
-    if without_nulls.len() > max_length {
-        without_nulls.chars().take(max_length).collect()
+    // Truncate using the same unit we enforce: Unicode scalar values.
+    if without_nulls.chars().count() > max_length_chars {
+        without_nulls.chars().take(max_length_chars).collect()
     } else {
         without_nulls
     }
@@ -25,15 +25,16 @@ pub fn sanitize_utf8(bytes: &[u8]) -> String {
 /// Sanitizes log messages for database storage
 /// Log messages can contain arbitrary binary data from programs
 pub fn sanitize_log_message(msg: &str) -> String {
-    // Max log message length: 1MB (PostgreSQL limit is ~1GB for text, but we want safety)
-    const MAX_LOG_LENGTH: usize = 1_048_576;
+    // Max log message length: 1,048,576 Unicode scalar values.
+    // This keeps the truncation unit consistent with sanitize_string.
+    const MAX_LOG_LENGTH_CHARS: usize = 1_048_576;
 
     let filtered: String = msg
         .chars()
         .filter(|c| *c != '\0' && *c != '\u{FFFD}')
         .collect();
 
-    sanitize_string(&filtered, MAX_LOG_LENGTH)
+    sanitize_string(&filtered, MAX_LOG_LENGTH_CHARS)
 }
 
 /// Sanitizes a vector of log messages
@@ -79,6 +80,14 @@ mod tests {
         let input = "a".repeat(1000);
         let result = sanitize_string(&input, 100);
         assert_eq!(result.len(), 100);
+    }
+
+    #[test]
+    fn test_sanitize_string_truncates_by_codepoint_count() {
+        let input = "🙂🙂🙂";
+        let result = sanitize_string(input, 2);
+        assert_eq!(result, "🙂🙂");
+        assert_eq!(result.chars().count(), 2);
     }
 
     #[test]

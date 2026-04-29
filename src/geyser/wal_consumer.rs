@@ -284,7 +284,9 @@ impl WalPipelineRunner {
 
         // CRITICAL FIX: Mark sequences as processed ONLY AFTER DB commit succeeds
         // This prevents data loss if crash occurs between buffering and DB flush
-        if let Some(max_seq) = self.pending_checkpoint_seqs.iter().copied().max() {
+        let pending_checkpoint_seqs = std::mem::take(&mut self.pending_checkpoint_seqs);
+
+        if let Some(max_seq) = pending_checkpoint_seqs.iter().copied().max() {
             // Look up which slot corresponds to this seq
             let slot = match self.wal_queue.get_slot_for_seq(max_seq) {
                 Some(s) => s,
@@ -310,8 +312,7 @@ impl WalPipelineRunner {
                 return Ok(());
             }
 
-            let checkpointed_count = self.pending_checkpoint_seqs.len();
-            self.pending_checkpoint_seqs.clear();
+            let checkpointed_count = pending_checkpoint_seqs.len();
             log::debug!(
                 "Checkpointed {} sequences after DB commit (slot: {}, seq: {})",
                 checkpointed_count,
@@ -687,21 +688,24 @@ impl RpcGapFiller {
         }
 
         // Extract program_ids from transaction.message.instructions
-        let program_ids: Vec<Vec<u8>> = tx
+        let program_ids: Vec<[u8; 32]> = tx
             .get("transaction")
             .and_then(|t| t.get("message"))
             .and_then(|m| m.get("instructions"))
             .and_then(|v| v.as_array())
             .map(|instructions| {
-                let mut seen: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+                let mut seen: std::collections::HashSet<[u8; 32]> =
+                    std::collections::HashSet::new();
                 instructions
                     .iter()
                     .filter_map(|ix| {
                         ix.get("programIdIndex")
                             .and_then(|idx| idx.as_u64())
                             .and_then(|idx| account_keys.get(idx as usize))
-                            .filter(|key| seen.insert(key.as_slice()))
-                            .cloned()
+                            .and_then(|program_id| {
+                                TransactionRow::program_id_from_slice(program_id)
+                            })
+                            .filter(|key| seen.insert(*key))
                     })
                     .collect()
             })
@@ -1001,5 +1005,55 @@ mod tests {
             .expect("mapped-but-unrepairable slots should degrade to Ok(0)");
 
         assert_eq!(result, 0);
+    }
+
+    #[tokio::test]
+    async fn process_batch_clears_pending_checkpoint_seqs_when_slot_lookup_fails() {
+        let temp_dir = tempdir().unwrap();
+        let wal_queue = Arc::new(WalQueue::new(temp_dir.path()).unwrap());
+
+        let mut runner = WalPipelineRunner::new(
+            wal_queue,
+            WalPipelineConfig {
+                wal_path: temp_dir.path().display().to_string(),
+                poll_interval: Duration::from_millis(10),
+                batch_size: 1,
+                batch_flush_ms: 1,
+            },
+            Arc::new(RwLock::new(crate::api::rest::ApiSnapshot::from_report(
+                "test",
+                "dry-run",
+                "127.0.0.1:0",
+                0,
+                0,
+                Duration::from_secs(0),
+                0,
+                PipelineReport::default(),
+            ))),
+            BatchWriter::new(1, Duration::from_millis(1)),
+            Type1Decoder::default(),
+            Vec::new(),
+            Box::new(DryRunStorageSink::new(Type1Store::new(RetentionPolicy {
+                max_age: Duration::from_secs(60),
+            }))),
+        );
+        let mut report = PipelineReport::default();
+
+        runner.pending_checkpoint_seqs = vec![42];
+        runner
+            .process_batch(
+                BufferedBatch {
+                    reason: crate::processor::batch_writer::FlushReason::Interval,
+                    events: vec![],
+                },
+                &mut report,
+            )
+            .await
+            .expect("missing slot mapping should not fail the batch");
+
+        assert!(
+            runner.pending_checkpoint_seqs.is_empty(),
+            "failing checkpoint attempts must not poison future batches"
+        );
     }
 }

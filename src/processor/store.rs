@@ -161,7 +161,8 @@ mod tests {
     use crate::processor::batch_writer::FlushReason;
     use crate::processor::decoder::PersistedBatch;
     use crate::processor::schema::{
-        test_helpers::test_signature, AccountUpdateRow, CustomDecodedRow, SlotRow, TransactionRow,
+        test_helpers::{test_program_id, test_signature},
+        AccountUpdateRow, CustomDecodedRow, SlotRow, TransactionRow,
     };
     use std::time::Duration;
 
@@ -200,7 +201,7 @@ mod tests {
                 signature: test_signature(4),
                 fee: 5,
                 success: true,
-                program_ids: vec![vec![9]],
+                program_ids: vec![test_program_id(9)],
                 log_messages: vec!["ok".to_string()],
             }],
             slot_rows: vec![SlotRow {
@@ -260,7 +261,7 @@ mod tests {
                 signature: test_signature(4),
                 fee: 5,
                 success: true,
-                program_ids: vec![vec![9]],
+                program_ids: vec![test_program_id(9)],
                 log_messages: vec!["ok".to_string()],
             }],
             slot_rows: vec![SlotRow {

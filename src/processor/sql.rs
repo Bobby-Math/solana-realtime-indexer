@@ -157,7 +157,7 @@ pub async fn execute_transactions_insert(
             pid_timestamps.push(ts);
             pid_signatures.push(row.signature);
             pid_program_ids.push(program_id.as_ref());
-            pid_positions.push(pos as i16);
+            pid_positions.push((pos + 1) as i16);
         }
     }
 

@@ -7,8 +7,8 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS slot_health_1m AS
 SELECT
     time_bucket('1 minute', timestamp) AS bucket,
     COUNT(*) AS slot_count,
-    SUM(slot - parent_slot - 1) AS skipped_slots,
-    CAST(SUM(slot - parent_slot - 1) AS DOUBLE PRECISION) / NULLIF(COUNT(*) + SUM(slot - parent_slot - 1), 0) AS skip_rate,
+    SUM(COALESCE(slot - parent_slot - 1, 0)) AS skipped_slots,
+    CAST(SUM(COALESCE(slot - parent_slot - 1, 0)) AS DOUBLE PRECISION) / NULLIF(COUNT(*) + SUM(COALESCE(slot - parent_slot - 1, 0)), 0) AS skip_rate,
     CAST(COUNT(*) AS DOUBLE PRECISION) / 60.0 AS slots_per_second
 FROM slots
 WHERE status = 'finalized'

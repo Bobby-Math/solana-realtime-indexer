@@ -4,6 +4,8 @@ use sqlx::Row;
 
 use crate::api::SharedApiState;
 
+const SLOT_HEALTH_BUCKETS_PER_HOUR: i64 = 60;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NetworkStressResponse {
     pub buckets: Vec<SlotHealthBucket>,
@@ -17,14 +19,16 @@ pub struct NetworkStressResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SlotHealthBucket {
-    pub bucket: String,  // ISO8601 timestamp
+    pub bucket: String, // ISO8601 timestamp
     pub slot_count: i64,
     pub skipped_slots: i64,
     pub skip_rate: f64,
     pub slots_per_second: f64,
 }
 
-pub async fn get_network_stress(State(state): State<SharedApiState>) -> Json<NetworkStressResponse> {
+pub async fn get_network_stress(
+    State(state): State<SharedApiState>,
+) -> Json<NetworkStressResponse> {
     // Extract pool clone under lock, then release immediately
     let pool = {
         let snapshot = state.read().await;
@@ -33,7 +37,7 @@ pub async fn get_network_stress(State(state): State<SharedApiState>) -> Json<Net
 
     // Get the database pool from the snapshot if available
     let response = if let Some(ref pool) = pool {
-        // Query the last 30 buckets from the slot health materialized view
+        // Query the last 60 one-minute buckets from the slot health materialized view.
         let query_result = sqlx::query(
             r#"
             SELECT
@@ -44,9 +48,10 @@ pub async fn get_network_stress(State(state): State<SharedApiState>) -> Json<Net
                 slots_per_second
             FROM slot_health_1m
             ORDER BY bucket DESC
-            LIMIT 30
-            "#
+            LIMIT $1
+            "#,
         )
+        .bind(SLOT_HEALTH_BUCKETS_PER_HOUR)
         .fetch_all(pool)
         .await;
 
@@ -138,11 +143,11 @@ mod tests {
 
     #[test]
     fn test_stress_level_calculation() {
-        assert_eq!(calculate_stress_level(0.01), "normal");    // 1% skip rate
+        assert_eq!(calculate_stress_level(0.01), "normal"); // 1% skip rate
         assert_eq!(calculate_stress_level(0.02), "elevated"); // 2% skip rate
         assert_eq!(calculate_stress_level(0.04), "elevated"); // 4% skip rate
-        assert_eq!(calculate_stress_level(0.05), "high");     // 5% skip rate
-        assert_eq!(calculate_stress_level(0.09), "high");     // 9% skip rate
+        assert_eq!(calculate_stress_level(0.05), "high"); // 5% skip rate
+        assert_eq!(calculate_stress_level(0.09), "high"); // 9% skip rate
         assert_eq!(calculate_stress_level(0.10), "critical"); // 10% skip rate
         assert_eq!(calculate_stress_level(0.15), "critical"); // 15% skip rate
     }

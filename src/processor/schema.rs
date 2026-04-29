@@ -7,6 +7,9 @@
 ///   explode loop.
 /// - `program_ids` stays on `TransactionRow` as source data for the normalized
 ///   `transaction_program_ids` child table; it is not a `transactions` column.
+///   Program IDs are fixed-width `[u8; 32]` values for the same reason:
+///   Solana pubkeys are always 32 bytes, so variable-length `Vec<u8>` would
+///   weaken both the type guarantee and the hot-path allocation profile.
 #[derive(Debug, Clone)]
 pub struct AccountUpdateRow {
     pub slot: i64,
@@ -29,7 +32,7 @@ pub struct TransactionRow {
     pub fee: i64,
     pub success: bool,
     /// Source data for `transaction_program_ids`.
-    pub program_ids: Vec<Vec<u8>>,
+    pub program_ids: Vec<[u8; 32]>,
     pub log_messages: Vec<String>,
 }
 
@@ -43,6 +46,20 @@ impl TransactionRow {
         let len = bytes.len().min(signature.len());
         signature[..len].copy_from_slice(&bytes[..len]);
         signature
+    }
+
+    /// Convert a raw pubkey/program-id slice into the fixed-width representation.
+    ///
+    /// Invalid lengths are rejected rather than padded so malformed incoming
+    /// program IDs cannot silently enter the persisted schema.
+    pub fn program_id_from_slice(bytes: &[u8]) -> Option<[u8; 32]> {
+        if bytes.len() != 32 {
+            return None;
+        }
+
+        let mut program_id = [0u8; 32];
+        program_id.copy_from_slice(bytes);
+        Some(program_id)
     }
 }
 
@@ -77,6 +94,12 @@ pub mod test_helpers {
         signature
     }
 
+    pub fn test_program_id(seed: u8) -> [u8; 32] {
+        let mut program_id = [0u8; 32];
+        program_id[0] = seed;
+        program_id
+    }
+
     pub fn make_transaction_row(slot: i64, timestamp_unix_ms: i64, sig_seed: u8) -> TransactionRow {
         TransactionRow {
             slot,
@@ -84,7 +107,7 @@ pub mod test_helpers {
             signature: test_signature(sig_seed),
             fee: 5_000,
             success: true,
-            program_ids: vec![vec![9, 10, 11, 12]],
+            program_ids: vec![test_program_id(9)],
             log_messages: vec!["ok".to_string()],
         }
     }

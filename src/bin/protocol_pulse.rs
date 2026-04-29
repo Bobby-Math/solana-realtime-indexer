@@ -2,41 +2,40 @@
 // This creates an impressive live dashboard for prospects
 #![allow(dead_code)]
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
-use solana_realtime_indexer::geyser::decoder::GeyserEvent;
+
+use solana_realtime_indexer::geyser::decoder::{GeyserEvent, TransactionUpdate};
+
+const LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
+const HIGH_FEE_THRESHOLD_LAMPORTS: u64 = 10_000;
+const MAX_RECENT_ACTIVITY: usize = 100;
 
 #[derive(Debug, Clone)]
 struct ProtocolMetrics {
     total_value_locked: f64,
     active_users: u64,
-    transaction_volume_24h: f64,
+    transaction_count: u64,
+    observed_fee_volume_sol: f64,
     revenue_today: f64,
     health_score: f64,
-    alerts: Vec<String>,
 }
 
 struct ProtocolPulse {
     metrics: ProtocolMetrics,
     start_time: Instant,
-    large_transactions: Vec<LargeTransaction>,
-    price_movements: Vec<PriceMovement>,
+    alerts: VecDeque<String>,
+    high_fee_transactions: VecDeque<HighFeeTransaction>,
+    account_balances: HashMap<Vec<u8>, u64>,
+    active_user_pubkeys: HashSet<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
-struct LargeTransaction {
+struct HighFeeTransaction {
     timestamp: i64,
-    amount: f64,
-    wallet: String,
+    amount_sol: f64,
+    signature: String,
     description: String,
-}
-
-#[derive(Debug, Clone)]
-struct PriceMovement {
-    token_pair: String,
-    price_before: f64,
-    price_after: f64,
-    change_percent: f64,
-    timestamp: i64,
 }
 
 impl ProtocolPulse {
@@ -45,46 +44,59 @@ impl ProtocolPulse {
             metrics: ProtocolMetrics {
                 total_value_locked: 0.0,
                 active_users: 0,
-                transaction_volume_24h: 0.0,
+                transaction_count: 0,
+                observed_fee_volume_sol: 0.0,
                 revenue_today: 0.0,
                 health_score: 100.0,
-                alerts: Vec::new(),
             },
             start_time: Instant::now(),
-            large_transactions: Vec::new(),
-            price_movements: Vec::new(),
+            alerts: VecDeque::new(),
+            high_fee_transactions: VecDeque::new(),
+            account_balances: HashMap::new(),
+            active_user_pubkeys: HashSet::new(),
         }
     }
 
     fn process_event(&mut self, event: &GeyserEvent) {
         match event {
             GeyserEvent::Transaction(tx) => {
-                // Track large transactions
-                if tx.fee > 10000 {
-                    let signature_str = bs58::encode(&tx.signature).into_string();
+                let fee_sol = tx.fee as f64 / LAMPORTS_PER_SOL;
 
-                    self.large_transactions.push(LargeTransaction {
-                        timestamp: tx.timestamp_unix_ms,
-                        amount: tx.fee as f64 / 1_000_000.0, // Convert to lamports to SOL
-                        wallet: signature_str.clone(),
-                        description: format!("Large transaction: {} SOL", tx.fee as f64 / 1_000_000_000.0),
-                    });
+                if tx.fee > HIGH_FEE_THRESHOLD_LAMPORTS {
+                    let signature = bs58::encode(&tx.signature).into_string();
 
-                    // Add alert
-                    self.metrics.alerts.push(format!(
-                        "🚨 Large transaction detected: {} SOL - {}",
-                        tx.fee as f64 / 1_000_000_000.0,
-                        signature_str
-                    ));
+                    push_bounded(
+                        &mut self.high_fee_transactions,
+                        HighFeeTransaction {
+                            timestamp: tx.timestamp_unix_ms,
+                            amount_sol: fee_sol,
+                            signature: signature.clone(),
+                            description: format!("High-fee transaction: {fee_sol:.9} SOL"),
+                        },
+                    );
+
+                    push_bounded(
+                        &mut self.alerts,
+                        format!("🚨 High-fee transaction detected: {fee_sol:.9} SOL - {signature}"),
+                    );
                 }
 
-                // Update metrics
-                self.metrics.transaction_volume_24h += tx.fee as f64;
-                self.metrics.active_users += 1;
+                self.metrics.transaction_count += 1;
+                self.metrics.observed_fee_volume_sol += fee_sol;
+
+                if let Some(user) = tx.accounts.first() {
+                    self.active_user_pubkeys.insert(user.clone());
+                    self.metrics.active_users = self.active_user_pubkeys.len() as u64;
+                }
             }
             GeyserEvent::AccountUpdate(acc) => {
-                // Track TVL changes
-                self.metrics.total_value_locked += acc.lamports as f64 / 1_000_000_000.0;
+                self.account_balances
+                    .insert(acc.pubkey.clone(), acc.lamports);
+                self.metrics.total_value_locked = self
+                    .account_balances
+                    .values()
+                    .map(|lamports| *lamports as f64 / LAMPORTS_PER_SOL)
+                    .sum();
             }
             _ => {}
         }
@@ -92,7 +104,11 @@ impl ProtocolPulse {
 
     fn generate_live_report(&self) -> String {
         let elapsed = self.start_time.elapsed().as_secs_f64();
-        let tps = self.metrics.active_users as f64 / elapsed;
+        let tps = if elapsed > 0.0 {
+            self.metrics.transaction_count as f64 / elapsed
+        } else {
+            0.0
+        };
 
         format!(
             r#"
@@ -101,9 +117,10 @@ impl ProtocolPulse {
 ═══════════════════════════════════════════════════════════════
 
 ⏱️  LIVE MONITORING: {:.1}s active
-💰 TVL: ${:.2}M
-👥 Active Users: {} ({} events/sec)
-📊 24h Volume: ${:.2}M
+💰 TVL: {:.2} SOL
+👥 Active Users: {}
+🧾 Transactions Seen: {} ({:.1} TPS)
+💸 Observed Fees: {:.6} SOL
 💵 Revenue Today: ${:.2}
 🏥 Health Score: {:.1}/100
 
@@ -111,31 +128,41 @@ impl ProtocolPulse {
 🚨 ALERTS:
 {}
 ═══════════════════════════════════════════════════════════════
-🐋 RECENT LARGE TRANSACTIONS:
+🐋 RECENT HIGH-FEE TRANSACTIONS:
 {}
 ═══════════════════════════════════════════════════════════════
 "#,
             elapsed,
             self.metrics.total_value_locked,
             self.metrics.active_users,
+            self.metrics.transaction_count,
             tps,
-            self.metrics.transaction_volume_24h / 1_000_000.0,
+            self.metrics.observed_fee_volume_sol,
             self.metrics.revenue_today,
             self.metrics.health_score,
-            if self.metrics.alerts.is_empty() {
+            if self.alerts.is_empty() {
                 "✅ No alerts - All systems normal!".to_string()
             } else {
-                self.metrics.alerts.iter()
-                    .map(|a| format!("  • {}", a))
+                self.alerts
+                    .iter()
+                    .rev()
+                    .map(|alert| format!("  • {}", alert))
                     .collect::<Vec<_>>()
                     .join("\n")
             },
-            if self.large_transactions.is_empty() {
-                "  No large transactions yet...".to_string()
+            if self.high_fee_transactions.is_empty() {
+                "  No high-fee transactions yet...".to_string()
             } else {
-                self.large_transactions.iter()
+                self.high_fee_transactions
+                    .iter()
+                    .rev()
                     .take(5)
-                    .map(|tx| format!("  • {} SOL - {}", tx.amount, tx.description))
+                    .map(|tx| {
+                        format!(
+                            "  • {:.9} SOL - {} ({})",
+                            tx.amount_sol, tx.description, tx.signature
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join("\n")
             }
@@ -143,14 +170,19 @@ impl ProtocolPulse {
     }
 }
 
+fn push_bounded<T>(entries: &mut VecDeque<T>, entry: T) {
+    if entries.len() >= MAX_RECENT_ACTIVITY {
+        entries.pop_front();
+    }
+    entries.push_back(entry);
+}
+
 // This would be called from your main processing loop
 fn demo_protocol_pulse() {
     let mut pulse = ProtocolPulse::new();
 
-    // Simulate some events for demo
     println!("🚀 Starting Protocol Pulse Demo...\n");
 
-    // Show immediate live updates
     for i in 1..=5 {
         let simulated_event = create_demo_event(i);
         pulse.process_event(&simulated_event);
@@ -163,11 +195,11 @@ fn demo_protocol_pulse() {
 }
 
 fn create_demo_event(num: i32) -> GeyserEvent {
-    GeyserEvent::Transaction(solana_realtime_indexer::geyser::decoder::TransactionUpdate {
+    GeyserEvent::Transaction(TransactionUpdate {
         timestamp_unix_ms: chrono::Utc::now().timestamp_millis(),
         slot: 123456 + num as u64,
         signature: format!("demo_signature_{}", num).as_bytes().to_vec(),
-        fee: 50000 * num as u64, // Increasing fees
+        fee: 50_000 * num as u64,
         success: true,
         accounts: vec![format!("account_{}", num).as_bytes().to_vec()],
         program_ids: vec![b"token-program".to_vec()],
@@ -177,4 +209,86 @@ fn create_demo_event(num: i32) -> GeyserEvent {
 
 fn main() {
     demo_protocol_pulse();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use solana_realtime_indexer::geyser::decoder::AccountUpdate;
+
+    fn make_transaction_event(signature_seed: u8, fee: u64, user_seed: u8) -> GeyserEvent {
+        GeyserEvent::Transaction(TransactionUpdate {
+            timestamp_unix_ms: 1_710_000_000_000 + signature_seed as i64,
+            slot: 100 + signature_seed as u64,
+            signature: vec![signature_seed; 64],
+            fee,
+            success: true,
+            accounts: vec![vec![user_seed; 32]],
+            program_ids: vec![],
+            log_messages: vec![],
+        })
+    }
+
+    fn make_account_event(pubkey_seed: u8, lamports: u64) -> GeyserEvent {
+        GeyserEvent::AccountUpdate(AccountUpdate {
+            timestamp_unix_ms: 1_710_000_000_000 + pubkey_seed as i64,
+            slot: 200 + pubkey_seed as u64,
+            pubkey: vec![pubkey_seed; 32],
+            owner: vec![9; 32],
+            lamports,
+            write_version: 1,
+            data: vec![],
+        })
+    }
+
+    #[test]
+    fn high_fee_transaction_amount_uses_lamports_per_sol() {
+        let mut pulse = ProtocolPulse::new();
+        pulse.process_event(&make_transaction_event(1, 1_500_000_000, 7));
+
+        let tx = pulse
+            .high_fee_transactions
+            .back()
+            .expect("expected tracked high-fee transaction");
+        assert!((tx.amount_sol - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn account_updates_maintain_tvl_snapshot_per_account() {
+        let mut pulse = ProtocolPulse::new();
+
+        pulse.process_event(&make_account_event(1, 5_000_000_000));
+        pulse.process_event(&make_account_event(1, 3_000_000_000));
+        pulse.process_event(&make_account_event(2, 2_000_000_000));
+
+        assert!((pulse.metrics.total_value_locked - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn active_users_are_unique_while_tps_uses_transaction_count() {
+        let mut pulse = ProtocolPulse::new();
+
+        pulse.process_event(&make_transaction_event(1, 20_000, 9));
+        pulse.process_event(&make_transaction_event(2, 25_000, 9));
+        pulse.process_event(&make_transaction_event(3, 30_000, 8));
+
+        assert_eq!(pulse.metrics.active_users, 2);
+        assert_eq!(pulse.metrics.transaction_count, 3);
+    }
+
+    #[test]
+    fn recent_activity_buffers_are_bounded() {
+        let mut pulse = ProtocolPulse::new();
+
+        for seed in 0..(MAX_RECENT_ACTIVITY as u8 + 10) {
+            pulse.process_event(&make_transaction_event(
+                seed,
+                HIGH_FEE_THRESHOLD_LAMPORTS + 1,
+                seed,
+            ));
+        }
+
+        assert_eq!(pulse.high_fee_transactions.len(), MAX_RECENT_ACTIVITY);
+        assert_eq!(pulse.alerts.len(), MAX_RECENT_ACTIVITY);
+    }
 }

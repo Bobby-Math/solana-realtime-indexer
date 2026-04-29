@@ -5,6 +5,18 @@ use sqlx::PgPool;
 use std::env;
 use std::path::Path;
 
+fn split_sql_statements(sql_content: &str) -> Vec<String> {
+    sql_content
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .split(';')
+        .map(|statement| statement.trim().to_string())
+        .filter(|statement| !statement.is_empty())
+        .collect()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
@@ -26,9 +38,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "006" => "fix_log_messages_type",
             "007" => "dashboard_reader_user",
             "008" => "timescaledb_retention_compression",
+            "009" => "normalize_transaction_program_id_positions",
+            "010" => "rebuild_slot_health_aggregate",
             _ => {
                 eprintln!("Unknown migration number: {}", migration_number);
-                eprintln!("Supported: 005, 006, 007, 008");
+                eprintln!("Supported: 005, 006, 007, 008, 009, 010");
                 std::process::exit(1);
             }
         }
@@ -55,11 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Split by semicolons and execute each statement
     // This is a simple approach - for production, use a proper migration library
-    let statements: Vec<String> = sql_content
-        .split(';')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && !s.starts_with("--"))
-        .collect();
+    let statements = split_sql_statements(&sql_content);
 
     println!("🚧 Executing {} SQL statements...", statements.len());
 
@@ -108,4 +118,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🎉 Migration {} complete!", migration_number);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_sql_statements;
+
+    #[test]
+    fn split_sql_statements_keeps_sql_after_leading_comments() {
+        let sql = r#"
+-- Migration comment
+CREATE TABLE example (id INT);
+
+-- Another comment
+INSERT INTO example VALUES (1);
+"#;
+
+        let statements = split_sql_statements(sql);
+
+        assert_eq!(
+            statements,
+            vec![
+                "CREATE TABLE example (id INT)".to_string(),
+                "INSERT INTO example VALUES (1)".to_string(),
+            ]
+        );
+    }
 }
