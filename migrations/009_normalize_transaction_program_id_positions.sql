@@ -5,6 +5,8 @@
 -- those live rows without touching already-correct historical data or deleting
 -- the newly inserted canonical rows.
 
+BEGIN;
+
 WITH live_style_transactions AS (
     SELECT DISTINCT timestamp, signature
     FROM transaction_program_ids
@@ -28,3 +30,5 @@ ON CONFLICT DO NOTHING;
 
 DELETE FROM transaction_program_ids
 WHERE position < 0;
+
+COMMIT;

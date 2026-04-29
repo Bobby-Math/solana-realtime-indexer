@@ -84,15 +84,15 @@ async fn query_cpi_graph(pool: &PgPool) -> Result<CpiGraphResponse, sqlx::Error>
         ),
         cpi_inference AS (
             -- Infer CPI calls from program co-occurrence patterns
-            -- Programs appearing at positions 1+ are likely called by programs at position 0
+            -- Programs appearing at positions 2+ are likely called by programs at position 1
             SELECT
                 caller.program_id AS caller_program,
                 callee.program_id AS callee_program,
                 COUNT(*) AS call_count
             FROM tx_programs caller
             JOIN tx_programs callee ON caller.signature = callee.signature
-            WHERE caller.position = 0
-              AND callee.position > 0
+            WHERE caller.position = 1
+              AND callee.position > 1
             GROUP BY caller.program_id, callee.program_id
         )
         SELECT
