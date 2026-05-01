@@ -390,6 +390,7 @@
         Chart.defaults.borderColor = '#1e293b';
 
         let latencyChart = null;
+        let healthChart = null;
         let cpiChart = null;
 
         // Fetch and update network health data
@@ -498,11 +499,11 @@
             const skipRates = data.buckets.map(b => b.skip_rate * 100);
             const slotsPerSec = data.buckets.map(b => b.slots_per_second);
 
-            if (latencyChart) {
-                latencyChart.destroy();
+            if (healthChart) {
+                healthChart.destroy();
             }
 
-            latencyChart = new Chart(ctx, {
+            healthChart = new Chart(ctx, {
                 type: 'line',
                 data: {
                     labels: labels,
