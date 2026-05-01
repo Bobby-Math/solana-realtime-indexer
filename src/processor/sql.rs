@@ -194,18 +194,29 @@ pub async fn execute_slots_upsert(
         .map(|row| to_utc_timestamp(row.timestamp_unix_ms))
         .collect::<Result<Vec<_>, _>>()?;
     let statuses: Vec<String> = rows.iter().map(|row| row.status.clone()).collect();
+    let block_times: Vec<Option<chrono::DateTime<Utc>>> = rows
+        .iter()
+        .map(|row| {
+            match row.block_time {
+                None => None,
+                Some(ms) => to_utc_timestamp(ms).ok(),
+            }
+        })
+        .collect();
 
     sqlx::query(
-        "INSERT INTO slots (slot, parent_slot, timestamp, status)
-         SELECT * FROM UNNEST($1::bigint[], $2::bigint[], $3::timestamptz[], $4::text[])
+        "INSERT INTO slots (slot, parent_slot, timestamp, status, block_time)
+         SELECT * FROM UNNEST($1::bigint[], $2::bigint[], $3::timestamptz[], $4::text[], $5::timestamptz[])
          ON CONFLICT (timestamp, slot) DO UPDATE SET
            parent_slot = EXCLUDED.parent_slot,
-           status = EXCLUDED.status",
+           status = EXCLUDED.status,
+           block_time = EXCLUDED.block_time",
     )
     .bind(&slots)
     .bind(&parent_slots)
     .bind(&timestamps)
     .bind(&statuses)
+    .bind(&block_times)
     .execute(&mut **transaction)
     .await?;
 

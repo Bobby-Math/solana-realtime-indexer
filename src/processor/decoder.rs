@@ -184,11 +184,15 @@ impl Type1Decoder {
                     });
                 }
                 GeyserEvent::SlotUpdate(update) => {
+                    // Get block_time from cache if available (from BlockMeta events)
+                    let block_time = block_time_cache.get(update.slot);
+
                     persisted.slot_rows.push(SlotRow {
                         slot: update.slot as i64,
                         timestamp_unix_ms: update.timestamp_unix_ms,
                         parent_slot: update.parent_slot.map(|slot| slot as i64),
                         status: update.status,
+                        block_time,
                     });
                 }
                 GeyserEvent::BlockMeta(_) => {

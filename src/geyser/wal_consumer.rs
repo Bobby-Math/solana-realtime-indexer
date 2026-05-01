@@ -572,6 +572,7 @@ impl RpcGapFiller {
                 .and_then(|v| v.as_u64())
                 .map(|s| s as i64),
             status: "confirmed".to_string(), // RPC only returns finalized/confirmed blocks
+            block_time: Some(block_time_ms), // RPC provides block_time directly
         };
 
         // Write transactions and slot directly to DB (bypass WAL)

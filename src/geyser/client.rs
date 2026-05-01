@@ -278,7 +278,7 @@ impl GeyserClient {
         use std::collections::HashMap;
 
         let mut request = SubscribeRequest {
-            commitment: Some(2), // 2 = Confirmed commitment level
+            commitment: Some(0), // 0 = Processed commitment level (real-time)
             ..Default::default()
         };
 

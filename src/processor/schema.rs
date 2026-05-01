@@ -69,6 +69,7 @@ pub struct SlotRow {
     pub timestamp_unix_ms: i64,
     pub parent_slot: Option<i64>,
     pub status: String,
+    pub block_time: Option<i64>, // Unix timestamp when block was produced (from BlockMeta)
 }
 
 #[derive(Debug, Clone)]

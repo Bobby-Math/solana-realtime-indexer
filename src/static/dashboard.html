@@ -16,24 +16,24 @@
             font-family: 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
             background: #0a0e1a;
             color: #e2e8f0;
-            line-height: 1.6;
+            line-height: 1.4;
         }
 
         .container {
             max-width: 1400px;
             margin: 0 auto;
-            padding: 20px;
+            padding: 10px;
         }
 
         header {
             border-bottom: 1px solid #1e293b;
-            padding-bottom: 20px;
-            margin-bottom: 30px;
+            padding-bottom: 8px;
+            margin-bottom: 8px;
             position: relative;
         }
 
         h1 {
-            font-size: 24px;
+            font-size: 18px;
             font-weight: 600;
             color: #f8fafc;
         }
@@ -58,9 +58,9 @@
         }
 
         .subtitle {
-            font-size: 14px;
+            font-size: 12px;
             color: #64748b;
-            margin-top: 5px;
+            margin-top: 2px;
         }
 
         .subtitle .brand-accent {
@@ -68,18 +68,53 @@
             font-weight: 500;
         }
 
+        .kpi-strip {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 1px;
+            background: #1e293b;
+            border: 1px solid #1e293b;
+            border-radius: 4px;
+            margin-bottom: 10px;
+            overflow: hidden;
+        }
+
+        .kpi-cell {
+            background: #111827;
+            padding: 8px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .kpi-label {
+            font-size: 9px;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .kpi-val {
+            font-size: 18px;
+            font-weight: 600;
+            color: #22d3ee;
+            font-family: 'SF Mono', monospace;
+        }
+
+        .kpi-val.orange { color: #f78166; }
+
         .grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
-            gap: 20px;
-            margin-bottom: 20px;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-bottom: 10px;
         }
 
         .panel {
             background: #111827;
             border: 1px solid #1e293b;
             border-radius: 4px;
-            padding: 20px;
+            padding: 12px;
             position: relative;
         }
 
@@ -98,11 +133,11 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 15px;
+            margin-bottom: 8px;
         }
 
         .panel-title {
-            font-size: 14px;
+            font-size: 11px;
             font-weight: 600;
             color: #f1f5f9;
             text-transform: uppercase;
@@ -115,10 +150,10 @@
         }
 
         .stat-value {
-            font-size: 32px;
+            font-size: 22px;
             font-weight: 600;
             color: #22d3ee;
-            margin-bottom: 5px;
+            margin-bottom: 2px;
         }
 
         .stat-value.accent-orange {
@@ -132,8 +167,8 @@
 
         .chart-container {
             position: relative;
-            height: 200px;
-            margin-top: 15px;
+            height: 240px;
+            margin-top: 8px;
         }
 
         .leaderboard-table {
@@ -144,7 +179,7 @@
 
         .leaderboard-table th,
         .leaderboard-table td {
-            padding: 8px;
+            padding: 5px 8px;
             text-align: left;
             border-bottom: 1px solid #1e293b;
             font-size: 12px;
@@ -224,9 +259,9 @@
 
         .refresh-info {
             text-align: center;
-            font-size: 11px;
+            font-size: 10px;
             color: #475569;
-            margin-top: 30px;
+            margin-top: 8px;
         }
     </style>
 </head>
@@ -241,26 +276,66 @@
             </div>
         </header>
 
+        <div class="kpi-strip">
+            <div class="kpi-cell">
+                <span class="kpi-label">Skip Rate</span>
+                <span class="kpi-val" id="current-skip-rate">--</span>
+            </div>
+            <div class="kpi-cell">
+                <span class="kpi-label">Net Status</span>
+                <span id="stress-indicator" class="stress-indicator stress-normal">--</span>
+            </div>
+            <div class="kpi-cell">
+                <span class="kpi-label">Avg Latency</span>
+                <span class="kpi-val" id="avg-latency">--</span>
+            </div>
+            <div class="kpi-cell">
+                <span class="kpi-label">P99 Latency</span>
+                <span class="kpi-val" id="p99-latency">--</span>
+            </div>
+            <div class="kpi-cell">
+                <span class="kpi-label">CPI Calls</span>
+                <span class="kpi-val" id="cpi-total-calls">--</span>
+            </div>
+            <div class="kpi-cell">
+                <span class="kpi-label">Total TX</span>
+                <span class="kpi-val orange" id="tps-total-tx">--</span>
+            </div>
+            <div class="kpi-cell">
+                <span class="kpi-label">Top Prog TPS</span>
+                <span class="kpi-val orange" id="tps-top-program">--</span>
+            </div>
+        </div>
+
         <div class="grid">
-            <!-- Network Stress Panel -->
+            <!-- Network Health Panel -->
             <div class="panel">
                 <div class="panel-header">
-                    <div class="panel-title">Network Stress</div>
+                    <div class="panel-title">Network Health</div>
                     <div class="panel-meta">Last 60 minutes</div>
                 </div>
-                <div id="stress-loading" class="loading">Loading network stress data...</div>
+                <div id="stress-loading" class="loading">Loading network health data...</div>
                 <div id="stress-content" style="display: none;">
-                    <div class="stat-value" id="current-latency">--</div>
-                    <div class="stat-label">Avg slot confirmation latency</div>
-                    <div style="margin-top: 15px;">
-                        <span class="stat-label">Status:</span>
-                        <span id="stress-indicator" class="stress-indicator stress-normal">Normal</span>
+                    <div class="chart-container">
+                        <canvas id="health-chart"></canvas>
                     </div>
+                </div>
+                <div id="stress-error" style="display: none;"></div>
+            </div>
+
+            <!-- Latency Metrics Panel -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">Slot-to-DB Latency</div>
+                    <div class="panel-meta">Last 60 minutes</div>
+                </div>
+                <div id="latency-loading" class="loading">Loading latency data...</div>
+                <div id="latency-content" style="display: none;">
                     <div class="chart-container">
                         <canvas id="latency-chart"></canvas>
                     </div>
                 </div>
-                <div id="stress-error" style="display: none;"></div>
+                <div id="latency-error" style="display: none;"></div>
             </div>
 
             <!-- CPI Graph Panel -->
@@ -271,8 +346,6 @@
                 </div>
                 <div id="cpi-loading" class="loading">Loading CPI graph data...</div>
                 <div id="cpi-content" style="display: none;">
-                    <div class="stat-value" id="cpi-total-calls">--</div>
-                    <div class="stat-label">Total cross-program calls</div>
                     <div class="chart-container">
                         <canvas id="cpi-chart"></canvas>
                     </div>
@@ -289,16 +362,6 @@
             </div>
             <div id="tps-loading" class="loading">Loading program TPS data...</div>
             <div id="tps-content" style="display: none;">
-                <div style="display: flex; gap: 30px; margin-bottom: 15px;">
-                    <div>
-                        <div class="stat-value" id="tps-total-tx">--</div>
-                        <div class="stat-label">Total transactions</div>
-                    </div>
-                    <div>
-                        <div class="stat-value" id="tps-top-program">--</div>
-                        <div class="stat-label">Top program TPS</div>
-                    </div>
-                </div>
                 <table class="leaderboard-table">
                     <thead>
                         <tr>
@@ -329,11 +392,11 @@
         let latencyChart = null;
         let cpiChart = null;
 
-        // Fetch and update network stress data
+        // Fetch and update network health data
         async function updateNetworkStress() {
             try {
                 const response = await fetch('/api/network-stress');
-                if (!response.ok) throw new Error('Failed to fetch network stress data');
+                if (!response.ok) throw new Error('Failed to fetch network health data');
 
                 const data = await response.json();
 
@@ -341,9 +404,9 @@
                 document.getElementById('stress-content').style.display = 'block';
                 document.getElementById('stress-error').style.display = 'none';
 
-                // Update current latency
-                document.getElementById('current-latency').textContent =
-                    data.current_avg_latency_ms.toFixed(1) + ' ms';
+                // Update current skip rate
+                document.getElementById('current-skip-rate').textContent =
+                    (data.slot_skip_rate * 100).toFixed(2) + '%';
 
                 // Update stress indicator
                 const indicator = document.getElementById('stress-indicator');
@@ -351,10 +414,10 @@
                 indicator.className = 'stress-indicator stress-' + data.stress_level;
 
                 // Update chart
-                updateLatencyChart(data);
+                updateHealthChart(data);
 
             } catch (error) {
-                console.error('Error fetching network stress:', error);
+                console.error('Error fetching network health:', error);
                 document.getElementById('stress-loading').style.display = 'none';
                 document.getElementById('stress-error').style.display = 'block';
                 document.getElementById('stress-error').textContent = 'Error: ' + error.message;
@@ -424,16 +487,16 @@
             }
         }
 
-        // Update latency chart
-        function updateLatencyChart(data) {
-            const ctx = document.getElementById('latency-chart').getContext('2d');
+        // Update network health chart
+        function updateHealthChart(data) {
+            const ctx = document.getElementById('health-chart').getContext('2d');
 
-            const labels = data.data_points.map(p => {
-                const date = new Date(p.timestamp);
+            const labels = data.buckets.map(b => {
+                const date = new Date(b.bucket);
                 return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
             });
-            const avgLatencies = data.data_points.map(p => p.avg_latency_ms);
-            const maxLatencies = data.data_points.map(p => p.max_latency_ms);
+            const skipRates = data.buckets.map(b => b.skip_rate * 100);
+            const slotsPerSec = data.buckets.map(b => b.slots_per_second);
 
             if (latencyChart) {
                 latencyChart.destroy();
@@ -445,20 +508,22 @@
                     labels: labels,
                     datasets: [
                         {
-                            label: 'Avg Latency',
-                            data: avgLatencies,
+                            label: 'Skip Rate (%)',
+                            data: skipRates,
                             borderColor: '#22d3ee',
                             backgroundColor: 'rgba(34, 211, 238, 0.1)',
                             fill: true,
-                            tension: 0.4
+                            tension: 0.4,
+                            yAxisID: 'y'
                         },
                         {
-                            label: 'Max Latency',
-                            data: maxLatencies,
-                            borderColor: '#f87171',
+                            label: 'Slots/Sec',
+                            data: slotsPerSec,
+                            borderColor: '#f78166',
                             backgroundColor: 'transparent',
                             borderDash: [5, 5],
-                            tension: 0.4
+                            tension: 0.4,
+                            yAxisID: 'y1'
                         }
                     ]
                 },
@@ -467,10 +532,24 @@
                     maintainAspectRatio: false,
                     scales: {
                         y: {
+                            type: 'linear',
+                            position: 'left',
                             beginAtZero: true,
                             title: {
                                 display: true,
-                                text: 'Latency (ms)'
+                                text: 'Skip Rate (%)'
+                            }
+                        },
+                        y1: {
+                            type: 'linear',
+                            position: 'right',
+                            beginAtZero: true,
+                            title: {
+                                display: true,
+                                text: 'Slots/Sec'
+                            },
+                            grid: {
+                                drawOnChartArea: false
                             }
                         }
                     },
@@ -532,14 +611,93 @@
             });
         }
 
+        // Fetch and update latency metrics data
+        async function updateLatencyMetrics() {
+            try {
+                const response = await fetch('/api/latency-metrics');
+                if (!response.ok) throw new Error('Failed to fetch latency metrics');
+
+                const data = await response.json();
+
+                document.getElementById('latency-loading').style.display = 'none';
+                document.getElementById('latency-content').style.display = 'block';
+                document.getElementById('latency-error').style.display = 'none';
+
+                // Update summary stats
+                document.getElementById('avg-latency').textContent =
+                    data.avg_latency_ms.toFixed(1) + ' ms';
+                document.getElementById('p99-latency').textContent =
+                    data.p99_latency_ms.toFixed(1) + ' ms';
+
+                // Update chart
+                updateLatencyChart(data);
+
+            } catch (error) {
+                console.error('Error fetching latency metrics:', error);
+                document.getElementById('latency-loading').style.display = 'none';
+                document.getElementById('latency-error').style.display = 'block';
+                document.getElementById('latency-error').textContent = 'Error: ' + error.message;
+            }
+        }
+
+        // Update latency chart
+        function updateLatencyChart(data) {
+            const ctx = document.getElementById('latency-chart').getContext('2d');
+
+            const labels = data.data_points.slice(0, 60).map(dp => {
+                const date = new Date(dp.db_write_time);
+                return date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+            });
+            const latencies = data.data_points.slice(0, 60).map(dp => dp.latency_ms);
+
+            if (latencyChart) {
+                latencyChart.destroy();
+            }
+
+            latencyChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Latency (ms)',
+                        data: latencies,
+                        borderColor: '#f78166',
+                        backgroundColor: 'rgba(247, 129, 102, 0.1)',
+                        fill: true,
+                        tension: 0.4
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: {
+                                display: true,
+                                text: 'Latency (ms)'
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: false
+                        }
+                    }
+                }
+            });
+        }
+
         // Initial load
         updateNetworkStress();
+        updateLatencyMetrics();
         updateCpiGraph();
         updateProgramTps();
 
         // Refresh every 5 seconds
         setInterval(() => {
             updateNetworkStress();
+            updateLatencyMetrics();
             updateCpiGraph();
             updateProgramTps();
         }, 5000);

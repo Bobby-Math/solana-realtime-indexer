@@ -209,6 +209,7 @@ mod tests {
                 timestamp_unix_ms: 125,
                 parent_slot: Some(1),
                 status: "processed".to_string(),
+                block_time: None,
             }],
             custom_rows: vec![CustomDecodedRow {
                 decoder_name: "program-activity".to_string(),
@@ -269,6 +270,7 @@ mod tests {
                 timestamp_unix_ms: 200,
                 parent_slot: None,
                 status: "processed".to_string(),
+                block_time: None,
             }],
             custom_rows: vec![CustomDecodedRow {
                 decoder_name: "test".to_string(),
