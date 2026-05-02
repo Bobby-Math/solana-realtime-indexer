@@ -1,0 +1,26 @@
+# Dual License
+
+This project is dual-licensed under both:
+
+- **MIT License** ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+- **Apache License, Version 2.0** ([LICENSE-APACHE2](LICENSE-APACHE2) or http://www.apache.org/licenses/LICENSE-2.0)
+
+You may choose either license for your use.
+
+## Summary
+
+Both licenses are permissive and allow:
+- ✅ Commercial use
+- ✅ Modification
+- ✅ Distribution
+- ✅ Private use
+
+**Key differences:**
+- Apache 2.0 includes an explicit patent grant
+- MIT is shorter and simpler
+
+For most use cases, either license works. If you need patent protection, use Apache 2.0.
+
+## Copyright
+
+Copyright (c) 2026 Bobby Math
