@@ -1,10 +1,13 @@
 # solana-realtime-indexer
 
-High-performance Solana realtime indexer:
+High-performance Solana realtime indexer with live deployment at [solana.bobby-math.dev](https://solana.bobby-math.dev)
 
-`RPC pool + Geyser streaming -> TimescaleDB -> public query API -> live dashboard`
+`Geyser streaming -> WAL -> TimescaleDB -> REST API -> live dashboard`
 
-Core indexer metrics: `ingest_events_per_sec`, `db_rows_written_per_sec`, and `slot_to_indexed_lag_ms`.
+**Current Devnet Performance:**
+- 40+ TPS sustained throughput
+- 1280ms p50 slot-to-DB latency
+- 1859ms p99 slot-to-DB latency
 
 | Metric | V1 target | Stretch target |
 | --- | ---: | ---: |
@@ -14,16 +17,10 @@ Core indexer metrics: `ingest_events_per_sec`, `db_rows_written_per_sec`, and `s
 
 ## 🚀 Quick Start
 
-### Development Mode (Safe - Uses Simulated Data)
 ```bash
-cargo run
-```
-
-### Production Mode (Real Helius Geyser Stream)
-```bash
-# Configure your Helius Geyser endpoint
+# Configure environment
 cp .env.example .env
-echo "GEYSER_ENDPOINT=https://your-helius-geyser-endpoint.com" >> .env
+# Edit .env with your Helius Geyser endpoint and database URL
 
 # Start TimescaleDB
 docker compose up -d
@@ -31,18 +28,20 @@ docker compose up -d
 # Run database migrations
 ./scripts/run-migrations.sh
 
-# Run with real Geyser connection
+# Run indexer
 cargo run
 ```
 
 ## ✅ Features
 
 - **Real-time Geyser Streaming**: Full Helius Geyser integration with gRPC
+- **Write-Ahead Log (WAL)**: Crash recovery with automatic restart from last checkpoint
+- **RPC Gap Filling**: Automatic repair of missing slots via RPC fallback
+- **Type-Safe Decoding**: Fixed-width types for signatures and program IDs
 - **Custom Program Indexing**: Protocol-specific decoders from IDLs
-- **High-Performance Pipeline**: Batch processing with configurable throughput
-- **Production Storage**: TimescaleDB with retention policies
-- **REST API**: Health and metrics endpoints
-- **Dual Mode**: Safe development mode + production Geyser mode
+- **High-Performance Pipeline**: Batch processing with UNNEST bulk inserts
+- **Production Storage**: TimescaleDB with compression and retention policies
+- **REST API & Dashboard**: Real-time metrics and program TPS leaderboard
 
 ## 🗄️ Migrations
 
